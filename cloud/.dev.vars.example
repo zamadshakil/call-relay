@@ -1,0 +1,5 @@
+LIVEKIT_API_KEY="replace-me"
+LIVEKIT_API_SECRET="replace-me"
+ENROLLMENT_INVITE="generate-a-long-random-invite"
+FCM_CLIENT_EMAIL="service-account@replace-me.iam.gserviceaccount.com"
+FCM_PRIVATE_KEY="replace-with-the-service-account-pkcs8-private-key"

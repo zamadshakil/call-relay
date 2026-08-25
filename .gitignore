@@ -1,0 +1,36 @@
+# Operating-system and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.iml
+
+# Local secrets and credentials
+.env
+.env.*
+!.env.example
+**/.dev.vars
+**/google-services.json
+**/local.properties
+**/*.jks
+**/*.keystore
+**/*.p12
+**/*.pem
+
+# JavaScript / Cloudflare output
+**/node_modules/
+cloud/dist/
+cloud/.wrangler/
+cloud/.playwright-cli/
+cloud/coverage/
+
+# Android / Gradle output
+**/.gradle/
+**/.kotlin/
+**/build/
+
+# Test and diagnostic output
+*.log
+*.hprof
+test-results/
+playwright-report/

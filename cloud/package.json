@@ -1,0 +1,31 @@
+{
+  "name": "call-relay-cloud",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "check": "tsc --noEmit && vite build",
+    "dev": "vite build && wrangler dev",
+    "test": "vitest run --config vitest.config.ts",
+    "types": "wrangler types",
+    "db:local": "wrangler d1 migrations apply CALL_RELAY_DB --local",
+    "preflight:production": "node scripts/preflight-production.mjs",
+    "deploy": "node scripts/preflight-production.mjs && vite build && wrangler deploy"
+  },
+  "dependencies": {
+    "jose": "6.2.10",
+    "livekit-client": "2.22.0",
+    "qrcode": "1.5.4"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "1.1.0",
+    "@types/node": "26.3.0",
+    "@types/qrcode": "1.5.6",
+    "typescript": "7.0.2",
+    "vite": "8.2.2",
+    "vitest": "4.1.11",
+    "wrangler": "4.126.0"
+  },
+  "packageManager": "pnpm@10.30.3"
+}

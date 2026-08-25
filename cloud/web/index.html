@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <title>Call Relay Console</title>
+  </head>
+  <body>
+    <main>
+      <header>
+        <p class="eyebrow">PRIVATE TEST CONSOLE</p>
+        <h1>Call Relay</h1>
+        <p>Browser peer for the stock-Android acoustic relay. Audio is never recorded.</p>
+      </header>
+
+      <section>
+        <h2>1. Enroll this browser</h2>
+        <label>API base <input id="apiBase" value="" placeholder="Leave blank on the hosted console" /></label>
+        <small>For safety, the console only sends signed requests back to its own origin.</small>
+        <label>Invite <input id="invite" type="password" autocomplete="off" /></label>
+        <label>Name <input id="deviceName" value="Browser test peer" /></label>
+        <button id="enroll">Generate key and enroll</button>
+        <output id="identity">Not enrolled</output>
+      </section>
+
+      <section>
+        <h2>2. Pair</h2>
+        <label>Android device ID <input id="peerDevice" placeholder="dev_…" /></label>
+        <button id="pair">Create pairing</button>
+        <output id="pairing">Not paired</output>
+        <canvas id="pairingQr" hidden aria-label="Android pairing QR code"></canvas>
+      </section>
+
+      <section>
+        <h2>3. Call</h2>
+        <label>E.164 number <input id="phoneNumber" inputmode="tel" placeholder="+923001234567" /></label>
+        <button id="dial">Ask Android to dial</button>
+        <label>Call ID <input id="callId" placeholder="call_…" /></label>
+        <div class="controls">
+          <button data-event="accept">Accept</button>
+          <button data-event="reject" class="danger">Reject</button>
+          <button data-event="end" class="danger">End</button>
+          <button data-event="full_duplex">Full duplex</button>
+          <button data-event="listen">Listen</button>
+          <button data-event="talk">Talk</button>
+          <button id="mute">Mute relay mic</button>
+          <button id="unmute">Unmute relay mic</button>
+        </div>
+        <div class="controls">
+          <input id="dtmf" maxlength="1" inputmode="tel" placeholder="DTMF 0-9, * or #" />
+          <button id="sendDtmf">Send DTMF</button>
+        </div>
+      </section>
+
+      <section>
+        <h2>4. LiveKit audio</h2>
+        <button id="join">Join relay room</button>
+        <button id="leave">Leave</button>
+        <output id="media">Disconnected</output>
+        <div id="remoteAudio"></div>
+      </section>
+
+      <pre id="log" aria-live="polite"></pre>
+    </main>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
