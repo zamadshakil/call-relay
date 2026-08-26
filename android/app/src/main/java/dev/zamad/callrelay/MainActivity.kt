@@ -4,7 +4,6 @@ import android.Manifest
 import android.accessibilityservice.AccessibilityServiceInfo
 import android.app.Activity
 import android.app.role.RoleManager
-import android.content.ComponentName
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
@@ -395,9 +394,34 @@ class MainActivity : Activity() {
 
     private fun accessibilityEnabled(): Boolean {
         val manager = getSystemService(AccessibilityManager::class.java)
-        val expected = ComponentName(this, RelayAccessibilityService::class.java)
-        return manager.getEnabledAccessibilityServiceList(AccessibilityServiceInfo.FEEDBACK_ALL_MASK)
-            .any { ComponentName.unflattenFromString(it.id) == expected }
+        val serviceClassName = RelayAccessibilityService::class.java.name
+        val managerReportsEnabled = manager
+            .getEnabledAccessibilityServiceList(AccessibilityServiceInfo.FEEDBACK_ALL_MASK)
+            .any { info ->
+                val service = info.resolveInfo?.serviceInfo
+                val normalizedClassName = service?.name?.let { name ->
+                    if (name.startsWith(".")) "${service.packageName}$name" else name
+                }
+                service?.packageName == packageName && normalizedClassName == serviceClassName
+            }
+        val secureSettingReportsEnabled = Settings.Secure.getString(
+            contentResolver,
+            Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
+        ).orEmpty()
+            .split(':')
+            .any { component ->
+                val separator = component.indexOf('/')
+                if (separator <= 0 || separator == component.lastIndex) return@any false
+                val servicePackage = component.substring(0, separator)
+                val rawClassName = component.substring(separator + 1)
+                val normalizedClassName = if (rawClassName.startsWith(".")) {
+                    "$servicePackage$rawClassName"
+                } else {
+                    rawClassName
+                }
+                servicePackage == packageName && normalizedClassName == serviceClassName
+            }
+        return managerReportsEnabled || secureSettingReportsEnabled || RelayRuntime.snapshot().accessibilityEnabled
     }
 
     private fun cycleSim() {
