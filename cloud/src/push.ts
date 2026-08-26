@@ -3,7 +3,7 @@ import type { Env, PushJob } from "./types";
 import { secretValue } from "./secrets";
 
 async function googleAccessToken(env: Env): Promise<string> {
-  if (env.FCM_PROJECT_ID === "replace-me") {
+  if (String(env.FCM_PROJECT_ID) === "replace-me") {
     throw new Error("FCM credentials are not configured");
   }
   const clientEmail = await secretValue(env.FCM_CLIENT_EMAIL, "FCM_CLIENT_EMAIL");

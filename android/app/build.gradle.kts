@@ -21,6 +21,7 @@ android {
         targetSdk = 36
         versionCode = 1
         versionName = "0.2.0-alpha"
+        buildConfigField("String", "DEFAULT_API_BASE_URL", "\"https://call-relay.zamadshakil.workers.dev\"")
         buildConfigField("boolean", "FCM_CONFIGURED", googleServicesFile.exists().toString())
     }
 

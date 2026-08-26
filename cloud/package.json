@@ -9,8 +9,11 @@
     "dev": "vite build && wrangler dev",
     "test": "vitest run --config vitest.config.ts",
     "types": "wrangler types",
-    "db:local": "wrangler d1 migrations apply CALL_RELAY_DB --local",
+    "secrets:prepare": "node scripts/prepare-production-secrets.mjs",
+    "firebase:android-config": "node scripts/fetch-firebase-android-config.mjs",
+    "providers:validate": "node scripts/validate-provider-credentials.mjs",
     "preflight:production": "node scripts/preflight-production.mjs",
+    "db:local": "wrangler d1 migrations apply CALL_RELAY_DB --local",
     "deploy": "node scripts/preflight-production.mjs && vite build && wrangler deploy"
   },
   "dependencies": {

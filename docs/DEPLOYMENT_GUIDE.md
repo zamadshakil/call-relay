@@ -4,6 +4,17 @@ This runbook activates the existing prototype in the correct dependency order. I
 
 The iPhone side is currently the hosted browser peer. There is no native iPhone application to deploy yet.
 
+## Current production environment (2026-08-26)
+
+- Worker/browser console: `https://call-relay.zamadshakil.workers.dev`
+- D1 database: `calling-system`
+- Queues: `call-relay-push` and `call-relay-push-dlq`
+- Firebase project: `call-relay-3dec7`; Android package: `dev.zamad.callrelay`
+- LiveKit, Firebase messaging OAuth, Worker health, D1 schema, secret names, Queue triggers, debug APK, and release APK have been verified.
+- The temporary aggregate secret payload was removed after deployment. The generated enrollment invite remains only in the ignored local file `cloud/.enrollment-invite.txt`.
+
+For this environment, continue at section 6. Sections 1–5 remain the reproducible procedure for another account or a clean rebuild.
+
 ## 0. Define the first acceptance milestone
 
 The first milestone is one consenting, non-emergency carrier call in which:
@@ -73,6 +84,14 @@ Reference: [LiveKit project and CLI credentials](https://docs.livekit.io/referen
    `android/app/google-services.json`
 
    Confirm that the filename has no suffix such as `(1)`. Git ignores this file.
+
+   When a service-account key can read the Firebase project, the repository can retrieve the already-registered app configuration without Android Studio:
+
+   ```powershell
+   cd cloud
+   pnpm firebase:android-config -- --service-account "C:\secure\firebase-service-account.json"
+   cd ..
+   ```
 5. In Firebase project settings, open **Cloud Messaging** and confirm that the FCM HTTP v1 API is enabled.
 6. In Google Cloud IAM, create a dedicated service account for this Worker and grant the minimum role needed to send messages: **Firebase Cloud Messaging API Admin**.
 7. Create one JSON key for that service account and download it to a secure location outside the repository.
@@ -143,6 +162,15 @@ pnpm check
 ### 4.4 Set encrypted Worker secrets
 
 Choose a random enrollment invite of at least 32 characters, store it in a password manager, and use the same value only while enrolling the two devices.
+
+When the Firebase service-account JSON and a local text file containing `LIVEKIT_URL`, `LIVEKIT_API_KEY`, and `LIVEKIT_API_SECRET` are already available, generate the ignored upload payload and a separate retained invite without printing their values:
+
+```powershell
+pnpm secrets:prepare -- --firebase "C:\secure\firebase-service-account.json" --livekit "C:\secure\livekit-keys.txt"
+pnpm providers:validate -- --firebase "C:\secure\firebase-service-account.json" --livekit "C:\secure\livekit-keys.txt"
+```
+
+The first command writes `.secrets.production.json` and `.enrollment-invite.txt` in `cloud`; both are Git-ignored. The second command validates Firebase messaging-scope OAuth and an authenticated LiveKit RoomService request without printing credential values.
 
 For the first deployment, upload all required secrets atomically with Wrangler's `--secrets-file` option. This avoids creating partially configured Worker versions. Create the ignored file from protected prompts and the Firebase JSON:
 

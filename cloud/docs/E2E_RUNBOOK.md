@@ -2,30 +2,28 @@
 
 The authoritative command-by-command instructions are in `../../docs/DEPLOYMENT_GUIDE.md`. This file remains as the compact acceptance checklist.
 
-The code is locally buildable and tested, but the real relay cannot be activated with placeholder cloud values or without a physical Android phone. Complete these gates in order.
+The production Worker and providers were activated on 2026-08-26. The real relay still requires a physical Android phone. Complete the remaining gates in order.
+
+Current production control plane: `https://call-relay.zamadshakil.workers.dev`.
 
 ## 1. Provision external services
 
-- Cloudflare: log in with Wrangler, create D1 database `call-relay`, Queue `call-relay-push`, and Queue `call-relay-push-dlq`.
-- LiveKit Cloud: create a project and keep its secure WebSocket URL, API key and API secret.
-- Firebase: create an Android app with package `dev.zamad.callrelay`, enable Cloud Messaging, download `google-services.json`, and create a service account permitted to send FCM HTTP v1 messages.
+- Cloudflare: complete. D1 database `calling-system`, Queue `call-relay-push`, and Queue `call-relay-push-dlq` are provisioned.
+- LiveKit Cloud: complete. The API credentials passed an authenticated RoomService request.
+- Firebase: complete. Android app `dev.zamad.callrelay`, local `google-services.json`, and messaging-scope service-account OAuth are verified.
 
 Put `google-services.json` at `android/app/google-services.json`. Never commit it or the service-account private key.
 
 ## 2. Configure and deploy the Worker
 
-1. Replace the placeholder D1 ID, LiveKit URL and Firebase project ID in `wrangler.jsonc`.
-2. Set the five encrypted per-Worker secrets listed in `SECRETS.md`.
-3. Run `pnpm preflight:production`; it must pass without exceptions.
-4. Apply all D1 migrations remotely with `pnpm exec wrangler d1 migrations apply CALL_RELAY_DB --remote`.
-5. Run `pnpm deploy` and record the resulting HTTPS Worker URL.
+This stage is complete. For future code-only deployments, run `pnpm deploy`; Wrangler preserves the installed secrets. Re-run remote migration listing whenever a migration is added.
 
 ## 3. Build and configure Android
 
 1. Run `android/scripts/build.ps1`.
 2. Connect a physical API 29+ Android phone with USB debugging and run `scripts/install.ps1`.
 3. Open Call Relay, grant all requested permissions, make it the default dialer, and enable only its narrowly scoped accessibility service.
-4. Enter the deployed Worker URL and a long random enrollment invite, then enroll.
+4. The deployed Worker URL is prefilled. Read the invite from the ignored local file `cloud/.enrollment-invite.txt`, then enroll.
 
 ## 4. Pair the browser peer
 

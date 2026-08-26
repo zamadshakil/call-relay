@@ -1,6 +1,7 @@
 package dev.zamad.callrelay.relay
 
 import android.content.Context
+import dev.zamad.callrelay.BuildConfig
 import dev.zamad.callrelay.crypto.SecureSecretStore
 
 class RelayPreferences(context: Context) {
@@ -8,7 +9,9 @@ class RelayPreferences(context: Context) {
     private val secureSecretStore = SecureSecretStore(context)
 
     var apiBaseUrl: String
-        get() = preferences.getString(KEY_API_BASE, "") ?: ""
+        get() = preferences.getString(KEY_API_BASE, BuildConfig.DEFAULT_API_BASE_URL)
+            ?.ifBlank { BuildConfig.DEFAULT_API_BASE_URL }
+            ?: BuildConfig.DEFAULT_API_BASE_URL
         set(value) = preferences.edit().putString(KEY_API_BASE, value.trim().trimEnd('/')).apply()
 
     var deviceId: String

@@ -12,20 +12,24 @@
 - Automated Worker integration tests, TypeScript checks, Android unit tests, lint, and build gates.
 - Production preflight that rejects placeholder Cloudflare, LiveKit, Firebase, and required-secret configuration.
 
-## Verified without external production accounts
+## Verified locally and in production on 2026-08-26
 
 - Cloud TypeScript compilation and production web build.
 - Isolated Worker/D1 API test suite.
-- Android unit tests, lint, and debug APK assembly.
+- Android unit tests, lint, and Firebase-enabled debug and release APK assembly.
 - Secret and generated-artifact exclusion from version control.
+- Cloudflare Worker and browser console at `https://call-relay.zamadshakil.workers.dev`.
+- Remote D1 migrations and expected tables in the `calling-system` database.
+- `call-relay-push` producer/consumer, `call-relay-push-dlq`, and the cleanup cron.
+- All five encrypted Worker secret bindings, without exposing their values.
+- Firebase messaging-scope OAuth using the supplied service account.
+- LiveKit authenticated RoomService access using the supplied API key and secret.
+- Firebase Android configuration for the exact package `dev.zamad.callrelay`.
 
-## External gates still required
+## Physical gates still required
 
-- Create and configure the production Cloudflare D1 database, Queues, encrypted Worker secrets, and Worker deployment.
-- Create a LiveKit Cloud project and install its credentials as Worker secrets.
-- Create a Firebase project, add `google-services.json` locally, and install the service-account credentials as Worker secrets.
 - Enroll and pair a real browser and Android handset.
 - Run the physical carrier-call compatibility matrix in `cloud/docs/E2E_RUNBOOK.md`.
 - Build the native iPhone peer later with a Mac and paid Apple Developer account.
 
-The system is not end-to-end certified until the account gates and physical-handset tests pass. That qualification cannot be replaced by an emulator.
+The cloud control plane is deployed and verified. The relay is not end-to-end certified until the physical-handset tests pass; that qualification cannot be replaced by an emulator.

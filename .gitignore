@@ -13,8 +13,11 @@ Thumbs.db
 **/google-services.json
 **/local.properties
 **/.secrets*.json
+**/.enrollment-invite.txt
 **/*service-account*.json
 **/firebase-adminsdk*.json
+**/*firebase-adminsdk*.json
+**/liveKit keys.txt
 **/*.jks
 **/*.keystore
 **/*.p12

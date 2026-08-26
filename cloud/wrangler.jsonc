@@ -2,7 +2,7 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "call-relay",
   "main": "src/index.ts",
-  "compatibility_date": "2026-08-25",
+  "compatibility_date": "2026-08-26",
   "compatibility_flags": ["nodejs_compat"],
   "secrets": {
     "required": [
@@ -33,8 +33,8 @@
   "d1_databases": [
     {
       "binding": "CALL_RELAY_DB",
-      "database_name": "call-relay",
-      "database_id": "00000000-0000-0000-0000-000000000000",
+      "database_name": "calling-system",
+      "database_id": "cb880c26-e4ca-4e37-961a-14ce68cdf865",
       "migrations_dir": "migrations"
     }
   ],
@@ -59,7 +59,7 @@
     "crons": ["* * * * *"]
   },
   "vars": {
-    "LIVEKIT_URL": "wss://replace-me.livekit.cloud",
-    "FCM_PROJECT_ID": "replace-me"
+    "LIVEKIT_URL": "wss://calling-system-elmcwb4t.livekit.cloud",
+    "FCM_PROJECT_ID": "call-relay-3dec7"
   }
 }
