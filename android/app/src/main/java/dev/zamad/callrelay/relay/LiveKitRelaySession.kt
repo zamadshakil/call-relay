@@ -39,6 +39,9 @@ class LiveKitRelaySession(
         require(serverUrl.startsWith("wss://")) { "LiveKit URL must use secure WebSocket transport" }
         require(participantToken.isNotBlank()) { "LiveKit participant token is missing" }
         require(callPassphrase.isNotBlank()) { "Call encryption key is missing" }
+        // E2EEOptions constructs its native FrameCryptorKeyProvider immediately. LiveKit.create()
+        // initializes WebRTC later, so initialize explicitly before constructing the room options.
+        LiveKit.init(appContext)
         disconnect()
         val inputSampleRate = CaptureSampleRateSelector.choose(appContext)
         val mediaAttributes = AudioAttributes.Builder()
