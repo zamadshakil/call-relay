@@ -60,10 +60,20 @@ const turnResponse = await fetch(`${turnOrigin}/generate`, {
   body: JSON.stringify({ ttl: 120, customIdentifier: "provider-validation" }),
 });
 const credential = await responseJson(turnResponse);
-if (!turnResponse.ok || typeof credential.username !== "string" || typeof credential.credential !== "string") {
+const credentialIceServers = Array.isArray(credential.iceServers)
+  ? credential.iceServers
+  : credential.iceServers && typeof credential.iceServers === "object"
+    ? [credential.iceServers]
+    : [];
+const turnServer = credentialIceServers.find((server) =>
+  server && typeof server === "object" && typeof server.username === "string" && typeof server.credential === "string"
+);
+const turnUsername = typeof credential.username === "string" ? credential.username : turnServer?.username;
+const turnPassword = typeof credential.credential === "string" ? credential.credential : turnServer?.credential;
+if (!turnResponse.ok || typeof turnUsername !== "string" || typeof turnPassword !== "string") {
   throw new Error(`Cloudflare TURN credential validation failed (${turnResponse.status})`);
 }
-const revokeResponse = await fetch(`${turnOrigin}/${encodeURIComponent(credential.username)}/revoke`, {
+const revokeResponse = await fetch(`${turnOrigin}/${encodeURIComponent(turnUsername)}/revoke`, {
   method: "POST",
   headers: { authorization: `Bearer ${turnToken}` },
 });

@@ -255,8 +255,14 @@ describe("Worker control plane", () => {
       }
       expect(request.url).toContain("/v1/turn/keys/integration-turn-key/credentials/generate");
       return Response.json({
-        username: "test-turn-username",
-        credential: "test-turn-password",
+        iceServers: {
+          urls: [
+            "turn:turn.cloudflare.com:3478?transport=udp",
+            "turns:turn.cloudflare.com:443?transport=tcp",
+          ],
+          username: "test-turn-username",
+          credential: "test-turn-password",
+        },
       }, { status: 201 });
     });
     const mediaResponse = await signedFetch(browser, `/v1/calls/${incomingCallId}/media-config`, "POST", {});

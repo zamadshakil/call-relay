@@ -56,7 +56,15 @@ function validateIceServers(value: unknown): IceServerConfig[] {
 }
 
 function iceServersFromCredential(body: CloudflareIceResponse): IceServerConfig[] {
-  if (body.iceServers !== undefined) return validateIceServers(body.iceServers);
+  if (body.iceServers !== undefined) {
+    // The standard endpoint returns an array, while the tagged-credential
+    // endpoint currently returns one ICE server object under the same field.
+    const servers = validateIceServers(Array.isArray(body.iceServers) ? body.iceServers : [body.iceServers]);
+    const hasStun = servers.some((server) =>
+      (typeof server.urls === "string" ? [server.urls] : server.urls).some((url) => url.startsWith("stun:")),
+    );
+    return hasStun ? servers : [{ urls: CLOUDFLARE_STUN_URLS }, ...servers];
+  }
   if (typeof body.username !== "string" || !body.username || typeof body.credential !== "string" || !body.credential) {
     throw new Error("Cloudflare TURN returned invalid credentials");
   }
