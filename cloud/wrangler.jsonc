@@ -4,6 +4,15 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-08-25",
   "compatibility_flags": ["nodejs_compat"],
+  "secrets": {
+    "required": [
+      "LIVEKIT_API_KEY",
+      "LIVEKIT_API_SECRET",
+      "ENROLLMENT_INVITE",
+      "FCM_CLIENT_EMAIL",
+      "FCM_PRIVATE_KEY"
+    ]
+  },
   "observability": {
     "enabled": true,
     "logs": {

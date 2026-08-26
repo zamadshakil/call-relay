@@ -9,6 +9,7 @@ The repository is intentionally honest about the platform boundary: a normal And
 - `android/` — Kotlin Android dialer, `InCallService`, relay-ready foreground service, signed control plane, LiveKit media bridge, and diagnostic modes.
 - `cloud/` — TypeScript Cloudflare Worker, D1 migrations, Queue handling, browser peer, API tests, and deployment preflight.
 - `docs/ARCHITECTURE.md` — trust boundaries, call flows, failure behavior, and non-negotiable limitations.
+- `docs/DEPLOYMENT_GUIDE.md` — complete LiveKit, Firebase, Cloudflare, Android, pairing and physical-call activation procedure.
 - `docs/RELEASE_STATUS.md` — what is implemented, what is verified, and what still requires external accounts or a physical handset.
 - `scripts/verify.ps1` — one command for the repository's repeatable local checks.
 
@@ -24,7 +25,7 @@ pnpm db:local
 pnpm dev
 ```
 
-Replace every placeholder in `.dev.vars`; never commit that file. See `cloud/docs/E2E_RUNBOOK.md` for production setup.
+Replace every placeholder in `.dev.vars`; never commit that file. See `docs/DEPLOYMENT_GUIDE.md` for production setup.
 
 ### Android app
 

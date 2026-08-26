@@ -12,6 +12,9 @@ Thumbs.db
 **/.dev.vars
 **/google-services.json
 **/local.properties
+**/.secrets*.json
+**/*service-account*.json
+**/firebase-adminsdk*.json
 **/*.jks
 **/*.keystore
 **/*.p12

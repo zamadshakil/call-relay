@@ -10,7 +10,7 @@
 - FCM device registration, command handling, retries, and failure acknowledgements.
 - Worker call-state API, D1 schema and migrations, cleanup, Queue consumer, browser pairing and call console.
 - Automated Worker integration tests, TypeScript checks, Android unit tests, lint, and build gates.
-- Production preflight that rejects placeholder Cloudflare, LiveKit, Firebase, and Secrets Store configuration.
+- Production preflight that rejects placeholder Cloudflare, LiveKit, Firebase, and required-secret configuration.
 
 ## Verified without external production accounts
 
@@ -21,7 +21,7 @@
 
 ## External gates still required
 
-- Create and configure the production Cloudflare D1 database, Queues, Secrets Store, and Worker deployment.
+- Create and configure the production Cloudflare D1 database, Queues, encrypted Worker secrets, and Worker deployment.
 - Create a LiveKit Cloud project and install its credentials as Worker secrets.
 - Create a Firebase project, add `google-services.json` locally, and install the service-account credentials as Worker secrets.
 - Enroll and pair a real browser and Android handset.

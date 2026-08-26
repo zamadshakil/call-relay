@@ -1,5 +1,7 @@
 # End-to-end activation runbook
 
+The authoritative command-by-command instructions are in `../../docs/DEPLOYMENT_GUIDE.md`. This file remains as the compact acceptance checklist.
+
 The code is locally buildable and tested, but the real relay cannot be activated with placeholder cloud values or without a physical Android phone. Complete these gates in order.
 
 ## 1. Provision external services
@@ -8,19 +10,19 @@ The code is locally buildable and tested, but the real relay cannot be activated
 - LiveKit Cloud: create a project and keep its secure WebSocket URL, API key and API secret.
 - Firebase: create an Android app with package `dev.zamad.callrelay`, enable Cloud Messaging, download `google-services.json`, and create a service account permitted to send FCM HTTP v1 messages.
 
-Put `google-services.json` at `call-relay-android/app/google-services.json`. Never commit it or the service-account private key.
+Put `google-services.json` at `android/app/google-services.json`. Never commit it or the service-account private key.
 
 ## 2. Configure and deploy the Worker
 
 1. Replace the placeholder D1 ID, LiveKit URL and Firebase project ID in `wrangler.jsonc`.
-2. Bind the five values listed in `SECRETS_STORE.md` from Cloudflare Secrets Store.
+2. Set the five encrypted per-Worker secrets listed in `SECRETS.md`.
 3. Run `pnpm preflight:production`; it must pass without exceptions.
 4. Apply all D1 migrations remotely with `pnpm exec wrangler d1 migrations apply CALL_RELAY_DB --remote`.
 5. Run `pnpm deploy` and record the resulting HTTPS Worker URL.
 
 ## 3. Build and configure Android
 
-1. Run `call-relay-android/scripts/build.ps1`.
+1. Run `android/scripts/build.ps1`.
 2. Connect a physical API 29+ Android phone with USB debugging and run `scripts/install.ps1`.
 3. Open Call Relay, grant all requested permissions, make it the default dialer, and enable only its narrowly scoped accessibility service.
 4. Enter the deployed Worker URL and a long random enrollment invite, then enroll.

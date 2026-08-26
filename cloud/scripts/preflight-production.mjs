@@ -12,16 +12,17 @@ if (!String(config.vars?.LIVEKIT_URL ?? "").startsWith("wss://") || String(confi
 if (!config.vars?.FCM_PROJECT_ID || String(config.vars.FCM_PROJECT_ID).includes("replace-me")) {
   failures.push("set vars.FCM_PROJECT_ID to the Firebase project ID");
 }
-const expectedSecrets = new Set([
+const expectedSecrets = [
   "LIVEKIT_API_KEY",
   "LIVEKIT_API_SECRET",
   "ENROLLMENT_INVITE",
   "FCM_CLIENT_EMAIL",
   "FCM_PRIVATE_KEY",
-]);
-for (const item of config.secrets_store_secrets ?? []) expectedSecrets.delete(item.binding);
-if (expectedSecrets.size > 0) {
-  failures.push(`add Secrets Store bindings for: ${Array.from(expectedSecrets).sort().join(", ")}`);
+];
+const declaredSecrets = new Set(config.secrets?.required ?? []);
+const missingSecretDeclarations = expectedSecrets.filter((name) => !declaredSecrets.has(name));
+if (missingSecretDeclarations.length > 0) {
+  failures.push(`declare required Worker secrets for: ${missingSecretDeclarations.sort().join(", ")}`);
 }
 const producer = config.queues?.producers?.find((item) => item.binding === "PUSH_QUEUE");
 const consumer = config.queues?.consumers?.find((item) => item.queue === producer?.queue);
