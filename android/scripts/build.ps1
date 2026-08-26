@@ -13,6 +13,7 @@ if (-not $env:JAVA_HOME) {
 $sdkRoot = $env:ANDROID_SDK_ROOT
 if (-not $sdkRoot) { $sdkRoot = $env:ANDROID_HOME }
 if (-not $sdkRoot -and (Test-Path -LiteralPath "E:\Android\Sdk")) { $sdkRoot = "E:\Android\Sdk" }
+if (-not $sdkRoot -and (Test-Path -LiteralPath "$env:LOCALAPPDATA\Android\Sdk")) { $sdkRoot = "$env:LOCALAPPDATA\Android\Sdk" }
 if (-not $sdkRoot -or -not (Test-Path -LiteralPath $sdkRoot)) {
     throw "Set ANDROID_SDK_ROOT (or ANDROID_HOME) to an installed Android SDK."
 }
