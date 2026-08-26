@@ -1,7 +1,9 @@
 # Security policy
 
-This is a private experimental telecommunications project. Do not open a public issue containing credentials, telephone numbers, call metadata, device identifiers, pairing QR contents, or audio.
+Do not publish credentials, telephone numbers, call metadata, device IDs, pairing QR contents, SDP, ICE addresses, TURN passwords or audio.
 
-If credentials are exposed, revoke and rotate them immediately in Cloudflare, LiveKit, Firebase, and the affected paired devices. The repository must contain only placeholders; production values belong in the provider secret stores or ignored local files.
+If credentials are exposed, revoke/rotate the Cloudflare TURN key/token, Worker secrets, Firebase key and affected pairing. Production values belong only in encrypted Worker secrets or ignored local files.
 
-Before testing, obtain participant consent and verify the laws and carrier terms applicable to every location involved.
+Signaling uses device P-256 signatures for REST and per-call HKDF/HMAC authentication for WebSocket envelopes. Media uses WebRTC DTLS-SRTP. The Worker, Durable Object and TURN relay must never log SDP, candidates, secrets or audio.
+
+Obtain participant consent and follow applicable carrier, telecom, interception and privacy rules before testing.

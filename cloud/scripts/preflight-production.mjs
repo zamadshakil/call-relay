@@ -6,15 +6,13 @@ const database = config.d1_databases?.find((item) => item.binding === "CALL_RELA
 if (!database || database.database_id === "00000000-0000-0000-0000-000000000000") {
   failures.push("replace the CALL_RELAY_DB database_id with the real D1 database ID");
 }
-if (!String(config.vars?.LIVEKIT_URL ?? "").startsWith("wss://") || String(config.vars.LIVEKIT_URL).includes("replace-me")) {
-  failures.push("set vars.LIVEKIT_URL to the real wss:// LiveKit Cloud URL");
-}
 if (!config.vars?.FCM_PROJECT_ID || String(config.vars.FCM_PROJECT_ID).includes("replace-me")) {
   failures.push("set vars.FCM_PROJECT_ID to the Firebase project ID");
 }
 const expectedSecrets = [
-  "LIVEKIT_API_KEY",
-  "LIVEKIT_API_SECRET",
+  "CF_TURN_KEY_ID",
+  "CF_TURN_API_TOKEN",
+  "SIGNAL_TICKET_SECRET",
   "ENROLLMENT_INVITE",
   "FCM_CLIENT_EMAIL",
   "FCM_PRIVATE_KEY",

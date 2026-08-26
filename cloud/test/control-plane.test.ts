@@ -1,6 +1,7 @@
 import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
 import { env } from "cloudflare:workers";
-import { describe, expect, it } from "vitest";
+import { SignJWT } from "jose";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import worker from "../src/index";
 import type { Env } from "../src/types";
 
@@ -49,7 +50,11 @@ async function enroll(platform: "android" | "browser", displayName: string): Pro
   const spki = new Uint8Array(await crypto.subtle.exportKey("spki", keyPair.publicKey));
   const response = await invoke(new Request("https://relay.test/v1/devices/enroll", {
     method: "POST",
-    headers: { "content-type": "application/json", "x-enrollment-invite": "integration-test-invite" },
+    headers: {
+      "content-type": "application/json",
+      "x-enrollment-invite": "integration-test-invite",
+      "x-relay-app-version": platform === "android" ? "android-webrtc-2" : "web-webrtc-1",
+    },
     body: JSON.stringify({ platform, displayName, publicKeySpki: base64Url(spki) }),
   }));
   expect(response.status).toBe(201);
@@ -79,6 +84,7 @@ async function signedRequest(
     "x-relay-timestamp": timestamp,
     "x-relay-nonce": nonce,
     "x-relay-signature": base64Url(signature),
+    "x-relay-app-version": "android-webrtc-2",
   });
   if (body !== undefined) headers.set("content-type", "application/json");
   return new Request(`https://relay.test${path}`, { method, headers, body: bodyText || undefined });
@@ -106,8 +112,37 @@ async function event(
   });
 }
 
+async function expiredSignalTicket(pairingId: string, deviceId: string, role: "android" | "peer"): Promise<string> {
+  const now = Math.floor(Date.now() / 1000);
+  return new SignJWT({ pairingId, deviceId, role, protocolVersion: 1 })
+    .setProtectedHeader({ alg: "HS256", typ: "JWT" })
+    .setAudience("call-relay-pairing-signal")
+    .setSubject(deviceId)
+    .setJti(crypto.randomUUID())
+    .setIssuedAt(now - 120)
+    .setExpirationTime(now - 60)
+    .sign(new TextEncoder().encode("integration-signal-ticket-secret-with-32-bytes"));
+}
+
 describe("Worker control plane", () => {
-  it("enforces pairing confirmation, roles, idempotency, state transitions, and least-privilege media grants", async () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("rejects pre-migration Android enrollment at the cutover gate", async () => {
+    const keyPair = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
+    const spki = new Uint8Array(await crypto.subtle.exportKey("spki", keyPair.publicKey));
+    const response = await invoke(new Request("https://relay.test/v1/devices/enroll", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-enrollment-invite": "integration-test-invite",
+        "x-relay-app-version": "android-webrtc-1",
+      },
+      body: JSON.stringify({ platform: "android", displayName: "Old Android", publicKeySpki: base64Url(spki) }),
+    }));
+    expect(response.status).toBe(426);
+  });
+
+  it("enforces pairing confirmation, roles, idempotency, state transitions, and Cloudflare-only media grants", async () => {
     const android = await enroll("android", "Relay Android");
     const browser = await enroll("browser", "Browser peer");
     const pairingSecret = crypto.getRandomValues(new Uint8Array(32));
@@ -133,6 +168,38 @@ describe("Worker control plane", () => {
     });
     expect(confirmation.status).toBe(200);
     expect((await json(confirmation)).confirmed).toBe(true);
+
+    const signalTicketResponse = await signedFetch(browser, `/v1/pairings/${pairingId}/signal-ticket`, "POST", {});
+    expect(signalTicketResponse.status).toBe(201);
+    const signalTicket = await json(signalTicketResponse);
+    expect(signalTicket.protocol).toBe("call-relay.signal.v1");
+    expect(signalTicket.role).toBe("peer");
+    const wrongPairing = await invoke(new Request("https://relay.test/v1/pairings/pair_00000000000000000000000000000000/signal", {
+      headers: {
+        upgrade: "websocket",
+        "sec-websocket-protocol": `call-relay.signal.v1, cr-ticket.${String(signalTicket.ticket)}`,
+      },
+    }));
+    expect(wrongPairing.status).toBe(403);
+    const expired = await invoke(new Request(`https://relay.test/v1/pairings/${pairingId}/signal`, {
+      headers: {
+        upgrade: "websocket",
+        "sec-websocket-protocol": `call-relay.signal.v1, cr-ticket.${await expiredSignalTicket(pairingId, browser.deviceId, "peer")}`,
+      },
+    }));
+    expect(expired.status).toBe(401);
+    const websocketRequest = new Request(`https://relay.test/v1/pairings/${pairingId}/signal`, {
+      headers: {
+        upgrade: "websocket",
+        "sec-websocket-protocol": `call-relay.signal.v1, cr-ticket.${String(signalTicket.ticket)}`,
+      },
+    });
+    const websocketResponse = await invoke(websocketRequest);
+    expect(websocketResponse.status).toBe(101);
+    websocketResponse.webSocket?.accept();
+    const reusedTicket = await invoke(websocketRequest);
+    expect(reusedTicket.status).toBe(409);
+    websocketResponse.webSocket?.close(1000, "test complete");
 
     const secondBrowser = await enroll("browser", "Second browser peer");
     const conflictingPairing = await signedFetch(secondBrowser, "/v1/pairings", "POST", {
@@ -180,37 +247,62 @@ describe("Worker control plane", () => {
     expect(incomingCreated.status).toBe(201);
     const incomingCallId = String((await json(incomingCreated)).callId);
 
-    const tokenResponse = await signedFetch(browser, `/v1/calls/${incomingCallId}/token`, "POST", {});
-    expect(tokenResponse.status).toBe(200);
-    const tokenBody = await json(tokenResponse);
-    const token = String(tokenBody.participantToken);
-    const segments = token.split(".");
-    expect(segments).toHaveLength(3);
-    const claims = JSON.parse(new TextDecoder().decode(fromBase64Url(segments[1] ?? ""))) as Record<string, unknown>;
-    const verificationKey = await crypto.subtle.importKey(
-      "raw",
-      new TextEncoder().encode("integration-api-secret"),
-      { name: "HMAC", hash: "SHA-256" },
-      false,
-      ["verify"],
-    );
-    expect(await crypto.subtle.verify(
-      "HMAC",
-      verificationKey,
-      fromBase64Url(segments[2] ?? "").buffer as ArrayBuffer,
-      new TextEncoder().encode(`${segments[0]}.${segments[1]}`),
-    )).toBe(true);
-    const grant = claims.video as Record<string, unknown>;
-    expect(grant.room).toBe(`call-${incomingCallId}`);
-    expect(grant.roomJoin).toBe(true);
-    expect(grant.canPublishSources).toEqual(["microphone"]);
-    expect(grant.canPublishData).toBe(false);
-    expect(claims.sub).toBe(browser.deviceId);
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      expect(request.headers.get("authorization")).toBe("Bearer integration-turn-token");
+      if (request.url.endsWith("/credentials/test-turn-username/revoke")) {
+        return Response.json({ revoked: true });
+      }
+      expect(request.url).toContain("/v1/turn/keys/integration-turn-key/credentials/generate");
+      return Response.json({
+        username: "test-turn-username",
+        credential: "test-turn-password",
+      }, { status: 201 });
+    });
+    const mediaResponse = await signedFetch(browser, `/v1/calls/${incomingCallId}/media-config`, "POST", {});
+    expect(mediaResponse.status).toBe(200);
+    const media = await json(mediaResponse);
+    expect(media.transport).toBe("webrtc_p2p");
+    expect(media.offerer).toBe("android");
+    expect(media.iceTransportPolicy).toBe("all");
+    expect(media.iceServers).toHaveLength(2);
+    const returnedIceServers = media.iceServers as Array<{ urls: string[] }>;
+    expect(returnedIceServers[1]?.urls).toContain("turns:turn.cloudflare.com:443?transport=tcp");
+    const storedCredential = await env.CALL_RELAY_DB.prepare(
+      "SELECT username, call_id, device_id FROM turn_credentials WHERE username = ?",
+    ).bind("test-turn-username").first<{ username: string; call_id: string; device_id: string }>();
+    expect(storedCredential).toEqual({ username: "test-turn-username", call_id: incomingCallId, device_id: browser.deviceId });
+
+    const removedToken = await signedFetch(browser, `/v1/calls/${incomingCallId}/token`, "POST", {});
+    expect(removedToken.status).toBe(410);
 
     const accepted = await event(browser, incomingCallId, "accept");
     expect((await json(accepted)).state).toBe("accepted");
     expect((await json(await event(android, incomingCallId, "active"))).state).toBe("active");
+    const summary = await event(android, incomingCallId, "media_summary", {
+      setupDurationMs: 1250,
+      candidateType: "relay",
+      protocol: "tls",
+      bytesSent: 4096,
+      sdp: "v=0\r\nthis-must-never-be-stored",
+      candidate: "candidate:private-address",
+    });
+    expect(summary.status).toBe(200);
+    const storedSummary = await env.CALL_RELAY_DB.prepare(
+      "SELECT payload_json FROM call_events WHERE call_id = ? AND event_type = 'media_summary' ORDER BY created_at DESC LIMIT 1",
+    ).bind(incomingCallId).first<{ payload_json: string }>();
+    expect(JSON.parse(storedSummary?.payload_json ?? "{}")).toEqual({
+      setupDurationMs: 1250,
+      candidateType: "relay",
+      protocol: "tls",
+      bytesSent: 4096,
+    });
     expect((await json(await event(android, incomingCallId, "end"))).state).toBe("ended");
+    const revokedCredential = await env.CALL_RELAY_DB.prepare(
+      "SELECT revoked_at, last_error FROM turn_credentials WHERE username = ?",
+    ).bind("test-turn-username").first<{ revoked_at: number | null; last_error: string | null }>();
+    expect(revokedCredential?.revoked_at).toEqual(expect.any(Number));
+    expect(revokedCredential?.last_error).toBeNull();
 
     const current = await signedFetch(browser, "/v1/calls/current", "GET");
     expect(current.status).toBe(200);

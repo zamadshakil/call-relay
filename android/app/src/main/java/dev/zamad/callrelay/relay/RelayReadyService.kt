@@ -8,6 +8,8 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.ConnectivityManager
+import android.net.Network
 import android.net.Uri
 import android.os.Bundle
 import android.os.IBinder
@@ -16,7 +18,8 @@ import android.telecom.PhoneAccountHandle
 import android.telecom.TelecomManager
 import android.telephony.TelephonyManager
 import dev.zamad.callrelay.MainActivity
-import dev.zamad.callrelay.crypto.CallKeyDeriver
+import dev.zamad.callrelay.R
+import dev.zamad.callrelay.network.PairingSignalClient
 import dev.zamad.callrelay.network.RelayApiClient
 import dev.zamad.callrelay.telecom.NumberPolicy
 import dev.zamad.callrelay.telecom.RelayInCallService
@@ -35,7 +38,9 @@ class RelayReadyService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private lateinit var preferences: RelayPreferences
     private lateinit var api: RelayApiClient
-    private lateinit var media: LiveKitRelaySession
+    private lateinit var media: WebRtcRelaySession
+    private lateinit var signal: PairingSignalClient
+    private lateinit var connectivity: ConnectivityManager
     private var watchdog: Job? = null
     private var setupJob: Job? = null
     private var setupGeneration = 0L
@@ -49,11 +54,13 @@ class RelayReadyService : Service() {
         super.onCreate()
         preferences = RelayPreferences(this)
         api = RelayApiClient(preferences)
-        media = LiveKitRelaySession(this, preferences)
+        signal = PairingSignalClient(preferences, api, signalListener)
+        media = WebRtcRelaySession(this, preferences, api, signal, mediaListener)
+        connectivity = getSystemService(ConnectivityManager::class.java)
+        connectivity.registerDefaultNetworkCallback(networkCallback)
         createNotificationChannel()
         watchdog = scope.launch {
             while (isActive) {
-                media.refreshRemoteVolume()
                 enforceMediaWatchdog()
                 sendHeartbeatIfDue()
                 delay(1_000)
@@ -103,17 +110,6 @@ class RelayReadyService : Service() {
                     }
                 }
             }
-            ACTION_CONNECT -> ifReady {
-                scope.launch {
-                    runCatching {
-                        connectMedia(
-                            callId = intent.getStringExtra(EXTRA_CALL_ID).orEmpty(),
-                            serverUrl = intent.getStringExtra(EXTRA_SERVER_URL).orEmpty(),
-                            token = intent.getStringExtra(EXTRA_TOKEN).orEmpty(),
-                        )
-                    }.onFailure(::reportFailure)
-                }
-            }
         }
         return START_NOT_STICKY
     }
@@ -123,6 +119,8 @@ class RelayReadyService : Service() {
         invalidateSetup()
         activeReportJob?.cancel()
         media.disconnect()
+        signal.close()
+        runCatching { connectivity.unregisterNetworkCallback(networkCallback) }
         scope.cancel()
         RelayRuntime.update { RelayRuntime.Snapshot() }
         super.onDestroy()
@@ -133,6 +131,7 @@ class RelayReadyService : Service() {
     private fun arm() {
         startForeground(NOTIFICATION_ID, notification("Ready for one paired peer"))
         RelayRuntime.update { it.copy(ready = true, error = null) }
+        signal.start()
     }
 
     private fun disarm() {
@@ -142,6 +141,7 @@ class RelayReadyService : Service() {
         activeReportedCallId = null
         mediaExpected = false
         media.disconnect()
+        signal.close()
         RelayRuntime.update { it.copy(ready = false, callId = null) }
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
@@ -172,11 +172,8 @@ class RelayReadyService : Service() {
                 checkSetupIsCurrent(generation)
                 check(RelayInCallService.activeCallCount() == 1) { "The cellular call ended before relay setup" }
                 activeReportedCallId = null
-                RelayRuntime.update { it.copy(callId = call.callId, mediaState = "Fetching room token") }
-                val credentials = api.token(call.callId)
-                checkSetupIsCurrent(generation)
-                check(RelayInCallService.activeCallCount() == 1) { "The cellular call ended before relay setup" }
-                connectMedia(call.callId, credentials.serverUrl, credentials.participantToken)
+                RelayRuntime.update { it.copy(callId = call.callId, mediaState = "Preparing direct-first WebRTC") }
+                connectMedia(call.callId)
                 checkSetupIsCurrent(generation)
             }.onFailure { failure ->
                 if (failure is CancellationException) {
@@ -206,10 +203,8 @@ class RelayReadyService : Service() {
             runCatching {
                 validateOutgoing(number)
                 checkSetupIsCurrent(generation)
-                RelayRuntime.update { it.copy(callId = callId, mediaState = "Fetching room token") }
-                val credentials = api.token(callId)
-                checkSetupIsCurrent(generation)
-                connectMedia(callId, credentials.serverUrl, credentials.participantToken)
+                RelayRuntime.update { it.copy(callId = callId, mediaState = "Preparing direct-first WebRTC") }
+                connectMedia(callId)
                 checkSetupIsCurrent(generation)
                 awaitPairedPeer(generation)
                 placeCellularCall(number)
@@ -228,9 +223,21 @@ class RelayReadyService : Service() {
     private fun acceptIncoming(requestedCallId: String?) {
         val activeCallId = RelayRuntime.snapshot().callId
         if (requestedCallId != null && activeCallId != null && requestedCallId != activeCallId) return
-        RelayInCallService.answer()
-        RelayInCallService.routeCurrentCallToSpeaker()
-        if (RelayInCallService.isActive()) callBecameActive()
+        if (activeCallId == null) return
+        scope.launch {
+            runCatching {
+                awaitPairedPeer(setupGeneration)
+                check(RelayInCallService.activeCallCount() == 1) { "Incoming SIM call ended before WebRTC connected" }
+                RelayInCallService.answer()
+                RelayInCallService.routeCurrentCallToSpeaker()
+                if (RelayInCallService.isActive()) callBecameActive()
+            }.onFailure { failure ->
+                if (failure !is CancellationException) {
+                    runCatching { api.event(activeCallId, "failed", "media_not_ready_before_answer") }
+                    reportFailure(failure)
+                }
+            }
+        }
     }
 
     private fun callBecameActive() {
@@ -247,17 +254,15 @@ class RelayReadyService : Service() {
         }
     }
 
-    private suspend fun connectMedia(callId: String, serverUrl: String, token: String) {
-        if (callId.isBlank() || serverUrl.isBlank() || token.isBlank()) {
-            RelayRuntime.update { it.copy(error = "Missing call media credentials") }
-            error("Missing call media credentials")
-        }
-        val passphrase = CallKeyDeriver.derivePassphrase(preferences.pairingSecret, callId)
+    private suspend fun connectMedia(callId: String) {
+        require(callId.isNotBlank()) { "Missing call ID" }
         mediaExpected = true
         try {
-            media.connect(serverUrl, token, passphrase)
+            api.event(callId, "media_connecting")
+            signal.awaitConnected()
+            media.connect(callId)
             media.applyMode(RelayRuntime.snapshot().mode)
-            updateNotification("Media connected; waiting for paired peer")
+            updateNotification("WebRTC connecting; SIM remains gated")
         } catch (failure: Throwable) {
             mediaExpected = false
             throw failure
@@ -274,9 +279,13 @@ class RelayReadyService : Service() {
         mediaExpected = false
         mediaLostAt = null
         lastHeartbeatAt = 0L
+        val summary = media.summary().json()
         media.disconnect()
         RelayRuntime.update { it.copy(callId = null, mediaState = "Disconnected") }
-        if (callId != null) scope.launch { runCatching { api.event(callId, "end") } }
+        if (callId != null) scope.launch {
+            runCatching { api.event(callId, "media_summary", payload = summary) }
+            runCatching { api.event(callId, "end") }
+        }
         updateNotification("Ready for one paired peer")
     }
 
@@ -400,7 +409,7 @@ class RelayReadyService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
         return Notification.Builder(this, CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.stat_sys_phone_call)
+            .setSmallIcon(R.drawable.ic_call_relay)
             .setContentTitle("Call Relay is ready")
             .setContentText(text)
             .setContentIntent(pendingIntent)
@@ -421,20 +430,91 @@ class RelayReadyService : Service() {
         const val ACTION_CALL_ACTIVE = "dev.zamad.callrelay.action.CALL_ACTIVE"
         const val ACTION_END = "dev.zamad.callrelay.action.END"
         const val ACTION_SET_MODE = "dev.zamad.callrelay.action.SET_MODE"
-        const val ACTION_CONNECT = "dev.zamad.callrelay.action.CONNECT"
         const val ACTION_DTMF = "dev.zamad.callrelay.action.DTMF"
         const val ACTION_MUTE = "dev.zamad.callrelay.action.MUTE"
         const val EXTRA_CALL_ID = "call_id"
         const val EXTRA_PHONE_NUMBER = "phone_number"
         const val EXTRA_MODE = "mode"
-        const val EXTRA_SERVER_URL = "server_url"
-        const val EXTRA_TOKEN = "token"
         const val EXTRA_DTMF = "dtmf"
         const val EXTRA_MUTED = "muted"
         private const val CHANNEL_ID = "relay-ready"
         private const val NOTIFICATION_ID = 2001
         private const val MEDIA_LOSS_TIMEOUT_MS = 15_000L
         private const val PEER_JOIN_TIMEOUT_MS = 20_000L
-        private const val HEARTBEAT_INTERVAL_MS = 10_000L
+        private const val HEARTBEAT_INTERVAL_MS = 30_000L
+    }
+
+    private val signalListener = object : PairingSignalClient.Listener {
+        override fun onSignalState(state: String) {
+            RelayRuntime.update { current ->
+                if (current.callId == null) current.copy(mediaState = "Signaling: $state") else current
+            }
+        }
+
+        override fun onPeerPresence(online: Boolean) {
+            if (RelayRuntime.snapshot().callId == null) updateNotification(if (online) "Paired peer online" else "Ready; paired peer offline")
+        }
+
+        override fun onCallSnapshot(call: PairingSignalClient.CallSnapshot) {
+            scope.launch {
+                if (call.state == "ending" || call.state == "ended" || call.state == "failed") {
+                    if (isCurrentCall(call.id)) endRelay(remoteRequest = true)
+                    return@launch
+                }
+                if (call.direction == "outgoing" && RelayRuntime.snapshot().callId == null && !call.phoneNumber.isNullOrBlank()) {
+                    beginOutgoing(call.id, call.phoneNumber)
+                    return@launch
+                }
+                if (isCurrentCall(call.id)) {
+                    media.applyMode(RelayMode.fromWire(call.relayMode))
+                    if (call.direction == "incoming" && call.state == "accepted" && !RelayInCallService.isActive()) acceptIncoming(call.id)
+                }
+            }
+        }
+
+        override fun onEnvelope(type: String, payload: org.json.JSONObject, callId: String) {
+            scope.launch {
+                runCatching { media.handleSignal(type, payload, callId) }
+                    .onFailure(::reportFailure)
+            }
+        }
+
+        override fun onSignalError(message: String) {
+            RelayRuntime.update { it.copy(error = message) }
+        }
+    }
+
+    private val mediaListener = object : WebRtcRelaySession.Listener {
+        override fun onMediaConnected(candidateType: String, icePolicy: String) {
+            val callId = RelayRuntime.snapshot().callId ?: return
+            scope.launch {
+                runCatching {
+                    api.event(
+                        callId,
+                        "media_connected",
+                        payload = org.json.JSONObject().put("candidateType", candidateType).put("icePolicy", icePolicy),
+                    )
+                }
+            }
+            updateNotification("WebRTC connected; safe for SIM call")
+        }
+
+        override fun onMediaFailed(code: String, message: String) {
+            val failedCallId = RelayRuntime.snapshot().callId ?: return
+            scope.launch {
+                mediaExpected = false
+                val summary = media.summary().json()
+                media.disconnect()
+                if (RelayInCallService.isActive()) RelayInCallService.disconnect()
+                runCatching { api.event(failedCallId, "media_summary", payload = summary) }
+                runCatching { api.event(failedCallId, "failed", code) }
+                reportFailure(IllegalStateException(message))
+            }
+        }
+    }
+
+    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) = media.networkChanged()
+        override fun onLost(network: Network) = media.networkChanged()
     }
 }

@@ -9,8 +9,9 @@ export default defineConfig(async () => {
   const fcmPrivateKey = privateKey.export({ type: "pkcs8", format: "pem" });
   const testSecrets = {
     ENROLLMENT_INVITE: "integration-test-invite",
-    LIVEKIT_API_KEY: "integration-api-key",
-    LIVEKIT_API_SECRET: "integration-api-secret",
+    CF_TURN_KEY_ID: "integration-turn-key",
+    CF_TURN_API_TOKEN: "integration-turn-token",
+    SIGNAL_TICKET_SECRET: "integration-signal-ticket-secret-with-32-bytes",
     FCM_CLIENT_EMAIL: "test@example.invalid",
     FCM_PRIVATE_KEY: fcmPrivateKey,
   };

@@ -13,7 +13,9 @@ Thumbs.db
 **/google-services.json
 **/local.properties
 **/.secrets*.json
-**/.enrollment-invite.txt
+**/.enrollment-invite*.txt
+**/.signal-ticket-secret*.txt
+**/turn-keys.txt
 **/*service-account*.json
 **/firebase-adminsdk*.json
 **/*firebase-adminsdk*.json

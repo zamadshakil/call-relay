@@ -8,11 +8,29 @@ class RelayPreferences(context: Context) {
     private val preferences = context.getSharedPreferences("relay-private", Context.MODE_PRIVATE)
     private val secureSecretStore = SecureSecretStore(context)
 
+    init {
+        val saved = preferences.getString(KEY_API_BASE, null)?.trim()?.trimEnd('/')
+        if (saved in OFFICIAL_API_ORIGINS && saved != BuildConfig.DEFAULT_API_BASE_URL) {
+            clearEnvironmentIdentity()
+            preferences.edit().putString(KEY_API_BASE, BuildConfig.DEFAULT_API_BASE_URL).apply()
+        }
+    }
+
     var apiBaseUrl: String
         get() = preferences.getString(KEY_API_BASE, BuildConfig.DEFAULT_API_BASE_URL)
             ?.ifBlank { BuildConfig.DEFAULT_API_BASE_URL }
             ?: BuildConfig.DEFAULT_API_BASE_URL
-        set(value) = preferences.edit().putString(KEY_API_BASE, value.trim().trimEnd('/')).apply()
+        set(value) {
+            val requested = value.trim().trimEnd('/')
+            val next = if (requested in OFFICIAL_API_ORIGINS && requested != BuildConfig.DEFAULT_API_BASE_URL) {
+                BuildConfig.DEFAULT_API_BASE_URL
+            } else {
+                requested
+            }
+            val previous = apiBaseUrl
+            if (previous != next) clearEnvironmentIdentity()
+            preferences.edit().putString(KEY_API_BASE, next).apply()
+        }
 
     var deviceId: String
         get() = preferences.getString(KEY_DEVICE_ID, "") ?: ""
@@ -77,6 +95,17 @@ class RelayPreferences(context: Context) {
         preferences.edit().putString(KEY_REMOTE_COMMANDS, existing.takeLast(100).joinToString("\n")).commit()
     }
 
+    private fun clearEnvironmentIdentity() {
+        preferences.edit()
+            .remove(KEY_DEVICE_ID)
+            .remove(KEY_PAIRING_ID)
+            .remove(KEY_PAIRING_SECRET)
+            .remove(KEY_PAIRING_CONFIRMED)
+            .remove(KEY_REMOTE_COMMANDS)
+            .apply()
+        secureSecretStore.put("")
+    }
+
     companion object {
         private const val KEY_API_BASE = "api_base"
         private const val KEY_DEVICE_ID = "device_id"
@@ -88,6 +117,10 @@ class RelayPreferences(context: Context) {
         private const val KEY_CAPTURE_GAIN = "capture_gain"
         private const val KEY_PLAYBACK_GAIN = "playback_gain"
         private const val KEY_REMOTE_COMMANDS = "remote_commands"
+        private val OFFICIAL_API_ORIGINS = setOf(
+            "https://call-relay-staging.zamadshakil.workers.dev",
+            "https://call-relay.zamadshakil.workers.dev",
+        )
         private val commandLock = Any()
     }
 }

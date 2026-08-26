@@ -1,34 +1,25 @@
-# Production secrets
+# Worker secrets
 
-Production uses encrypted per-Worker secrets. The five required names are declared in `wrangler.jsonc`, which allows Wrangler to reject a deployment when one is missing:
+Required encrypted Worker secrets:
 
-- `LIVEKIT_API_KEY`
-- `LIVEKIT_API_SECRET`
+- `CF_TURN_KEY_ID`
+- `CF_TURN_API_TOKEN`
+- `SIGNAL_TICKET_SECRET` (at least 32 random bytes)
 - `ENROLLMENT_INVITE`
 - `FCM_CLIENT_EMAIL`
 - `FCM_PRIVATE_KEY`
 
-For the first deployment, create an ignored `.secrets.production.json` containing all five values and upload it atomically:
+Prepare an ignored aggregate upload without printing values:
 
 ```powershell
-pnpm build
+pnpm secrets:prepare -- --firebase "C:\secure\firebase-service-account.json" --turn "C:\secure\turn-keys.txt"
+pnpm providers:validate -- --firebase "C:\secure\firebase-service-account.json" --turn "C:\secure\turn-keys.txt"
 pnpm exec wrangler deploy --secrets-file .\.secrets.production.json
 pnpm exec wrangler secret list
 ```
 
-The complete guide includes protected PowerShell prompts that construct this file without printing the credentials. Delete only `.secrets.production.json` immediately after the deployment and `/health` check succeed.
+The TURN file contains `CF_TURN_KEY_ID=...` and `CF_TURN_API_TOKEN=...`. The preparation script creates ignored enrollment and signaling secrets if absent. Delete only `.secrets.production.json` after successful deployment; retain the generated secret source files securely for recovery.
 
-For later Firebase-key rotation, load the downloaded service-account JSON without printing its credentials:
+For the first staging deployment, use a separate staging TURN key and separate generated invite/ticket files, then pass the aggregate file directly to `wrangler deploy --env staging --secrets-file ...`. A new Worker cannot receive secrets with `secret bulk` before its first deployment.
 
-```powershell
-$firebaseCredentialPath = "C:\secure\call-relay-firebase-service-account.json"
-$firebaseCredential = Get-Content -Raw -LiteralPath $firebaseCredentialPath | ConvertFrom-Json
-$firebaseCredential.private_key | pnpm exec wrangler secret put FCM_PRIVATE_KEY
-Remove-Variable firebaseCredential
-```
-
-Do not commit the service-account JSON. Secure or remove the downloaded key after confirming deployment, and revoke it immediately if it is exposed.
-
-Cloudflare Secrets Store is intentionally not used for `FCM_PRIVATE_KEY`: Secrets Store currently limits each account secret to 1024 bytes, while an RSA PKCS#8 Firebase private key commonly exceeds that. Per-Worker secrets support values up to 5 KB and are compatible with the Worker's existing secret loader.
-
-Use `pnpm exec wrangler secret list` to verify names only. Cloudflare will not reveal stored values. Re-running `wrangler secret put NAME` rotates a value by creating and deploying a new Worker version. See `../../docs/DEPLOYMENT_GUIDE.md` for initial setup and recovery details.
+Never commit or print these values. Per-Worker secrets are used because the Firebase PKCS#8 key commonly exceeds Secrets Store's smaller item limit.

@@ -1,17 +1,35 @@
 import { authenticate } from "./auth";
 import { HttpError, fromBase64Url, json, readBodyBytes, readJson, requireString, timingSafeEqualText } from "./http";
-import { createLiveKitToken } from "./livekit";
 import { dispatchOutboxItem, drainOutbox } from "./outbox";
+import { PairingSignal } from "./pairing-signal";
 import { deliverPush } from "./push";
 import { secretValue } from "./secrets";
+import { createSignalTicket, SIGNALING_PROTOCOL, signalRole, signalTicketFromProtocols, verifySignalTicket } from "./signal-ticket";
 import { canTransition, isE164 } from "./state";
+import { createMediaConfig, revokeDueTurnCredentials, revokeTurnCredentialsForCall } from "./turn";
 import type { CallRow, CallState, DeviceRow, Env, PairingRow, Platform, PushJob, RelayMode } from "./types";
 
-type JsonObject = Record<string, unknown>;
-type EventType = "accept" | "reject" | "end" | "mute" | "dtmf" | "full_duplex" | "listen" | "talk" | "active" | "failed" | "media_heartbeat";
+export { PairingSignal };
 
-const EVENT_TYPES = new Set<EventType>(["accept", "reject", "end", "mute", "dtmf", "full_duplex", "listen", "talk", "active", "failed", "media_heartbeat"]);
+type JsonObject = Record<string, unknown>;
+type EventType = "accept" | "reject" | "end" | "mute" | "dtmf" | "full_duplex" | "listen" | "talk" | "active" | "failed" |
+  "media_connecting" | "media_connected" | "media_path_changed" | "media_restarting" | "media_summary" | "media_heartbeat";
+
+const EVENT_TYPES = new Set<EventType>([
+  "accept", "reject", "end", "mute", "dtmf", "full_duplex", "listen", "talk", "active", "failed",
+  "media_connecting", "media_connected", "media_path_changed", "media_restarting", "media_summary", "media_heartbeat",
+]);
 const MODE_EVENTS = new Set<EventType>(["full_duplex", "listen", "talk"]);
+const MEDIA_EVENTS = new Set<EventType>(["media_connecting", "media_connected", "media_path_changed", "media_restarting", "media_summary"]);
+const MIN_ANDROID_APP_VERSION = 2;
+
+function assertSupportedAndroidVersion(request: Request): void {
+  const value = request.headers.get("x-relay-app-version") ?? "";
+  const match = /^android-webrtc-(\d+)$/u.exec(value);
+  if (!match || Number(match[1]) < MIN_ANDROID_APP_VERSION) {
+    throw new HttpError(426, `Android app version android-webrtc-${MIN_ANDROID_APP_VERSION} or newer is required`);
+  }
+}
 
 function id(prefix: string): string {
   return `${prefix}_${crypto.randomUUID().replaceAll("-", "")}`;
@@ -42,6 +60,19 @@ async function getCall(env: Env, callId: string): Promise<CallRow> {
   return call;
 }
 
+async function getPairing(env: Env, pairingId: string): Promise<PairingRow> {
+  const pairing = await env.CALL_RELAY_DB.prepare("SELECT * FROM pairings WHERE id = ? AND revoked_at IS NULL")
+    .bind(pairingId).first<PairingRow>();
+  if (!pairing) throw new HttpError(404, "pairing not found");
+  return pairing;
+}
+
+function broadcastCall(env: Env, ctx: ExecutionContext, call: CallRow): void {
+  ctx.waitUntil(env.PAIRING_SIGNAL.getByName(call.pairing_id).publishSnapshot(JSON.stringify(call)).catch((error: unknown) => {
+    console.error(JSON.stringify({ message: "call snapshot broadcast failed", callId: call.id, error: error instanceof Error ? error.message : String(error) }));
+  }));
+}
+
 function assertCallMember(call: CallRow, deviceId: string): void {
   if (call.android_device_id !== deviceId && call.peer_device_id !== deviceId) {
     throw new HttpError(403, "device is not a member of this call");
@@ -66,6 +97,7 @@ async function enroll(request: Request, env: Env): Promise<Response> {
   const body = await readJson<JsonObject>(request);
   const platform = requireString(body.platform, "platform") as Platform;
   if (!["android", "browser", "ios"].includes(platform)) throw new HttpError(400, "platform is invalid");
+  if (platform === "android") assertSupportedAndroidVersion(request);
   const displayName = requireString(body.displayName, "displayName", 80).trim();
   if (!displayName) throw new HttpError(400, "displayName is invalid");
   const publicKeySpki = requireString(body.publicKeySpki, "publicKeySpki", 512);
@@ -142,7 +174,15 @@ async function confirmPairing(request: Request, env: Env, device: DeviceRow, pai
   return json({ pairingId: pairing.id, confirmed: true });
 }
 
-async function expireStaleForAndroid(env: Env, androidDeviceId: string, now: number): Promise<void> {
+async function expireStaleForAndroid(env: Env, ctx: ExecutionContext, androidDeviceId: string, now: number): Promise<void> {
+  const stale = await env.CALL_RELAY_DB.prepare(
+    `SELECT id FROM call_sessions
+     WHERE android_device_id = ? AND state NOT IN ('ended', 'failed') AND (
+       (state IN ('created', 'ringing_peer', 'accepted', 'dialing_sim') AND updated_at < ?) OR
+       (state = 'active' AND updated_at < ?) OR
+       (state = 'ending' AND updated_at < ?)
+     )`,
+  ).bind(androidDeviceId, now - 120_000, now - 90_000, now - 30_000).all<{ id: string }>();
   await env.CALL_RELAY_DB.prepare(
     `UPDATE call_sessions SET state = 'failed', failure_code = 'stale_session', ended_at = ?, updated_at = ?, version = version + 1
      WHERE android_device_id = ? AND state NOT IN ('ended', 'failed') AND (
@@ -150,7 +190,12 @@ async function expireStaleForAndroid(env: Env, androidDeviceId: string, now: num
        (state = 'active' AND updated_at < ?) OR
        (state = 'ending' AND updated_at < ?)
      )`,
-  ).bind(now, now, androidDeviceId, now - 120_000, now - 45_000, now - 30_000).run();
+  ).bind(now, now, androidDeviceId, now - 120_000, now - 90_000, now - 30_000).run();
+  for (const staleCall of stale.results) {
+    const updated = await getCall(env, staleCall.id);
+    broadcastCall(env, ctx, updated);
+    ctx.waitUntil(revokeTurnCredentialsForCall(env, staleCall.id));
+  }
 }
 
 async function createCall(request: Request, env: Env, ctx: ExecutionContext, device: DeviceRow, direction: "incoming" | "outgoing"): Promise<Response> {
@@ -181,7 +226,7 @@ async function createCall(request: Request, env: Env, ctx: ExecutionContext, dev
   }
   const callId = id("call");
   const now = Date.now();
-  await expireStaleForAndroid(env, androidDeviceId, now);
+  await expireStaleForAndroid(env, ctx, androidDeviceId, now);
   const state: CallState = direction === "incoming" ? "ringing_peer" : "dialing_sim";
   const targetDeviceId = direction === "outgoing" ? androidDeviceId : peerDeviceId;
   const targetPlatform = targetDeviceId === device.id ? device.platform : peer.platform;
@@ -208,16 +253,17 @@ async function createCall(request: Request, env: Env, ctx: ExecutionContext, dev
   if (outboxId) ctx.waitUntil(dispatchOutboxItem(env, outboxId).catch((error: unknown) => {
     console.error(JSON.stringify({ message: "initial call push enqueue failed", callId, error: error instanceof Error ? error.message : String(error) }));
   }));
+  broadcastCall(env, ctx, await getCall(env, callId));
   return json({ callId, state }, { status: 201 });
 }
 
-async function callToken(env: Env, call: CallRow, device: DeviceRow): Promise<Response> {
+async function callMediaConfig(env: Env, call: CallRow, device: DeviceRow): Promise<Response> {
   assertCallMember(call, device.id);
   if (["ending", "ended", "failed"].includes(call.state)) throw new HttpError(409, "call is closing or closed");
   const confirmed = await env.CALL_RELAY_DB.prepare("SELECT id FROM pairings WHERE id = ? AND confirmed_at IS NOT NULL AND revoked_at IS NULL")
     .bind(call.pairing_id).first<{ id: string }>();
   if (!confirmed) throw new HttpError(409, "pairing is not confirmed");
-  return json({ serverUrl: env.LIVEKIT_URL, participantToken: await createLiveKitToken(env, call, device), roomName: `call-${call.id}`, expiresInSeconds: 600 });
+  return json(await createMediaConfig(env, call, device));
 }
 
 function authorizeEvent(call: CallRow, device: DeviceRow, eventType: EventType): CallState {
@@ -238,7 +284,65 @@ function authorizeEvent(call: CallRow, device: DeviceRow, eventType: EventType):
     if (isAndroid) throw new HttpError(403, "this control originates from the paired peer");
     return call.state;
   }
+  if (MEDIA_EVENTS.has(eventType)) return call.state;
   return call.state;
+}
+
+function sanitizeEventPayload(eventType: EventType, payload: Record<string, unknown>): Record<string, unknown> {
+  if (eventType === "dtmf") {
+    if (typeof payload.digit !== "string" || !/^[0-9*#]$/u.test(payload.digit)) throw new HttpError(400, "DTMF must be one digit from 0-9, * or #");
+    return { digit: payload.digit };
+  }
+  if (eventType === "mute") {
+    if (typeof payload.muted !== "boolean") throw new HttpError(400, "mute payload must contain a boolean muted value");
+    return { muted: payload.muted };
+  }
+  if (eventType === "media_connected" || eventType === "media_path_changed" || eventType === "media_restarting") {
+    const result: Record<string, unknown> = {};
+    if (payload.candidateType !== undefined) {
+      if (typeof payload.candidateType !== "string" || !["host", "srflx", "relay"].includes(payload.candidateType)) throw new HttpError(400, "candidateType is invalid");
+      result.candidateType = payload.candidateType;
+    }
+    if (payload.icePolicy !== undefined) {
+      if (payload.icePolicy !== "all" && payload.icePolicy !== "relay") throw new HttpError(400, "icePolicy is invalid");
+      result.icePolicy = payload.icePolicy;
+    }
+    if (eventType === "media_restarting" && payload.reason !== undefined) {
+      const allowed = new Set(["direct_timeout", "ice_failed", "connection_failed", "network_change", "network_online", "peer_request"]);
+      if (typeof payload.reason !== "string" || !allowed.has(payload.reason)) throw new HttpError(400, "media restart reason is invalid");
+      result.reason = payload.reason;
+    }
+    return result;
+  }
+  if (eventType === "media_summary") {
+    const result: Record<string, unknown> = {};
+    const limits: Record<string, number> = {
+      setupDurationMs: 120_000,
+      rttMs: 60_000,
+      jitterMs: 60_000,
+      packetsLost: 1_000_000_000_000,
+      concealedSamples: 10_000_000_000_000,
+      bytesSent: 10_000_000_000_000,
+      bytesReceived: 10_000_000_000_000,
+      iceRestartCount: 10_000,
+    };
+    for (const [name, maximum] of Object.entries(limits)) {
+      const value = payload[name];
+      if (value === undefined) continue;
+      if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > maximum) throw new HttpError(400, `${name} is invalid`);
+      result[name] = value;
+    }
+    if (payload.candidateType !== undefined) {
+      if (typeof payload.candidateType !== "string" || !["host", "srflx", "relay", "unknown"].includes(payload.candidateType)) throw new HttpError(400, "candidateType is invalid");
+      result.candidateType = payload.candidateType;
+    }
+    if (payload.protocol !== undefined) {
+      if (typeof payload.protocol !== "string" || !["udp", "tcp", "tls", "unknown"].includes(payload.protocol)) throw new HttpError(400, "media protocol is invalid");
+      result.protocol = payload.protocol;
+    }
+    return result;
+  }
+  return {};
 }
 
 async function appendEvent(request: Request, env: Env, ctx: ExecutionContext, call: CallRow, device: DeviceRow): Promise<Response> {
@@ -248,9 +352,12 @@ async function appendEvent(request: Request, env: Env, ctx: ExecutionContext, ca
   if (!EVENT_TYPES.has(eventTypeValue as EventType)) throw new HttpError(400, "unsupported event type");
   const eventType = eventTypeValue as EventType;
   const commandId = requireCommandId(body.commandId);
-  const payload = typeof body.payload === "object" && body.payload !== null && !Array.isArray(body.payload) ? body.payload as Record<string, unknown> : {};
-  if (eventType === "dtmf" && (typeof payload.digit !== "string" || !/^[0-9*#]$/u.test(payload.digit))) throw new HttpError(400, "DTMF must be one digit from 0-9, * or #");
-  if (eventType === "mute" && typeof payload.muted !== "boolean") throw new HttpError(400, "mute payload must contain a boolean muted value");
+  const rawPayload = typeof body.payload === "object" && body.payload !== null && !Array.isArray(body.payload) ? body.payload as Record<string, unknown> : {};
+  const payload = sanitizeEventPayload(eventType, rawPayload);
+  const candidateType = typeof payload.candidateType === "string" ? payload.candidateType : null;
+  if (candidateType !== null && !["host", "srflx", "relay"].includes(candidateType)) throw new HttpError(400, "candidateType is invalid");
+  const icePolicy = typeof payload.icePolicy === "string" ? payload.icePolicy : null;
+  if (icePolicy !== null && icePolicy !== "all" && icePolicy !== "relay") throw new HttpError(400, "icePolicy is invalid");
   const duplicate = await env.CALL_RELAY_DB.prepare("SELECT id FROM call_events WHERE call_id = ? AND command_id = ?")
     .bind(call.id, commandId).first<{ id: string }>();
   if (duplicate) {
@@ -275,15 +382,22 @@ async function appendEvent(request: Request, env: Env, ctx: ExecutionContext, ca
     .bind(targetDeviceId).first<{ platform: Platform }>();
   const outboxId = target?.platform === "android" ? id("push") : null;
   const failureCode = eventType === "failed" ? requireString(body.code ?? "unknown", "code", 80) : null;
+  if (failureCode !== null && !/^[a-z0-9_]{1,80}$/u.test(failureCode)) throw new HttpError(400, "failure code is invalid");
+  const mediaConnectedAt = eventType === "media_connected" ? now : null;
+  const mediaFailureCode = eventType === "failed" ? failureCode : null;
   const statements: D1PreparedStatement[] = [
     env.CALL_RELAY_DB.prepare(
-      "UPDATE call_sessions SET state = ?, relay_mode = ?, updated_at = ?, ended_at = COALESCE(?, ended_at), failure_code = COALESCE(?, failure_code), version = version + 1, last_event_id = ? WHERE id = ? AND version = ? AND state = ?",
-    ).bind(nextState, relayMode, now, terminal, failureCode, eventId, call.id, call.version, call.state),
+      `UPDATE call_sessions SET state = ?, relay_mode = ?, updated_at = ?, ended_at = COALESCE(?, ended_at),
+       failure_code = COALESCE(?, failure_code), media_connected_at = COALESCE(?, media_connected_at),
+       media_failure_code = COALESCE(?, media_failure_code), selected_candidate_type = COALESCE(?, selected_candidate_type),
+       ice_policy = COALESCE(?, ice_policy), version = version + 1, last_event_id = ?
+       WHERE id = ? AND version = ? AND state = ?`,
+    ).bind(nextState, relayMode, now, terminal, failureCode, mediaConnectedAt, mediaFailureCode, candidateType, icePolicy, eventId, call.id, call.version, call.state),
     env.CALL_RELAY_DB.prepare(
       "INSERT INTO call_events(id, call_id, device_id, event_type, payload_json, created_at, command_id) SELECT ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM call_sessions WHERE id = ? AND last_event_id = ?)",
     ).bind(eventId, call.id, device.id, eventType, JSON.stringify(payload), now, commandId, call.id, eventId),
   ];
-  if (outboxId) statements.push(env.CALL_RELAY_DB.prepare(
+  if (outboxId && !MEDIA_EVENTS.has(eventType)) statements.push(env.CALL_RELAY_DB.prepare(
     "INSERT INTO push_outbox(id, target_device_id, payload_json, created_at) SELECT ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM call_sessions WHERE id = ? AND last_event_id = ?)",
   ).bind(outboxId, targetDeviceId, pushPayload(targetDeviceId, {
     type: "call_event", callId: call.id, event: eventType, commandId,
@@ -300,10 +414,41 @@ async function appendEvent(request: Request, env: Env, ctx: ExecutionContext, ca
     }
     throw new HttpError(409, "call changed concurrently; retry the command");
   }
-  if (outboxId) ctx.waitUntil(dispatchOutboxItem(env, outboxId).catch((error: unknown) => {
+  if (outboxId && !MEDIA_EVENTS.has(eventType)) ctx.waitUntil(dispatchOutboxItem(env, outboxId).catch((error: unknown) => {
     console.error(JSON.stringify({ message: "event push enqueue failed", callId: call.id, eventType, error: error instanceof Error ? error.message : String(error) }));
   }));
+  const updatedCall = await getCall(env, call.id);
+  broadcastCall(env, ctx, updatedCall);
+  if (["ended", "failed"].includes(nextState)) {
+    ctx.waitUntil(revokeTurnCredentialsForCall(env, call.id));
+  }
   return json({ callId: call.id, state: nextState, relayMode });
+}
+
+async function issueSignalTicket(env: Env, device: DeviceRow, pairingId: string): Promise<Response> {
+  const pairing = await getPairing(env, pairingId);
+  if (pairing.confirmed_at === null) throw new HttpError(409, "pairing is not confirmed");
+  signalRole(pairing, device);
+  return json(await createSignalTicket(env, pairing, device), { status: 201 });
+}
+
+async function openSignalSocket(request: Request, env: Env, pairingId: string): Promise<Response> {
+  const encodedTicket = signalTicketFromProtocols(request.headers.get("sec-websocket-protocol"));
+  const ticket = await verifySignalTicket(env, encodedTicket);
+  if (ticket.pairingId !== pairingId) throw new HttpError(403, "signaling ticket is for another pairing");
+  const pairing = await getPairing(env, pairingId);
+  if (pairing.confirmed_at === null) throw new HttpError(409, "pairing is not confirmed");
+  const device = await env.CALL_RELAY_DB.prepare(
+    "SELECT id, platform, display_name, public_key_spki, fcm_token, revoked_at FROM devices WHERE id = ? AND revoked_at IS NULL",
+  ).bind(ticket.deviceId).first<DeviceRow>();
+  if (!device || signalRole(pairing, device) !== ticket.role) throw new HttpError(403, "signaling ticket identity is invalid");
+  const headers = new Headers(request.headers);
+  headers.set("sec-websocket-protocol", SIGNALING_PROTOCOL);
+  headers.set("x-relay-signal-device", ticket.deviceId);
+  headers.set("x-relay-signal-role", ticket.role);
+  headers.set("x-relay-signal-jti", ticket.jti);
+  headers.set("x-relay-signal-exp", ticket.expiresAt.toString());
+  return env.PAIRING_SIGNAL.getByName(pairingId).fetch(new Request("https://pairing-signal.internal/connect", { headers }));
 }
 
 async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -311,6 +456,7 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
   if (request.method === "POST" && url.pathname === "/v1/devices/enroll") return enroll(request, env);
   const body = request.method === "GET" || request.method === "HEAD" ? new Uint8Array() : await readBodyBytes(request.clone());
   const device = await authenticate(request, env, body);
+  if (device.platform === "android") assertSupportedAndroidVersion(request);
   if (request.method === "GET" && url.pathname === "/v1/calls/current") {
     const call = await env.CALL_RELAY_DB.prepare(
       "SELECT * FROM call_sessions WHERE (android_device_id = ? OR peer_device_id = ?) AND state NOT IN ('ended', 'failed') ORDER BY created_at DESC LIMIT 1",
@@ -328,16 +474,19 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
   if (request.method === "POST" && url.pathname === "/v1/pairings") return pair(request, env, device);
   const pairingMatch = /^\/v1\/pairings\/(pair_[a-f0-9]{32})\/confirm$/u.exec(url.pathname);
   if (request.method === "POST" && pairingMatch) return confirmPairing(request, env, device, pairingMatch[1] ?? "");
+  const signalTicketMatch = /^\/v1\/pairings\/(pair_[a-f0-9]{32})\/signal-ticket$/u.exec(url.pathname);
+  if (request.method === "POST" && signalTicketMatch) return issueSignalTicket(env, device, signalTicketMatch[1] ?? "");
   if (request.method === "POST" && url.pathname === "/v1/calls/incoming") return createCall(request, env, ctx, device, "incoming");
   if (request.method === "POST" && url.pathname === "/v1/calls/outgoing") return createCall(request, env, ctx, device, "outgoing");
-  const match = /^\/v1\/calls\/(call_[a-f0-9]{32})(?:\/(token|events))?$/u.exec(url.pathname);
+  const match = /^\/v1\/calls\/(call_[a-f0-9]{32})(?:\/(token|media-config|events))?$/u.exec(url.pathname);
   if (!match) throw new HttpError(404, "endpoint not found");
   const call = await getCall(env, match[1] ?? "");
   if (request.method === "GET" && !match[2]) {
     assertCallMember(call, device.id);
     return json({ call });
   }
-  if (request.method === "POST" && match[2] === "token") return callToken(env, call, device);
+  if (request.method === "POST" && match[2] === "token") return json({ error: "participant media tokens were removed; update the client" }, { status: 410 });
+  if (request.method === "POST" && match[2] === "media-config") return callMediaConfig(env, call, device);
   if (request.method === "POST" && match[2] === "events") return appendEvent(request, env, ctx, call, device);
   throw new HttpError(405, "method not allowed");
 }
@@ -357,10 +506,12 @@ export default {
     const url = new URL(request.url);
     if (url.pathname === "/health") {
       if (request.method !== "GET") return json({ error: "method not allowed" }, { status: 405 });
-      return json({ ok: true, audioStored: false });
+      return json({ ok: true, audioStored: false, mediaTransport: "webrtc_p2p" });
     }
     if (!url.pathname.startsWith("/v1/")) return secureAssetResponse(await env.ASSETS.fetch(request));
     try {
+      const signalMatch = /^\/v1\/pairings\/(pair_[a-f0-9]{32})\/signal$/u.exec(url.pathname);
+      if (request.method === "GET" && signalMatch) return await openSignalSocket(request, env, signalMatch[1] ?? "");
       return await api(request, env, ctx);
     } catch (error) {
       if (error instanceof HttpError) return json({ error: error.message }, { status: error.status });
@@ -382,6 +533,14 @@ export default {
   async scheduled(_controller, env): Promise<void> {
     await drainOutbox(env);
     const now = Date.now();
+    const stale = await env.CALL_RELAY_DB.prepare(
+      `SELECT id, pairing_id FROM call_sessions
+       WHERE state NOT IN ('ended', 'failed') AND (
+         (state IN ('created', 'ringing_peer', 'accepted', 'dialing_sim') AND updated_at < ?) OR
+         (state = 'active' AND updated_at < ?) OR
+         (state = 'ending' AND updated_at < ?)
+       )`,
+    ).bind(now - 120_000, now - 90_000, now - 30_000).all<{ id: string; pairing_id: string }>();
     await env.CALL_RELAY_DB.prepare(
       `UPDATE call_sessions SET state = 'failed', failure_code = 'session_timeout', ended_at = ?, updated_at = ?, version = version + 1
        WHERE state NOT IN ('ended', 'failed') AND (
@@ -389,7 +548,13 @@ export default {
          (state = 'active' AND updated_at < ?) OR
          (state = 'ending' AND updated_at < ?)
        )`,
-    ).bind(now, now, now - 120_000, now - 45_000, now - 30_000).run();
+    ).bind(now, now, now - 120_000, now - 90_000, now - 30_000).run();
+    await Promise.all(stale.results.map(async (staleCall) => {
+      const updated = await getCall(env, staleCall.id);
+      await env.PAIRING_SIGNAL.getByName(staleCall.pairing_id).publishSnapshot(JSON.stringify(updated));
+      await revokeTurnCredentialsForCall(env, staleCall.id);
+    }));
+    await revokeDueTurnCredentials(env);
     const purgeBefore = now - 24 * 60 * 60 * 1000;
     const nonceBefore = now - 10 * 60 * 1000;
     await env.CALL_RELAY_DB.batch([

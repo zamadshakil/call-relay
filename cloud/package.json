@@ -14,11 +14,11 @@
     "providers:validate": "node scripts/validate-provider-credentials.mjs",
     "preflight:production": "node scripts/preflight-production.mjs",
     "db:local": "wrangler d1 migrations apply CALL_RELAY_DB --local",
-    "deploy": "node scripts/preflight-production.mjs && vite build && wrangler deploy"
+    "deploy": "node scripts/preflight-production.mjs && vite build && wrangler deploy",
+    "deploy:staging": "vite build && wrangler deploy --env staging"
   },
   "dependencies": {
     "jose": "6.2.10",
-    "livekit-client": "2.22.0",
     "qrcode": "1.5.4"
   },
   "devDependencies": {

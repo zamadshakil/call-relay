@@ -1,5 +1,6 @@
-LIVEKIT_API_KEY="replace-me"
-LIVEKIT_API_SECRET="replace-me"
+CF_TURN_KEY_ID="replace-me"
+CF_TURN_API_TOKEN="replace-me"
+SIGNAL_TICKET_SECRET="generate-at-least-32-random-bytes"
 ENROLLMENT_INVITE="generate-a-long-random-invite"
 FCM_CLIENT_EMAIL="service-account@replace-me.iam.gserviceaccount.com"
 FCM_PRIVATE_KEY="replace-with-the-service-account-pkcs8-private-key"

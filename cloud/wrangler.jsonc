@@ -6,8 +6,9 @@
   "compatibility_flags": ["nodejs_compat"],
   "secrets": {
     "required": [
-      "LIVEKIT_API_KEY",
-      "LIVEKIT_API_SECRET",
+      "CF_TURN_KEY_ID",
+      "CF_TURN_API_TOKEN",
+      "SIGNAL_TICKET_SECRET",
       "ENROLLMENT_INVITE",
       "FCM_CLIENT_EMAIL",
       "FCM_PRIVATE_KEY"
@@ -38,6 +39,20 @@
       "migrations_dir": "migrations"
     }
   ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "PAIRING_SIGNAL",
+        "class_name": "PairingSignal"
+      }
+    ]
+  },
+  "exports": {
+    "PairingSignal": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
+  },
   "queues": {
     "producers": [
       {
@@ -59,7 +74,57 @@
     "crons": ["* * * * *"]
   },
   "vars": {
-    "LIVEKIT_URL": "wss://calling-system-elmcwb4t.livekit.cloud",
     "FCM_PROJECT_ID": "call-relay-3dec7"
+  },
+  "env": {
+    "staging": {
+      "name": "call-relay-staging",
+      "secrets": {
+        "required": [
+          "CF_TURN_KEY_ID",
+          "CF_TURN_API_TOKEN",
+          "SIGNAL_TICKET_SECRET",
+          "ENROLLMENT_INVITE",
+          "FCM_CLIENT_EMAIL",
+          "FCM_PRIVATE_KEY"
+        ]
+      },
+      "d1_databases": [
+        {
+          "binding": "CALL_RELAY_DB",
+          "database_name": "call-relay-staging",
+          "database_id": "9f39161a-777e-463b-a953-6f32b1e62a26",
+          "migrations_dir": "migrations"
+        }
+      ],
+      "durable_objects": {
+        "bindings": [
+          {
+            "name": "PAIRING_SIGNAL",
+            "class_name": "PairingSignal"
+          }
+        ]
+      },
+      "queues": {
+        "producers": [
+          {
+            "binding": "PUSH_QUEUE",
+            "queue": "call-relay-staging-push"
+          }
+        ],
+        "consumers": [
+          {
+            "queue": "call-relay-staging-push",
+            "max_batch_size": 10,
+            "max_batch_timeout": 5,
+            "max_retries": 5,
+            "dead_letter_queue": "call-relay-staging-push-dlq"
+          }
+        ]
+      },
+      "vars": {
+        "FCM_PROJECT_ID": "call-relay-3dec7"
+      }
+    }
   }
 }

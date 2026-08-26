@@ -19,15 +19,18 @@ android {
         applicationId = "dev.zamad.callrelay"
         minSdk = 29
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.2.0-alpha"
+        versionCode = 2
+        versionName = "0.3.0-webrtc-alpha"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-        buildConfigField("String", "DEFAULT_API_BASE_URL", "\"https://call-relay.zamadshakil.workers.dev\"")
         buildConfigField("boolean", "FCM_CONFIGURED", googleServicesFile.exists().toString())
     }
 
     buildTypes {
+        debug {
+            buildConfigField("String", "DEFAULT_API_BASE_URL", "\"https://call-relay-staging.zamadshakil.workers.dev\"")
+        }
         release {
+            buildConfigField("String", "DEFAULT_API_BASE_URL", "\"https://call-relay.zamadshakil.workers.dev\"")
             isMinifyEnabled = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
@@ -61,7 +64,8 @@ tasks.matching { it.name == "preReleaseBuild" }.configureEach {
 }
 
 dependencies {
-    implementation("io.livekit:livekit-android:2.28.0")
+    implementation("io.github.webrtc-sdk:android-prefixed:144.7559.09")
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
     implementation("androidx.work:work-runtime:2.11.2")
     implementation(platform("com.google.firebase:firebase-bom:34.18.0"))

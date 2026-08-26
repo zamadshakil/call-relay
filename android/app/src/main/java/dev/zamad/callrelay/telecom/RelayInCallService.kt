@@ -15,6 +15,7 @@ import android.telecom.CallEndpointException
 import android.telecom.InCallService
 import android.content.Intent
 import dev.zamad.callrelay.MainActivity
+import dev.zamad.callrelay.R
 import dev.zamad.callrelay.relay.RelayReadyService
 import dev.zamad.callrelay.relay.RelayPreferences
 import dev.zamad.callrelay.relay.RelayRuntime
@@ -22,7 +23,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicReference
 
-@Suppress("DEPRECATION")
+@Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
 class RelayInCallService : InCallService() {
     private val availableEndpoints = mutableListOf<CallEndpoint>()
     private val callbacks = ConcurrentHashMap<Call, Call.Callback>()
@@ -122,7 +123,7 @@ class RelayInCallService : InCallService() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
         val builder = Notification.Builder(this, CALL_CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.stat_sys_phone_call)
+            .setSmallIcon(R.drawable.ic_call_relay)
             .setContentTitle(if (state == Call.STATE_RINGING) "Incoming cellular call" else "Cellular call")
             .setContentText(stateName(state))
             .setCategory(Notification.CATEGORY_CALL)

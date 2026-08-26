@@ -1,35 +1,27 @@
 # Release status
 
-## Implemented in this repository
+## Implemented
 
-- Android default-dialer and `InCallService` call lifecycle.
-- Relay Ready foreground service and narrowly scoped Accessibility Service.
-- SIM selection, one-call/one-peer enforcement, destination validation, speaker routing, DTMF, and process-death-safe behavior.
-- LiveKit audio with full-duplex, Listen, Talk, and hold-to-talk modes.
-- P-256 signed requests, replay protection inputs, encrypted pairing material, and per-call E2EE derivation.
-- FCM device registration, command handling, retries, and failure acknowledgements.
-- Worker call-state API, D1 schema and migrations, cleanup, Queue consumer, browser pairing and call console.
-- Automated Worker integration tests, TypeScript checks, Android unit tests, lint, and build gates.
-- Production preflight that rejects placeholder Cloudflare, LiveKit, Firebase, and required-secret configuration.
+- Cloudflare-only direct/TURN raw WebRTC; no application-level provider fallback.
+- Pairing-scoped SQLite Durable Object with WebSocket hibernation, single-use 60-second tickets, role binding and replay checks.
+- Cross-platform HKDF/HMAC signaling authentication with a shared golden vector.
+- Unique two-hour TURN credentials, 75% refresh, revocation tracking, privacy-safe usage tags and no stored passwords.
+- Native browser WebRTC, foreground signaling, direct/TURN route and quality statistics.
+- Android raw WebRTC audio, direct-to-relay ICE restart, network-change recovery, 20-second setup gate and 15-second active watchdog.
+- D1 media state/summary fields, 30-second Android heartbeat, 90-second active timeout and 24-hour purge.
+- The old participant-token endpoint returns `410 Gone`.
 
-## Verified locally and in production on 2026-08-26
+## Verified locally on 2026-08-27
 
-- Cloud TypeScript compilation and production web build.
-- Isolated Worker/D1 API test suite.
-- Android unit tests, lint, and Firebase-enabled debug and release APK assembly.
-- Secret and generated-artifact exclusion from version control.
-- Cloudflare Worker and browser console at `https://call-relay.zamadshakil.workers.dev`.
-- Remote D1 migrations and expected tables in the `calling-system` database.
-- `call-relay-push` producer/consumer, `call-relay-push-dlq`, and the cleanup cron.
-- All five encrypted Worker secret bindings, without exposing their values.
-- Firebase messaging-scope OAuth using the supplied service account.
-- LiveKit authenticated RoomService access using the supplied API key and secret.
-- Firebase Android configuration for the exact package `dev.zamad.callrelay`.
+- Worker/D1 integration tests and TypeScript production browser build.
+- Android unit tests, cross-platform crypto vector, lint, debug APK assembly and instrumentation-test APK compilation.
+- No managed-media client dependency in Android, browser package manifest or browser bundle.
 
-## Physical gates still required
+## Still required
 
-- Enroll and pair a real browser and Android handset.
-- Run the physical carrier-call compatibility matrix in `cloud/docs/E2E_RUNBOOK.md`.
-- Build the native iPhone peer later with a Mac and paid Apple Developer account.
+- A separate staging TURN key and the six staging Worker secrets. The staging D1 database, Queues and migrations already exist; the first Worker deployment is intentionally blocked until its secrets file is available.
+- Real Android/browser direct, forced UDP TURN and TLS/443 tests.
+- Incoming/outgoing acoustic qualification, network switching, 200-call pilot and 30-minute stability gate.
+- Native iPhone client after a Mac and paid Apple Developer account are available.
 
-The cloud control plane is deployed and verified. The relay is not end-to-end certified until the physical-handset tests pass; that qualification cannot be replaced by an emulator.
+The existing production deployment is the previous build until the isolated staging gates pass.

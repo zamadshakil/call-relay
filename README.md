@@ -1,57 +1,24 @@
 # Stock Android SIM Call Relay
 
-An experimental, invite-only system that keeps a normal carrier call on a stock Android phone and relays it acoustically over LiveKit to a paired browser or future iPhone app.
+An experimental, invite-only acoustic relay from a normal stock-Android SIM call to a paired browser or future native iPhone app.
 
-The repository is intentionally honest about the platform boundary: a normal Android app cannot read or inject protected cellular-call PCM. The Android handset therefore remains on speakerphone, its microphone captures the caller acoustically, and peer audio is played through the handset speaker. Whether full duplex works is handset- and firmware-dependent and must be proven on a physical phone.
+Media uses raw WebRTC: direct peer-to-peer when ICE can establish it, otherwise encrypted Cloudflare TURN. A pairing-scoped Cloudflare Durable Object carries signaling only. There is no SIP/PSTN bridge, media server, recording, provider fallback, root requirement, modified OS, or extra hardware.
 
-## Repository layout
+The platform limit remains: a stock third-party Android app cannot read or inject protected cellular-call PCM. The Android stays on speakerphone, its microphone captures caller audio acoustically, and peer audio plays through that speaker. Full-duplex quality is handset-dependent and must be proven on a physical SIM call.
 
-- `android/` — Kotlin Android dialer, `InCallService`, relay-ready foreground service, signed control plane, LiveKit media bridge, and diagnostic modes.
-- `cloud/` — TypeScript Cloudflare Worker, D1 migrations, Queue handling, browser peer, API tests, and deployment preflight.
-- `docs/ARCHITECTURE.md` — trust boundaries, call flows, failure behavior, and non-negotiable limitations.
-- `docs/DEPLOYMENT_GUIDE.md` — complete LiveKit, Firebase, Cloudflare, Android, pairing and physical-call activation procedure.
-- `docs/RELEASE_STATUS.md` — what is implemented, what is verified, and what still requires external accounts or a physical handset.
-- `scripts/verify.ps1` — one command for the repository's repeatable local checks.
+## Layout
 
-## Quick start
+- `android/` — Kotlin default dialer, Telecom integration, raw libwebrtc media, authenticated signaling, acoustic processors and diagnostics.
+- `cloud/` — TypeScript Worker, D1, Queues, SQLite Durable Object signaling, TURN credential broker, and native-WebRTC browser.
+- `docs/DEPLOYMENT_GUIDE.md` — staging/production deployment and phone-test procedure.
+- `scripts/verify.ps1` — repeatable cloud and Android checks.
 
-### Cloud control plane and browser peer
-
-```powershell
-cd cloud
-Copy-Item .dev.vars.example .dev.vars
-pnpm install --frozen-lockfile
-pnpm db:local
-pnpm dev
-```
-
-Replace every placeholder in `.dev.vars`; never commit that file. See `docs/DEPLOYMENT_GUIDE.md` for production setup.
-
-### Android app
-
-The project builds from the command line and does not require Android Studio:
-
-```powershell
-cd android
-.\scripts\build.ps1
-```
-
-For push notifications, place a Firebase Android configuration at `android/app/google-services.json`. It is intentionally ignored by Git.
-
-## Verification
+## Verify
 
 ```powershell
 .\scripts\verify.ps1
 ```
 
-Continuous integration performs the equivalent TypeScript, Worker test, Android unit-test, lint, and debug-build gates on every push and pull request.
+Android Studio and an emulator are not required; the repository uses its command-line JDK/SDK toolchain.
 
-## Safety and privacy
-
-- Do not use this system for emergency numbers, short codes, MMI/USSD, conferences, or call waiting.
-- Obtain consent from every call participant and follow local recording, interception, telecom, and privacy laws.
-- The Android speaker is audible and the microphone captures the surrounding room.
-- No audio is intentionally stored by this system; call metadata is designed to expire after 24 hours.
-- This prototype is not a safety-critical or emergency-calling product.
-
-This repository has no open-source license. All rights are reserved unless the owner adds one later.
+Do not use this prototype for emergencies. Obtain participant consent and comply with applicable telecom, interception and privacy laws. Audio is not intentionally stored; call metadata is purged after 24 hours.

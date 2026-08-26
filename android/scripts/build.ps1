@@ -24,5 +24,5 @@ if (-not $env:GRADLE_USER_HOME -and (Test-Path -LiteralPath "E:\Android")) {
     $env:GRADLE_USER_HOME = "E:\Android\gradle-cache"
 }
 
-& "$PSScriptRoot\..\gradlew.bat" testDebugUnitTest lintDebug assembleDebug
+& "$PSScriptRoot\..\gradlew.bat" testDebugUnitTest lintDebug assembleDebug assembleDebugAndroidTest
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

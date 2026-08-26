@@ -54,11 +54,15 @@
       </section>
 
       <section>
-        <h2>4. LiveKit audio</h2>
-        <button id="join">Join relay room</button>
+        <h2>4. WebRTC audio</h2>
+        <p>Direct peer-to-peer when possible; encrypted Cloudflare TURN relay otherwise.</p>
+        <output id="signal">Disconnected</output>
+        <output id="presence">Android offline</output>
+        <button id="join">Prepare WebRTC media</button>
         <button id="leave">Leave</button>
         <output id="media">Disconnected</output>
-        <div id="remoteAudio"></div>
+        <output id="stats">No active media</output>
+        <audio id="remoteAudio" autoplay playsinline></audio>
       </section>
 
       <pre id="log" aria-live="polite"></pre>

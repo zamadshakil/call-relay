@@ -58,9 +58,6 @@ class MainActivity : Activity() {
     private lateinit var pairingId: EditText
     private lateinit var pairingSecret: EditText
     private lateinit var phoneNumber: EditText
-    private lateinit var manualCallId: EditText
-    private lateinit var manualServerUrl: EditText
-    private lateinit var manualToken: EditText
     private lateinit var simButton: Button
 
     private val refresh = object : Runnable {
@@ -182,15 +179,8 @@ class MainActivity : Activity() {
         }
         content.addView(pushToTalk)
 
-        content.addView(section("6. Direct LiveKit diagnostic"))
-        content.addView(text("Normally the Worker supplies these values. Manual entry isolates LiveKit from FCM during early tests.", 14f, false))
-        manualCallId = input("call_…", InputType.TYPE_CLASS_TEXT)
-        manualServerUrl = input("wss://….livekit.cloud", InputType.TYPE_TEXT_VARIATION_URI)
-        manualToken = input("LiveKit participant token", InputType.TYPE_TEXT_VARIATION_PASSWORD)
-        content.addView(label("Call ID", manualCallId))
-        content.addView(label("LiveKit URL", manualServerUrl))
-        content.addView(label("Participant token", manualToken))
-        content.addView(button("Connect diagnostic media") { connectManualMedia() })
+        content.addView(section("6. Cloudflare WebRTC diagnostics"))
+        content.addView(text("Relay Ready maintains authenticated pairing signaling. Calls try direct WebRTC first and automatically force encrypted Cloudflare TURN when needed.", 14f, false))
 
         content.addView(section("7. Call-time microphone gate"))
         content.addView(button("Start independent microphone probe") { startProbe() })
@@ -341,16 +331,6 @@ class MainActivity : Activity() {
             Intent(this, RelayReadyService::class.java)
                 .setAction(RelayReadyService.ACTION_SET_MODE)
                 .putExtra(RelayReadyService.EXTRA_MODE, mode.wireValue),
-        )
-    }
-
-    private fun connectManualMedia() {
-        startService(
-            Intent(this, RelayReadyService::class.java)
-                .setAction(RelayReadyService.ACTION_CONNECT)
-                .putExtra(RelayReadyService.EXTRA_CALL_ID, manualCallId.text.toString().trim())
-                .putExtra(RelayReadyService.EXTRA_SERVER_URL, manualServerUrl.text.toString().trim())
-                .putExtra(RelayReadyService.EXTRA_TOKEN, manualToken.text.toString().trim()),
         )
     }
 

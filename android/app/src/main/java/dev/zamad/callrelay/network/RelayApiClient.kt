@@ -18,10 +18,18 @@ class RelayApiClient(
     private val preferences: RelayPreferences,
     private val identity: DeviceIdentity = DeviceIdentity(),
 ) {
-    data class MediaCredentials(
-        val serverUrl: String,
-        val participantToken: String,
+    data class IceServer(
+        val urls: List<String>,
+        val username: String,
+        val credential: String,
     )
+
+    data class MediaConfig(
+        val iceServers: List<IceServer>,
+        val credentialsExpiresAt: Long,
+    )
+
+    data class SignalTicket(val ticket: String, val protocol: String, val expiresAt: Long)
 
     data class CreatedCall(val callId: String, val state: String)
 
@@ -65,9 +73,34 @@ class RelayApiClient(
         Unit
     }
 
-    suspend fun token(callId: String): MediaCredentials = withContext(Dispatchers.IO) {
-        val response = request("POST", "/v1/calls/$callId/token", "{}")
-        MediaCredentials(response.getString("serverUrl"), response.getString("participantToken"))
+    suspend fun mediaConfig(callId: String): MediaConfig = withContext(Dispatchers.IO) {
+        val response = request("POST", "/v1/calls/$callId/media-config", "{}", attempts = 2)
+        check(response.getString("transport") == "webrtc_p2p") { "Worker returned an unsupported media transport" }
+        check(response.getString("offerer") == "android") { "Worker assigned the wrong WebRTC offerer" }
+        check(response.getInt("protocolVersion") == 1) { "Worker returned an unsupported media protocol" }
+        val servers = response.getJSONArray("iceServers")
+        val parsed = buildList {
+            for (index in 0 until servers.length()) {
+                val server = servers.getJSONObject(index)
+                val rawUrls = server.get("urls")
+                val urls = when (rawUrls) {
+                    is String -> listOf(rawUrls)
+                    is org.json.JSONArray -> buildList { for (urlIndex in 0 until rawUrls.length()) add(rawUrls.getString(urlIndex)) }
+                    else -> error("Worker returned invalid ICE server URLs")
+                }
+                check(urls.isNotEmpty() && urls.all { it.startsWith("stun:") || it.startsWith("turn:") || it.startsWith("turns:") }) {
+                    "Worker returned invalid ICE server URLs"
+                }
+                add(IceServer(urls, server.optString("username"), server.optString("credential")))
+            }
+        }
+        check(parsed.any { server -> server.urls.any { it.startsWith("turn") } }) { "Worker did not return Cloudflare TURN" }
+        MediaConfig(parsed, response.getLong("credentialsExpiresAt"))
+    }
+
+    suspend fun signalTicket(): SignalTicket = withContext(Dispatchers.IO) {
+        val response = request("POST", "/v1/pairings/${preferences.pairingId}/signal-ticket", "{}", attempts = 2)
+        SignalTicket(response.getString("ticket"), response.getString("protocol"), response.getLong("expiresAt"))
     }
 
     suspend fun updatePushToken(fcmToken: String) = withContext(Dispatchers.IO) {
@@ -142,6 +175,7 @@ class RelayApiClient(
                 doInput = true
                 setRequestProperty("content-type", "application/json")
                 setRequestProperty("accept", "application/json")
+                setRequestProperty("x-relay-app-version", "android-webrtc-2")
                 extraHeaders.forEach(::setRequestProperty)
                 if (signed) {
                     check(preferences.deviceId.isNotBlank()) { "Android device is not enrolled" }
