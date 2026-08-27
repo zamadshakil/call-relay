@@ -11,17 +11,17 @@ export async function authenticate(request: Request, env: Env, body: Uint8Array)
   const timestamp = Number(timestampText);
 
   if (!deviceId || deviceId.length > 80 || !nonce || nonce.length > 128 || !signatureText || signatureText.length > 128 || !Number.isSafeInteger(timestamp)) {
-    throw new HttpError(401, "missing or invalid request signature headers");
+    throw new HttpError(401, "missing or invalid request signature headers", "INVALID_DEVICE_SIGNATURE");
   }
   if (Math.abs(Date.now() - timestamp) > MAX_CLOCK_SKEW_MS) {
-    throw new HttpError(401, "request timestamp is outside the allowed window");
+    throw new HttpError(401, "request timestamp is outside the allowed window", "DEVICE_CLOCK_SKEW");
   }
 
   const device = await env.CALL_RELAY_DB.prepare(
     `SELECT id, platform, display_name, public_key_spki, fcm_token, fcm_target_kind, revoked_at, user_id,
       agreement_public_key_raw, app_version FROM devices WHERE id = ?`,
   ).bind(deviceId).first<DeviceRow>();
-  if (!device || device.revoked_at !== null) throw new HttpError(401, "unknown or revoked device");
+  if (!device) throw new HttpError(401, "device is not registered", "DEVICE_NOT_FOUND");
 
   const url = new URL(request.url);
   const bodyHash = await sha256Hex(body);
@@ -45,13 +45,16 @@ export async function authenticate(request: Request, env: Env, body: Uint8Array)
       return false;
     }
   })();
-  if (!verified) throw new HttpError(401, "invalid request signature");
+  if (!verified) throw new HttpError(401, "invalid request signature", "INVALID_DEVICE_SIGNATURE");
+  if (device.revoked_at !== null) {
+    throw new HttpError(410, "this device registration has been revoked", "DEVICE_REVOKED");
+  }
 
   const nonceResult = await env.CALL_RELAY_DB.prepare(
     "INSERT OR IGNORE INTO request_nonces(device_id, nonce, created_at) VALUES (?, ?, ?)",
   ).bind(deviceId, nonce, Date.now()).run();
   if (nonceResult.meta.changes !== 1) {
-    throw new HttpError(409, "request nonce has already been used");
+    throw new HttpError(409, "request nonce has already been used", "REQUEST_REPLAY");
   }
   await env.CALL_RELAY_DB.prepare("UPDATE devices SET last_seen_at = ? WHERE id = ?")
     .bind(Date.now(), deviceId).run();

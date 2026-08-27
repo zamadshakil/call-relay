@@ -12,10 +12,12 @@ import {
 } from "./pairing-v2";
 import { HttpError, fromBase64Url, json, readBodyBytes, readJson, requireString, timingSafeEqualText } from "./http";
 import { dispatchOutboxItem, drainOutbox } from "./outbox";
+import { drainPairingControlOutbox } from "./pairing-control";
 import { PairingSignal } from "./pairing-signal";
 import { deliverPush } from "./push";
 import { secretValue } from "./secrets";
 import { createSignalTicket, SIGNALING_PROTOCOL, signalRole, signalTicketFromProtocols, verifySignalTicket } from "./signal-ticket";
+import { recordDeviceHeartbeat } from "./presence";
 import { canTransition, isE164 } from "./state";
 import { createMediaConfig, revokeDueTurnCredentials, revokeTurnCredentialsForCall } from "./turn";
 import type { CallRow, CallState, DeviceRow, Env, PairingRow, Platform, PushJob, RelayMode } from "./types";
@@ -75,9 +77,10 @@ async function getCall(env: Env, callId: string): Promise<CallRow> {
 }
 
 async function getPairing(env: Env, pairingId: string): Promise<PairingRow> {
-  const pairing = await env.CALL_RELAY_DB.prepare("SELECT * FROM pairings WHERE id = ? AND revoked_at IS NULL")
+  const pairing = await env.CALL_RELAY_DB.prepare("SELECT * FROM pairings WHERE id = ?")
     .bind(pairingId).first<PairingRow>();
-  if (!pairing) throw new HttpError(404, "pairing not found");
+  if (!pairing) throw new HttpError(404, "pairing not found", "PAIRING_NOT_FOUND");
+  if (pairing.revoked_at !== null) throw new HttpError(410, "pairing has been revoked", "PAIRING_REVOKED");
   return pairing;
 }
 
@@ -260,18 +263,24 @@ async function createCall(request: Request, env: Env, ctx: ExecutionContext, dev
   const pushChannel = targetPlatform === "android" ? "android_fcm" : targetPlatform === "browser" ? "web_push" : null;
   const outboxId = pushChannel ? id("push") : null;
   const statements: D1PreparedStatement[] = [env.CALL_RELAY_DB.prepare(
-    "INSERT INTO call_sessions(id, pairing_id, android_device_id, peer_device_id, direction, state, phone_number, created_at, updated_at, request_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-  ).bind(callId, pairingId, androidDeviceId, peerDeviceId, direction, state, phoneNumber, now, now, requestId)];
+    `INSERT INTO call_sessions(id, pairing_id, android_device_id, peer_device_id, direction, state, phone_number, created_at, updated_at, request_id)
+     SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+     WHERE EXISTS (
+       SELECT 1 FROM pairings WHERE id = ? AND revoked_at IS NULL AND confirmed_at IS NOT NULL
+     )`,
+  ).bind(callId, pairingId, androidDeviceId, peerDeviceId, direction, state, phoneNumber, now, now, requestId, pairingId)];
   if (outboxId) statements.push(env.CALL_RELAY_DB.prepare(
-    "INSERT INTO push_outbox(id, target_device_id, channel, payload_json, created_at) VALUES (?, ?, ?, ?, ?)",
+    `INSERT INTO push_outbox(id, target_device_id, channel, payload_json, created_at)
+     SELECT ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM call_sessions WHERE id = ?)`,
   ).bind(outboxId, targetDeviceId, pushChannel, pushPayload(targetDeviceId, {
     type: direction === "incoming" ? "incoming_call" : "outgoing_call",
     callId,
     phoneNumber: direction === "outgoing" ? phoneNumber ?? "" : "",
     callVersion: "0",
-  }), now));
+  }), now, callId));
+  let results: D1Result<unknown>[];
   try {
-    await env.CALL_RELAY_DB.batch(statements);
+    results = await env.CALL_RELAY_DB.batch(statements);
   } catch (error) {
     const duplicate = await env.CALL_RELAY_DB.prepare(
       "SELECT id, state FROM call_sessions WHERE pairing_id = ? AND direction = ? AND request_id = ?",
@@ -282,6 +291,14 @@ async function createCall(request: Request, env: Env, ctx: ExecutionContext, dev
     ).bind(androidDeviceId).first<{ id: string }>();
     if (openCall) throw new HttpError(409, "the Android device already has an open call");
     throw error;
+  }
+  if (results[0]?.meta.changes !== 1) {
+    const currentPairing = await env.CALL_RELAY_DB.prepare("SELECT confirmed_at, revoked_at FROM pairings WHERE id = ?")
+      .bind(pairingId).first<{ confirmed_at: number | null; revoked_at: number | null }>();
+    if (!currentPairing || currentPairing.revoked_at !== null) {
+      throw new HttpError(410, "pairing has been revoked", "PAIRING_REVOKED");
+    }
+    throw new HttpError(409, "pairing is not confirmed", "PAIRING_NOT_CONFIRMED");
   }
   if (outboxId) ctx.waitUntil(dispatchOutboxItem(env, outboxId).catch((error: unknown) => {
     console.error(JSON.stringify({ message: "initial call push enqueue failed", callId, error: error instanceof Error ? error.message : String(error) }));
@@ -404,9 +421,25 @@ async function appendEvent(request: Request, env: Env, ctx: ExecutionContext, ca
     return json({ callId: current.id, state: current.state, relayMode: current.relay_mode, duplicate: true });
   }
   if (["ended", "failed"].includes(call.state)) throw new HttpError(409, "call is closed");
+  if (eventType === "active" && call.state === "active") {
+    if (device.id !== call.android_device_id) {
+      throw new HttpError(403, "only Android can report an expected SIM call active");
+    }
+    // RelayReadyService can be recreated while Telecom keeps the SIM call
+    // alive. Let the new service instance reassert the milestone without
+    // advancing the call version or duplicating its event history.
+    return json({ callId: call.id, state: call.state, relayMode: call.relay_mode, duplicate: true });
+  }
+  if (eventType === "answering_sim" && call.telecom_answer_requested_at !== null) {
+    // A WebSocket snapshot and an FCM wake can independently ask Android to
+    // answer. Treat the milestone as idempotent across process restarts so a
+    // duplicate never increments the call version or rebroadcasts accepted.
+    return json({ callId: call.id, state: call.state, relayMode: call.relay_mode, duplicate: true });
+  }
   if (eventType === "media_heartbeat") {
     if (device.id !== call.android_device_id) throw new HttpError(403, "only Android can report relay media health");
-    await env.CALL_RELAY_DB.prepare("UPDATE call_sessions SET updated_at = ? WHERE id = ? AND state NOT IN ('ended', 'failed')")
+    if (call.state !== "active") throw new HttpError(409, "media heartbeat requires an active SIM call");
+    await env.CALL_RELAY_DB.prepare("UPDATE call_sessions SET updated_at = ? WHERE id = ? AND state = 'active'")
       .bind(Date.now(), call.id).run();
     return json({ callId: call.id, state: call.state, relayMode: call.relay_mode });
   }
@@ -535,6 +568,10 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
   const body = request.method === "GET" || request.method === "HEAD" ? new Uint8Array() : await readBodyBytes(request.clone());
   const device = await authenticate(request, env, body);
   if (device.platform === "android") assertSupportedAndroidVersion(request, env);
+  const heartbeatMatch = /^\/v1\/devices\/(dev_[a-f0-9]{32})\/heartbeat$/u.exec(url.pathname);
+  if (request.method === "POST" && heartbeatMatch) {
+    return recordDeviceHeartbeat(request, env, device, heartbeatMatch[1] ?? "");
+  }
   if (request.method === "GET" && url.pathname === "/v1/calls/current") {
     const call = await env.CALL_RELAY_DB.prepare(
       "SELECT * FROM call_sessions WHERE (android_device_id = ? OR peer_device_id = ?) AND state NOT IN ('ended', 'failed') ORDER BY created_at DESC LIMIT 1",
@@ -655,7 +692,9 @@ export default {
       if (request.method === "GET" && signalMatch) return await openSignalSocket(request, env, signalMatch[1] ?? "");
       return await api(request, env, ctx);
     } catch (error) {
-      if (error instanceof HttpError) return json({ error: error.message }, { status: error.status });
+      if (error instanceof HttpError) {
+        return json({ error: error.message, ...(error.code ? { code: error.code } : {}) }, { status: error.status });
+      }
       console.error(JSON.stringify({ message: "unhandled request error", path: url.pathname, error: error instanceof Error ? error.message : String(error) }));
       return json({ error: "internal error" }, { status: 500 });
     }
@@ -679,6 +718,7 @@ export default {
   },
   async scheduled(_controller, env): Promise<void> {
     await drainOutbox(env);
+    await drainPairingControlOutbox(env);
     const now = Date.now();
     const stale = await env.CALL_RELAY_DB.prepare(
       `SELECT id, pairing_id FROM call_sessions
@@ -708,6 +748,7 @@ export default {
     await env.CALL_RELAY_DB.batch([
       env.CALL_RELAY_DB.prepare("DELETE FROM request_nonces WHERE created_at < ?").bind(nonceBefore),
       env.CALL_RELAY_DB.prepare("DELETE FROM push_outbox WHERE created_at < ?").bind(purgeBefore),
+      env.CALL_RELAY_DB.prepare("DELETE FROM pairing_control_outbox WHERE delivered_at IS NOT NULL AND delivered_at < ?").bind(purgeBefore),
       env.CALL_RELAY_DB.prepare("DELETE FROM call_events WHERE call_id IN (SELECT id FROM call_sessions WHERE updated_at < ?)").bind(purgeBefore),
       env.CALL_RELAY_DB.prepare("DELETE FROM call_sessions WHERE updated_at < ?").bind(purgeBefore),
       env.CALL_RELAY_DB.prepare("DELETE FROM pairing_invitations WHERE pairing_id IS NULL AND expires_at < ?").bind(purgeBefore),

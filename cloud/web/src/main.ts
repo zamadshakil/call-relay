@@ -15,6 +15,16 @@ import {
 import { assertFirebaseWebConfigured, firebaseConfig } from "./firebase-config";
 import { paddleClientToken, paddleEnvironment } from "./billing-config";
 import { deriveSignalKey, signalMac, verifySignalMac } from "./key-derivation";
+import { CallSnapshotWatermarks } from "./call-snapshot-watermark";
+import { LatestAuthoritativeRecovery } from "./authoritative-recovery";
+import { IceGenerationRouter } from "./ice-generation";
+import { SignalingGenerationGuard } from "./signaling-generation";
+import {
+  AndroidPresenceState,
+  IncomingCallRecovery,
+  KeyedSingleFlight,
+  type IncomingPhaseUpdate,
+} from "./incoming-call-controller";
 import {
   base64Url,
   createPeerProof,
@@ -43,7 +53,15 @@ interface AccountSnapshot {
     billingRequired: boolean;
     accessMode: "paid" | "approval_only";
   };
-  devices: Array<{ id: string; platform: "android" | "browser" | "ios"; displayName: string; online: boolean; sim: { carrierName: string; maskedNumber: string | null } | null }>;
+  devices: Array<{
+    id: string;
+    platform: "android" | "browser" | "ios";
+    displayName: string;
+    online?: boolean;
+    lastAuthenticatedAt?: number;
+    relayPresence?: { relayReady: boolean; signalState: "connecting" | "connected" | "disconnected"; heartbeatAt: number | null; heartbeatFresh: boolean; processStartedAt: number | null; lastErrorCode: string | null };
+    sim: { carrierName: string; maskedNumber: string | null } | null;
+  }>;
   pairing: Record<string, unknown> | null;
 }
 
@@ -95,6 +113,7 @@ interface SignalEnvelope {
   timestamp: number;
   type: string;
   payload: string;
+  negotiationId?: string;
   mac: string;
 }
 
@@ -154,8 +173,11 @@ const initialPageParameters = new URLSearchParams(location.search);
 const androidBillingReturn = initialPageParameters.get("return") === "android";
 let checkoutPageActive = initialPageParameters.has("_ptxn");
 let currentCall: CallView | undefined;
+const callSnapshotWatermarks = new CallSnapshotWatermarks();
+const currentCallRecovery = new LatestAuthoritativeRecovery<CallView | undefined>();
 
 let signalSocket: WebSocket | undefined;
+const signalSocketGeneration = new SignalingGenerationGuard<WebSocket>();
 let signalConnection: Promise<void> | undefined;
 let signalMessageChain: Promise<void> = Promise.resolve();
 let signalSessionId = "";
@@ -176,7 +198,7 @@ let mediaCallId = "";
 let mediaConfig: MediaConfig | undefined;
 let mediaGeneration = 0;
 let currentIcePolicy: RTCIceTransportPolicy = "all";
-let candidateBatch: RTCIceCandidateInit[] = [];
+let candidateBatch: Array<{ candidate: RTCIceCandidateInit; negotiationId: string }> = [];
 let candidateTimer: number | undefined;
 let credentialRefreshTimer: number | undefined;
 let statsTimer: number | undefined;
@@ -184,6 +206,7 @@ let forceRelayTimer: number | undefined;
 let setupFailureTimer: number | undefined;
 let disconnectRecoveryTimer: number | undefined;
 let offerRecoveryTimer: number | undefined;
+let relayRestartResetTimer: number | undefined;
 let pendingRemoteCandidates: RTCIceCandidateInit[] = [];
 let remoteIceComplete = false;
 let lastRoute = "";
@@ -192,6 +215,22 @@ let setupStartedAt = 0;
 let setupDurationMs = 0;
 let iceRestartCount = 0;
 let lastStatsSummary: JsonObject = {};
+let activeNegotiationId = "";
+const localIceGenerations = new IceGenerationRouter();
+let latestPresenceVersion = 0;
+const mediaSetupFlight = new KeyedSingleFlight<RTCPeerConnection>();
+const androidPresence = new AndroidPresenceState();
+const incomingRecovery = new IncomingCallRecovery({
+  requestOffer: async (callId, negotiationId, attempt, trigger) => {
+    activateNegotiation(negotiationId);
+    discardLocalCandidateBatch();
+    pendingRemoteCandidates = [];
+    remoteIceComplete = false;
+    await sendSignal("offer_request", { attempt, trigger, iceRestart: true, icePolicy: "relay" }, callId, negotiationId);
+  },
+  onPhase: (update) => renderIncomingPhase(update),
+  onDeadline: (callId) => { void handleIncomingDeadline(callId); },
+});
 
 function loadIdentity(): StoredIdentity | undefined {
   try {
@@ -309,6 +348,64 @@ function showScreen(id: typeof screenIds[number]): void {
   for (const screenId of screenIds) element<HTMLElement>(screenId).hidden = screenId !== id;
 }
 
+function renderAndroidPresence(): void {
+  element<HTMLOutputElement>("presence").value = androidPresence.label;
+}
+
+function renderIncomingPhase(update: IncomingPhaseUpdate): void {
+  if (currentCall?.id !== update.callId && mediaCallId !== update.callId) return;
+  const button = element<HTMLButtonElement>("acceptCall");
+  element("incomingState").textContent = update.detail;
+  if (!["media_connected", "answering_sim", "active"].includes(update.phase)) {
+    element<HTMLOutputElement>("media").value = update.detail;
+  }
+  const retryable = update.phase === "failed";
+  button.disabled = !retryable;
+  button.textContent = retryable ? "Retry connection" : update.phase === "active"
+    ? "Active"
+    : update.phase === "answering_sim" || update.phase === "media_connected"
+      ? "Answering…"
+      : update.phase === "ice_connecting"
+        ? "Connecting…"
+        : update.phase === "waiting_android" || update.phase === "waiting_offer"
+          ? "Waiting…"
+          : "Preparing…";
+}
+
+async function handleIncomingDeadline(callId: string): Promise<void> {
+  if (currentCall?.id !== callId && mediaCallId !== callId) return;
+  try {
+    const data = await responseJson(await signedFetch("/v1/calls/current"));
+    const authoritativeCall = callView(data.call);
+    if (authoritativeCall?.id === callId && authoritativeCall.state === "active") {
+      await applyCallSnapshot(authoritativeCall);
+      if (currentCall?.id !== callId || currentCall.state !== "active") return;
+      incomingRecovery.callActive(callId);
+      element<HTMLOutputElement>("media").value = peerConnection?.connectionState === "connected"
+        ? "Connected"
+        : "SIM active · restoring secure audio";
+      log(`Ignored stale incoming deadline because ${callId} is already active`);
+      return;
+    }
+  } catch (error) {
+    // Never tear down an established SRTP path merely because the control
+    // plane was briefly unavailable. The normal recovery poll will reconcile.
+    if (peerConnection?.connectionState === "connected" && mediaCallId === callId) {
+      log(`Could not reconcile incoming deadline; preserving connected media: ${String(error)}`);
+      window.setTimeout(() => { void handleIncomingDeadline(callId); }, 2_000);
+      return;
+    }
+  }
+  if (currentCall?.state === "active" && currentCall.id === callId) {
+    incomingRecovery.callActive(callId);
+    return;
+  }
+  mediaSetupFlight.clear(callId);
+  closeMedia(false);
+  element<HTMLOutputElement>("media").value = "Secure audio timed out · retry available";
+  log(`Incoming secure-audio deadline expired for ${callId}; connection can be retried safely`);
+}
+
 function render(): void {
   if (checkoutPageActive) {
     showScreen("paymentScreen");
@@ -360,7 +457,8 @@ function render(): void {
     ? `${account.subscription.plan === "annual" ? "Annual" : "Monthly"} plan${account.subscription.currentPeriodEndsAt ? ` · renews ${new Date(account.subscription.currentPeriodEndsAt).toLocaleDateString()}` : ""}`
     : "Approved access · payment not required";
   element("androidName").textContent = android?.displayName ?? "Android relay";
-  element<HTMLOutputElement>("presence").value = android?.online ? "Android online" : "Android offline";
+  androidPresence.setRestOnline(android?.relayPresence?.heartbeatFresh ?? android?.online ?? false);
+  renderAndroidPresence();
 }
 
 function saveIdentityWithoutRender(): void {
@@ -521,10 +619,24 @@ async function refreshAccount(checkRevocation = false): Promise<AccountSnapshot>
   return snapshot;
 }
 
+function invalidateSignalSocket(reason: string): void {
+  const previousSocket = signalSocket;
+  signalSocketGeneration.invalidate();
+  signalSocket = undefined;
+  signalConnection = undefined;
+  signalSessionId = "";
+  signalSequence = 0;
+  stopSignalHeartbeat();
+  previousSocket?.close(1000, reason);
+}
+
 async function clearLocalDevice(): Promise<void> {
   deliberatelyDisconnected = true;
-  signalSocket?.close(1000, "device identity reset");
+  invalidateSignalSocket("device identity reset");
   closeMedia();
+  currentCallRecovery.invalidate();
+  latestPresenceVersion = 0;
+  androidPresence.signalingClosed();
   identity = undefined;
   signingKey = undefined;
   agreementKey = undefined;
@@ -534,6 +646,35 @@ async function clearLocalDevice(): Promise<void> {
   savePendingPairing();
   saveIdentityWithoutRender();
   await Promise.all([deleteKey(signingKeyName), deleteKey(agreementKeyName), deleteKey(pairingKeyName), deleteKey(pairingProofKeyName)]);
+}
+
+function pairingIdentityWasRevoked(code: number, reason: string): boolean {
+  return [4003, 4004, 4401, 4403].includes(code) || /(?:pairing|device|identity).*(?:revoked|invalid|inactive|disabled|unavailable|not found|unknown)/iu.test(reason);
+}
+
+async function clearLocalPairingState(reason: string): Promise<void> {
+  deliberatelyDisconnected = true;
+  invalidateSignalSocket("pairing state reset");
+  closeMedia();
+  currentCallRecovery.invalidate();
+  // Presence versions are scoped to one PairingSignal Durable Object. A
+  // replacement pairing starts its own sequence and must not be compared with
+  // the version from the revoked object.
+  latestPresenceVersion = 0;
+  androidPresence.signalingClosed();
+  incomingRecovery.reset();
+  pairingKey = undefined;
+  pairingProofKey = undefined;
+  pendingPairing = undefined;
+  savePendingPairing();
+  if (identity) {
+    delete identity.pairingId;
+    saveIdentityWithoutRender();
+  }
+  if (account) account = { ...account, pairing: null };
+  await Promise.all([deleteKey(pairingKeyName), deleteKey(pairingProofKeyName)]);
+  log(`Pairing session cleared without signing out: ${reason}`);
+  render();
 }
 
 async function ensureBrowserRegistration(replaceExisting = false): Promise<void> {
@@ -882,7 +1023,7 @@ async function signalKey(callId: string): Promise<CryptoKey> {
 }
 
 function signalCanonical(envelope: Omit<SignalEnvelope, "mac">): string {
-  return [
+  const fields: Array<string | number> = [
     envelope.version,
     envelope.callId,
     envelope.senderDeviceId,
@@ -892,10 +1033,12 @@ function signalCanonical(envelope: Omit<SignalEnvelope, "mac">): string {
     envelope.timestamp,
     envelope.type,
     envelope.payload,
-  ].join("\n");
+  ];
+  if (envelope.negotiationId !== undefined) fields.push(envelope.negotiationId);
+  return fields.join("\n");
 }
 
-async function sendSignal(type: string, payload: JsonObject, callId = mediaCallId): Promise<void> {
+async function sendSignal(type: string, payload: JsonObject, callId = mediaCallId, negotiationId?: string): Promise<void> {
   await ensureSignalConnected();
   if (!identity || !signalSocket || signalSocket.readyState !== WebSocket.OPEN || !signalSessionId) throw new Error("signaling is not ready");
   const unsigned: Omit<SignalEnvelope, "mac"> = {
@@ -908,12 +1051,14 @@ async function sendSignal(type: string, payload: JsonObject, callId = mediaCallI
     timestamp: Date.now(),
     type,
     payload: encodePayload(payload),
+    ...(negotiationId ? { negotiationId } : {}),
   };
   signalSocket.send(JSON.stringify({ ...unsigned, mac: await signalMac(await signalKey(callId), signalCanonical(unsigned)) } satisfies SignalEnvelope));
 }
 
 async function verifyEnvelope(envelope: SignalEnvelope): Promise<boolean> {
   if (!currentCall || envelope.callId !== currentCall.id || envelope.senderDeviceId !== currentCall.android_device_id || envelope.role !== "android") return false;
+  if (envelope.negotiationId !== undefined && !validNegotiationId(envelope.negotiationId)) return false;
   const remoteSequence = remoteSequences.get(envelope.sessionId) ?? 0;
   if (envelope.sequence <= remoteSequence || Math.abs(Date.now() - envelope.timestamp) > 5 * 60 * 1000) return false;
   const { mac: _mac, ...unsigned } = envelope;
@@ -933,35 +1078,70 @@ async function connectSignal(): Promise<void> {
   if (!identity?.pairingId || !pairingKey) return;
   if (signalSocket?.readyState === WebSocket.OPEN) return;
   if (signalConnection) return signalConnection;
+  const pairingId = identity.pairingId;
   if (signalSocket && signalSocket.readyState !== WebSocket.CLOSED) signalSocket.close(4000, "reconnecting");
+  const generation = signalSocketGeneration.begin(pairingId);
   deliberatelyDisconnected = false;
-  signalConnection = (async () => {
-    const ticketResponse = await responseJson(await signedFetch(`/v1/pairings/${identity!.pairingId}/signal-ticket`, { method: "POST", body: "{}" }));
+  const connecting = (async () => {
+    let ticketResponse: JsonObject;
+    try {
+      ticketResponse = await responseJson(await signedFetch(`/v1/pairings/${pairingId}/signal-ticket`, { method: "POST", body: "{}" }));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (signalSocketGeneration.isGeneration(generation, pairingId) && pairingIdentityWasRevoked(0, message)) {
+        await clearLocalPairingState(message);
+      }
+      throw error;
+    }
+    if (!signalSocketGeneration.isGeneration(generation, pairingId)) throw new Error("signaling connection was superseded");
     const ticket = requiredString(ticketResponse.ticket, "ticket");
     const protocol = requiredString(ticketResponse.protocol, "protocol");
     if (protocol !== signalProtocol) throw new Error("server returned an unsupported signaling protocol");
-    const socket = new WebSocket(websocketUrl(identity!.pairingId!), [signalProtocol, `cr-ticket.${ticket}`]);
+    const socket = new WebSocket(websocketUrl(pairingId), [signalProtocol, `cr-ticket.${ticket}`]);
+    if (!signalSocketGeneration.bind(generation, pairingId, socket)) {
+      socket.close(4000, "signaling connection superseded");
+      throw new Error("signaling connection was superseded");
+    }
     signalSocket = socket;
     socket.onmessage = (event) => {
+      if (!signalSocketGeneration.isCurrent(generation, pairingId, socket) || signalSocket !== socket) return;
+      const message = String(event.data);
       signalMessageChain = signalMessageChain
-        .then(() => handleSignalMessage(String(event.data)))
+        .then(async () => {
+          const isCurrent = () => signalSocketGeneration.isCurrent(generation, pairingId, socket) && signalSocket === socket;
+          if (!isCurrent()) return;
+          await handleSignalMessage(message, isCurrent);
+        })
         .catch((error) => { log(`Signaling error: ${String(error)}`); });
     };
-    socket.onclose = () => {
-      if (signalSocket === socket) {
+    socket.onclose = (event) => {
+      if (signalSocketGeneration.isCurrent(generation, pairingId, socket) && signalSocket === socket) {
+        signalSocketGeneration.invalidate();
         signalSocket = undefined;
         signalSessionId = "";
+        androidPresence.signalingClosed();
+        renderAndroidPresence();
+        incomingRecovery.setAndroidPresence(false);
         element<HTMLOutputElement>("signal").value = "Disconnected";
         stopSignalHeartbeat();
-        if (!deliberatelyDisconnected) scheduleSignalReconnect();
+        if (pairingIdentityWasRevoked(event.code, event.reason)) {
+          void clearLocalPairingState(event.reason || `signaling close ${event.code}`);
+        } else if (!deliberatelyDisconnected) scheduleSignalReconnect();
       }
     };
     await new Promise<void>((resolve, reject) => {
       const timeout = window.setTimeout(() => reject(new Error("signaling connection timed out")), 10_000);
       socket.onopen = () => {
         window.clearTimeout(timeout);
+        if (!signalSocketGeneration.isCurrent(generation, pairingId, socket) || signalSocket !== socket) {
+          socket.close(4000, "signaling connection superseded");
+          reject(new Error("signaling connection was superseded"));
+          return;
+        }
         reconnectAttempts = 0;
         lastSignalPongAt = Date.now();
+        androidPresence.signalingOpened();
+        renderAndroidPresence();
         startSignalHeartbeat();
         element<HTMLOutputElement>("signal").value = "Connected — authenticating session";
         resolve();
@@ -971,12 +1151,14 @@ async function connectSignal(): Promise<void> {
         reject(new Error("signaling WebSocket failed"));
       };
     });
+    if (!signalSocketGeneration.isCurrent(generation, pairingId, socket) || signalSocket !== socket) return;
     void recoverCurrentCall();
   })();
+  signalConnection = connecting;
   try {
-    await signalConnection;
+    await connecting;
   } finally {
-    signalConnection = undefined;
+    if (signalConnection === connecting) signalConnection = undefined;
   }
 }
 
@@ -1012,13 +1194,14 @@ function startSignalHeartbeat(): void {
   }, 20_000);
 }
 
-async function recoverForegroundSession(): Promise<void> {
+async function recoverForegroundSession(trigger = "foreground"): Promise<void> {
   if (foregroundRecovery) return foregroundRecovery;
   foregroundRecovery = (async () => {
     if (!firebaseUser || !identity?.pairingId || !pairingKey) return;
     await refreshAccount();
     await ensureSignalConnected();
     await recoverCurrentCall();
+    incomingRecovery.requestMissingOffer(trigger, true);
     await syncExistingPushSubscription();
   })();
   try {
@@ -1040,25 +1223,43 @@ function scheduleSignalReconnect(): void {
   }, delay);
 }
 
-async function handleSignalMessage(message: string): Promise<void> {
+async function handleSignalMessage(message: string, isCurrent: () => boolean = () => true): Promise<void> {
+  if (!isCurrent()) return;
   if (message === "pong") {
     lastSignalPongAt = Date.now();
     return;
   }
   const value: unknown = JSON.parse(message);
+  if (!isCurrent()) return;
   if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("invalid signaling message");
   const record = value as JsonObject;
   if (record.type === "hello") {
     signalSessionId = requiredString(record.sessionId, "sessionId");
     signalSequence = 0;
     element<HTMLOutputElement>("signal").value = "Connected and authenticated";
+    incomingRecovery.requestMissingOffer("signal_hello", true);
+    void recoverCurrentCall();
     return;
   }
   if (record.type === "presence") {
-    element<HTMLOutputElement>("presence").value = record.android === true ? "Android online" : "Android offline";
+    const version = typeof record.version === "number" && Number.isSafeInteger(record.version) ? record.version : undefined;
+    if (version === undefined && latestPresenceVersion > 0) return;
+    if (version !== undefined && version <= latestPresenceVersion) return;
+    if (version !== undefined) latestPresenceVersion = version;
+    const online = record.android === true;
+    androidPresence.signalingPresence(online);
+    renderAndroidPresence();
+    incomingRecovery.setAndroidPresence(online);
+    return;
+  }
+  if (record.type === "pairing_revoked") {
+    if (!isCurrent()) return;
+    const reason = typeof record.reason === "string" ? record.reason : "pairing revoked";
+    await clearLocalPairingState(reason);
     return;
   }
   if (record.type === "call_snapshot") {
+    if (!isCurrent()) return;
     const call = callView(record.call);
     if (call) await applyCallSnapshot(call);
     return;
@@ -1066,28 +1267,94 @@ async function handleSignalMessage(message: string): Promise<void> {
   if (record.type === "protocol_error") throw new Error(requiredString(record.message, "message"));
   const envelope = record as unknown as SignalEnvelope;
   if (!await verifyEnvelope(envelope)) throw new Error("rejected unauthenticated or replayed signal");
-  await handlePeerSignal(envelope.type, decodePayload(envelope.payload));
+  if (!isCurrent()) return;
+  await handlePeerSignal(envelope.type, decodePayload(envelope.payload), envelope.negotiationId);
 }
 
 async function recoverCurrentCall(): Promise<void> {
   try {
-    const data = await responseJson(await signedFetch("/v1/calls/current"));
-    const call = callView(data.call);
-    if (call) await applyCallSnapshot(call);
-    else if (currentCall) {
-      closeMedia();
-      currentCall = undefined;
-      element("incomingBanner").hidden = true;
-    }
+    await currentCallRecovery.run(
+      async () => {
+        const data = await responseJson(await signedFetch("/v1/calls/current"));
+        return callView(data.call);
+      },
+      async (call) => {
+        if (call) {
+          await applyCallSnapshot(call);
+        } else if (currentCall) {
+          callSnapshotWatermarks.close(currentCall);
+          closeMedia();
+          incomingRecovery.reset(currentCall.id);
+          currentCall = undefined;
+          element("incomingBanner").hidden = true;
+        }
+      },
+    );
   } catch (error) {
     log(`Call recovery failed: ${String(error)}`);
   }
 }
 
+function markIncomingConnectionPrepared(callId: string, connection: RTCPeerConnection): void {
+  incomingRecovery.markLocalReady(callId);
+  if (connection.remoteDescription) incomingRecovery.offerReceived(callId, activeNegotiationId || undefined);
+  if (connection.connectionState === "connected") incomingRecovery.mediaConnected(callId);
+}
+
+async function reconcileIncomingMedia(call: CallView, trigger: string): Promise<void> {
+  if (call.direction !== "incoming") return;
+  const hasRemoteOffer = mediaCallId === call.id && Boolean(peerConnection?.remoteDescription);
+  incomingRecovery.reconcile(call.id, call.state, hasRemoteOffer, trigger);
+  if (call.state === "active") {
+    if (peerConnection?.connectionState === "connected" && mediaCallId === call.id) {
+      incomingRecovery.callActive(call.id);
+      return;
+    }
+    if (incomingRecovery.callId !== call.id || ["idle", "active", "failed"].includes(incomingRecovery.phase)) {
+      incomingRecovery.begin(call.id, true, incomingRecovery.callId === call.id);
+    }
+    try {
+      const connection = await ensurePeerConnection(call.id);
+      markIncomingConnectionPrepared(call.id, connection);
+      incomingRecovery.requestMissingOffer("active_call_recovery", true);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      incomingRecovery.fail(call.id, `Active call recovery failed: ${message}`);
+    }
+    return;
+  }
+  if (call.state !== "accepted") return;
+  if (incomingRecovery.callId === call.id && incomingRecovery.phase === "failed") {
+    incomingRecovery.renderCurrent();
+    return;
+  }
+  try {
+    const connection = await ensurePeerConnection(call.id);
+    markIncomingConnectionPrepared(call.id, connection);
+    incomingRecovery.markAccepted(call.id);
+    if (call.telecom_answer_requested_at) incomingRecovery.simAnswering(call.id);
+    incomingRecovery.requestMissingOffer(trigger, true);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    incomingRecovery.fail(call.id, `Secure audio preparation failed: ${message}`);
+    log(`Incoming media recovery failed: ${message}`);
+  }
+}
+
 async function applyCallSnapshot(call: CallView): Promise<void> {
-  if (currentCall?.id === call.id && currentCall.version >= call.version) return;
+  const snapshotDecision = callSnapshotWatermarks.classify(call);
+  if (snapshotDecision === "stale") return;
+  // An equal snapshot has already been applied. If its call is no longer the
+  // current UI call, allowing it back in would recreate state that was cleared.
+  if (snapshotDecision === "equal" && currentCall?.id !== call.id) return;
+  if (currentCall?.id === call.id && snapshotDecision === "equal") {
+    await reconcileIncomingMedia(call, "equal_snapshot");
+    return;
+  }
   if (currentCall?.id !== call.id && currentCall && currentCall.created_at > call.created_at) return;
   const changedCall = currentCall?.id !== call.id;
+  if (changedCall && currentCall) incomingRecovery.reset(currentCall.id);
+  callSnapshotWatermarks.commit(call);
   currentCall = call;
   const incoming = element("incomingBanner");
   incoming.hidden = call.direction !== "incoming" || !["ringing_peer", "accepted", "active"].includes(call.state);
@@ -1097,7 +1364,7 @@ async function applyCallSnapshot(call: CallView): Promise<void> {
     accepting.disabled = false;
     accepting.textContent = "Accept";
   } else if (call.state === "accepted") {
-    element("incomingState").textContent = call.telecom_answer_requested_at ? "Answering Android SIM call" : "Connecting audio";
+    element("incomingState").textContent = call.telecom_answer_requested_at ? "Answering Android SIM call" : "Restoring secure audio";
     accepting.disabled = true;
     accepting.textContent = call.telecom_answer_requested_at ? "Answering…" : "Preparing…";
   } else {
@@ -1109,6 +1376,7 @@ async function applyCallSnapshot(call: CallView): Promise<void> {
   if (call.state === "ended" || call.state === "failed") {
     log(`Call ${call.state}`);
     closeMedia();
+    incomingRecovery.reset(call.id);
     currentCall = undefined;
     incoming.hidden = true;
     accepting.disabled = false;
@@ -1116,18 +1384,10 @@ async function applyCallSnapshot(call: CallView): Promise<void> {
     return;
   }
   applyPeerMode(call.relay_mode);
-  if (call.direction === "incoming" && call.state === "ringing_peer" && changedCall) {
-    if (offerRecoveryTimer !== undefined) window.clearTimeout(offerRecoveryTimer);
-    offerRecoveryTimer = window.setTimeout(() => {
-      if (currentCall?.id === call.id && (!peerConnection || !peerConnection.remoteDescription)) {
-        void sendSignal("ice_restart_request", { reason: "incoming_offer_recovery", icePolicy: "relay" }, call.id)
-          .catch((error) => log(`Incoming media recovery failed: ${String(error)}`));
-      }
-    }, 1_500);
-  }
+  await reconcileIncomingMedia(call, changedCall ? "new_snapshot" : "updated_snapshot");
   if (call.direction === "outgoing" || call.state === "accepted" || call.state === "active") {
-    await ensurePeerConnection(call.id);
-    if (changedCall) {
+    if (call.direction === "outgoing") await ensurePeerConnection(call.id);
+    if (changedCall && call.direction === "outgoing") {
       if (offerRecoveryTimer !== undefined) window.clearTimeout(offerRecoveryTimer);
       offerRecoveryTimer = window.setTimeout(() => {
         if (currentCall?.id === call.id && peerConnection && !peerConnection.remoteDescription) {
@@ -1152,7 +1412,15 @@ async function requestMediaConfig(callId: string): Promise<MediaConfig> {
 }
 
 async function ensurePeerConnection(callId: string): Promise<RTCPeerConnection> {
-  if (peerConnection && mediaCallId === callId) return peerConnection;
+  if (peerConnection && mediaCallId === callId && peerConnection.connectionState !== "closed") return peerConnection;
+  if (mediaSetupFlight.activeKey && mediaSetupFlight.activeKey !== callId) {
+    closeMedia(false);
+    mediaSetupFlight.clear();
+  }
+  return mediaSetupFlight.run(callId, () => buildPeerConnection(callId));
+}
+
+async function buildPeerConnection(callId: string): Promise<RTCPeerConnection> {
   closeMedia(false);
   const generation = ++mediaGeneration;
   mediaCallId = callId;
@@ -1160,7 +1428,7 @@ async function ensurePeerConnection(callId: string): Promise<RTCPeerConnection> 
   setupDurationMs = 0;
   iceRestartCount = 0;
   element<HTMLOutputElement>("media").value = "Requesting Cloudflare STUN/TURN credentials";
-  const config = await requestMediaConfig(callId);
+  const config = await withTimeout(requestMediaConfig(callId), 8_000, "Cloudflare TURN configuration timed out");
   if (generation !== mediaGeneration) throw new Error("media setup was cancelled");
   mediaConfig = config;
   currentIcePolicy = "all";
@@ -1170,10 +1438,21 @@ async function ensurePeerConnection(callId: string): Promise<RTCPeerConnection> 
     autoGainControl: true,
     channelCount: 1,
   };
-  const stream = await navigator.mediaDevices.getUserMedia({
-    audio: speechConstraints,
-    video: false,
+  let acceptLateStream = true;
+  const streamRequest = navigator.mediaDevices.getUserMedia({ audio: speechConstraints, video: false }).then((stream) => {
+    if (!acceptLateStream || generation !== mediaGeneration) {
+      stream.getTracks().forEach((track) => track.stop());
+      throw new Error("media setup was cancelled");
+    }
+    return stream;
   });
+  let stream: MediaStream;
+  try {
+    stream = await withTimeout(streamRequest, 10_000, "Microphone access timed out");
+  } catch (error) {
+    acceptLateStream = false;
+    throw error;
+  }
   if (generation !== mediaGeneration) {
     stream.getTracks().forEach((track) => track.stop());
     throw new Error("media setup was cancelled");
@@ -1184,6 +1463,10 @@ async function ensurePeerConnection(callId: string): Promise<RTCPeerConnection> 
     // are repeated on the live track. Failure is non-fatal because Safari may
     // omit individual optional constraints while still providing processed audio.
     await track.applyConstraints(speechConstraints).catch(() => undefined);
+  }
+  if (generation !== mediaGeneration) {
+    stream.getTracks().forEach((track) => track.stop());
+    throw new Error("media setup was cancelled");
   }
   localStream = stream;
   const connection = new RTCPeerConnection({
@@ -1204,10 +1487,16 @@ async function ensurePeerConnection(callId: string): Promise<RTCPeerConnection> 
   };
   connection.onicecandidate = (event) => {
     if (event.candidate) {
-      candidateBatch.push(event.candidate.toJSON());
+      const candidate = event.candidate.toJSON();
+      const negotiationId = localIceGenerations.negotiationForCandidate(candidate);
+      if (!negotiationId) return;
+      candidateBatch.push({ candidate, negotiationId });
       candidateTimer ??= window.setTimeout(() => void flushCandidates(), 50);
     } else {
-      void flushCandidates().then(() => sendSignal("ice_complete", {}, callId)).catch((error) => log(`ICE send failed: ${String(error)}`));
+      // A null candidate has no ufrag, so after an ICE restart it cannot be
+      // safely attributed to a generation. Flushing the bound candidates is
+      // sufficient; do not mislabel end-of-candidates as the new generation.
+      void flushCandidates().catch((error) => log(`ICE send failed: ${String(error)}`));
     }
   };
   connection.onconnectionstatechange = () => void handleConnectionState(connection);
@@ -1223,31 +1512,74 @@ async function ensurePeerConnection(callId: string): Promise<RTCPeerConnection> 
 async function flushCandidates(): Promise<void> {
   if (candidateTimer !== undefined) window.clearTimeout(candidateTimer);
   candidateTimer = undefined;
-  const candidates = candidateBatch;
+  const taggedCandidates = candidateBatch;
   candidateBatch = [];
-  if (candidates.length) await sendSignal("ice_candidates", { candidates });
+  const negotiationId = activeNegotiationId;
+  const candidates = taggedCandidates
+    .filter((candidate) => candidate.negotiationId === negotiationId)
+    .map((candidate) => candidate.candidate);
+  if (candidates.length) await sendSignal("ice_candidates", { candidates }, mediaCallId, negotiationId || undefined);
 }
 
-async function handlePeerSignal(type: string, payload: JsonObject): Promise<void> {
+function discardLocalCandidateBatch(): void {
+  if (candidateTimer !== undefined) window.clearTimeout(candidateTimer);
+  candidateTimer = undefined;
+  candidateBatch = [];
+}
+
+function validNegotiationId(value: unknown): string | undefined {
+  return typeof value === "string" && /^[A-Za-z0-9_-]{8,80}$/u.test(value) ? value : undefined;
+}
+
+function activateNegotiation(negotiationId: string): void {
+  activeNegotiationId = negotiationId;
+  localIceGenerations.activate(negotiationId);
+}
+
+async function handlePeerSignal(type: string, payload: JsonObject, envelopeNegotiationId?: string): Promise<void> {
   if (!currentCall) throw new Error("no active call for signaling");
+  const negotiationId = validNegotiationId(envelopeNegotiationId);
   if (type === "offer") {
     relayRestartRequested = false;
     const sdp = requiredString(payload.sdp, "sdp");
-    const connection = await ensurePeerConnection(currentCall.id);
-    if (payload.icePolicy === "relay") {
-      currentIcePolicy = "relay";
-      connection.setConfiguration({ ...connection.getConfiguration(), iceTransportPolicy: "relay" });
+    const callId = currentCall.id;
+    const previousNegotiationId = activeNegotiationId;
+    const offerNegotiationId = negotiationId ?? (incomingRecovery.negotiationId || crypto.randomUUID());
+    activateNegotiation(offerNegotiationId);
+    if (negotiationId && previousNegotiationId && negotiationId !== previousNegotiationId) {
+      discardLocalCandidateBatch();
+      pendingRemoteCandidates = [];
+      remoteIceComplete = false;
     }
-    await connection.setRemoteDescription({ type: "offer", sdp });
-    for (const candidate of pendingRemoteCandidates.splice(0)) await connection.addIceCandidate(candidate);
-    if (remoteIceComplete) await connection.addIceCandidate(null);
-    const answer = await connection.createAnswer();
-    await connection.setLocalDescription(answer);
-    await sendSignal("answer", { sdp: answer.sdp ?? "", icePolicy: currentIcePolicy });
-    startSetupDeadlines();
+    incomingRecovery.offerReceived(callId, offerNegotiationId);
+    try {
+      const connection = await ensurePeerConnection(callId);
+      if (activeNegotiationId !== offerNegotiationId) throw new Error("WebRTC offer was superseded");
+      if (payload.icePolicy === "relay") {
+        currentIcePolicy = "relay";
+        connection.setConfiguration({ ...connection.getConfiguration(), iceTransportPolicy: "relay" });
+      }
+      await connection.setRemoteDescription({ type: "offer", sdp });
+      if (activeNegotiationId !== offerNegotiationId) throw new Error("WebRTC offer was superseded");
+      for (const candidate of pendingRemoteCandidates.splice(0)) await connection.addIceCandidate(candidate);
+      if (remoteIceComplete) await connection.addIceCandidate(null);
+      const answer = await connection.createAnswer();
+      localIceGenerations.bindLocalDescription(offerNegotiationId, answer.sdp ?? "");
+      await connection.setLocalDescription(answer);
+      if (activeNegotiationId !== offerNegotiationId) throw new Error("WebRTC offer was superseded");
+      await sendSignal("answer", { sdp: answer.sdp ?? "", icePolicy: currentIcePolicy }, callId, offerNegotiationId);
+      incomingRecovery.answerSent(callId);
+      startSetupDeadlines();
+    } catch (error) {
+      if (activeNegotiationId === offerNegotiationId) {
+        incomingRecovery.offerHandlingFailed(callId, "Android offer could not be applied; retrying");
+      }
+      throw error;
+    }
     return;
   }
   if (type === "ice_candidates") {
+    if (negotiationId && activeNegotiationId && negotiationId !== activeNegotiationId) return;
     if (!Array.isArray(payload.candidates) || payload.candidates.length > 128) throw new Error("invalid ICE candidate batch");
     const candidates = payload.candidates as RTCIceCandidateInit[];
     if (peerConnection?.remoteDescription) {
@@ -1258,12 +1590,14 @@ async function handlePeerSignal(type: string, payload: JsonObject): Promise<void
     return;
   }
   if (type === "ice_complete") {
+    if (negotiationId && activeNegotiationId && negotiationId !== activeNegotiationId) return;
     remoteIceComplete = true;
     if (peerConnection?.remoteDescription) await peerConnection.addIceCandidate(null);
     return;
   }
   if (type === "media_failed") {
     element<HTMLOutputElement>("media").value = `Android media failed: ${String(payload.reason ?? "unknown")}`;
+    incomingRecovery.fail(currentCall.id, `Android media failed: ${String(payload.reason ?? "unknown")}`);
     return;
   }
 }
@@ -1272,7 +1606,9 @@ function startSetupDeadlines(): void {
   if (forceRelayTimer !== undefined) window.clearTimeout(forceRelayTimer);
   if (setupFailureTimer !== undefined) window.clearTimeout(setupFailureTimer);
   forceRelayTimer = window.setTimeout(() => void requestRelayRestart("direct_timeout"), 8_000);
-  setupFailureTimer = window.setTimeout(() => void failMedia("ice_timeout"), 20_000);
+  setupFailureTimer = currentCall?.direction === "outgoing"
+    ? window.setTimeout(() => void failMedia("ice_timeout"), 20_000)
+    : undefined;
 }
 
 async function requestRelayRestart(reason: string): Promise<void> {
@@ -1284,10 +1620,20 @@ async function requestRelayRestart(reason: string): Promise<void> {
     peerConnection.setConfiguration({ ...peerConnection.getConfiguration(), iceTransportPolicy: "relay" });
   }
   element<HTMLOutputElement>("media").value = "Direct path unavailable — forcing Cloudflare TURN";
+  const negotiationId = crypto.randomUUID();
+  activateNegotiation(negotiationId);
+  discardLocalCandidateBatch();
+  pendingRemoteCandidates = [];
+  remoteIceComplete = false;
+  const incomingRestart = Boolean(mediaCallId && currentCall?.direction === "incoming");
+  const controllerOwnsRestart = incomingRestart && incomingRecovery.callId === mediaCallId;
+  if (controllerOwnsRestart) incomingRecovery.restartNegotiation(mediaCallId, negotiationId, reason);
   await Promise.allSettled([
-    sendSignal("ice_restart_request", { reason, icePolicy: "relay" }),
+    controllerOwnsRestart ? Promise.resolve() : sendSignal("offer_request", { reason, iceRestart: true, icePolicy: "relay" }, mediaCallId, negotiationId),
     mediaCallId ? sendEvent(mediaCallId, "media_restarting", { reason, icePolicy: "relay" }) : Promise.resolve({}),
   ]);
+  if (relayRestartResetTimer !== undefined) window.clearTimeout(relayRestartResetTimer);
+  relayRestartResetTimer = window.setTimeout(() => { relayRestartRequested = false; }, 2_000);
 }
 
 async function failMedia(code: string): Promise<void> {
@@ -1309,8 +1655,12 @@ async function handleConnectionState(connection: RTCPeerConnection): Promise<voi
     forceRelayTimer = setupFailureTimer = disconnectRecoveryTimer = undefined;
     const route = await selectedRoute(connection);
     element<HTMLOutputElement>("media").value = `Connected — ${route.label}`;
+    if (mediaCallId) {
+      incomingRecovery.mediaConnected(mediaCallId);
+      if (currentCall?.id === mediaCallId && currentCall.state === "active") incomingRecovery.callActive(mediaCallId);
+    }
     await Promise.allSettled([
-      sendSignal("media_ready", { route: route.candidateType, protocol: route.protocol }),
+      sendSignal("media_ready", { route: route.candidateType, protocol: route.protocol }, mediaCallId, activeNegotiationId || undefined),
       mediaCallId ? sendEvent(mediaCallId, "media_connected", { candidateType: route.candidateType, icePolicy: currentIcePolicy }) : Promise.resolve({}),
     ]);
     startStats();
@@ -1414,10 +1764,10 @@ function applyPeerMode(mode: CallView["relay_mode"]): void {
 
 function closeMedia(clearCallId = true): void {
   mediaGeneration += 1;
-  for (const timer of [candidateTimer, credentialRefreshTimer, statsTimer, forceRelayTimer, setupFailureTimer, disconnectRecoveryTimer, offerRecoveryTimer]) {
+  for (const timer of [candidateTimer, credentialRefreshTimer, statsTimer, forceRelayTimer, setupFailureTimer, disconnectRecoveryTimer, offerRecoveryTimer, relayRestartResetTimer]) {
     if (timer !== undefined) window.clearTimeout(timer);
   }
-  candidateTimer = credentialRefreshTimer = statsTimer = forceRelayTimer = setupFailureTimer = disconnectRecoveryTimer = offerRecoveryTimer = undefined;
+  candidateTimer = credentialRefreshTimer = statsTimer = forceRelayTimer = setupFailureTimer = disconnectRecoveryTimer = offerRecoveryTimer = relayRestartResetTimer = undefined;
   peerConnection?.close();
   peerConnection = undefined;
   localStream?.getTracks().forEach((track) => track.stop());
@@ -1433,7 +1783,12 @@ function closeMedia(clearCallId = true): void {
   localMicMuted = false;
   setupStartedAt = setupDurationMs = iceRestartCount = 0;
   lastStatsSummary = {};
-  if (clearCallId) mediaCallId = "";
+  if (clearCallId) {
+    mediaSetupFlight.clear();
+    activeNegotiationId = "";
+    localIceGenerations.reset();
+    mediaCallId = "";
+  }
   element<HTMLOutputElement>("media").value = "Disconnected";
   element<HTMLOutputElement>("stats").value = "No active media";
 }
@@ -1471,29 +1826,44 @@ document.querySelectorAll<HTMLButtonElement>("[data-event]").forEach((button) =>
     const event = button.dataset.event;
     if (!event) throw new Error("button event is missing");
     if (event === "accept") {
-      button.disabled = true;
-      button.textContent = "Preparing…";
-      element("incomingState").textContent = "Preparing secure audio";
+      const state = currentCall?.state;
+      if (currentCall?.direction !== "incoming" || !state || !["ringing_peer", "accepted", "active"].includes(state)) {
+        throw new Error("the incoming call is no longer available");
+      }
+      incomingRecovery.begin(callId, state !== "ringing_peer", true);
       await element<HTMLAudioElement>("remoteAudio").play().catch(() => undefined);
-      await ensureSignalConnected();
-      await ensurePeerConnection(callId);
+      await withTimeout(ensureSignalConnected(), 7_000, "Android signaling did not become ready");
+      const connection = await ensurePeerConnection(callId);
+      markIncomingConnectionPrepared(callId, connection);
+      if (currentCall?.state === "ringing_peer") {
+        try {
+          await sendEvent(callId, "accept");
+        } catch (error) {
+          await recoverCurrentCall();
+          if (currentCall?.id !== callId || !["accepted", "active"].includes(currentCall.state)) throw error;
+          log("Incoming call was already accepted; continuing media recovery");
+        }
+      }
+      incomingRecovery.markAccepted(callId);
+      if (currentCall?.state === "active" && connection.connectionState === "connected") incomingRecovery.callActive(callId);
+      incomingRecovery.requestMissingOffer("accept_ready", true);
+      log(currentCall?.state === "ringing_peer" ? "Accepted incoming call; waiting for secure media" : "Retrying accepted incoming call media");
+      return;
     }
     if (event === "end" && mediaCallId === callId && Object.keys(lastStatsSummary).length) {
       await sendEvent(callId, "media_summary", lastStatsSummary);
     }
     await sendEvent(callId, event);
-    if (event === "accept") {
-      button.textContent = "Waiting…";
-      element("incomingState").textContent = "Waiting for Android to answer";
+    if (event === "end" || event === "reject") {
+      incomingRecovery.reset(callId);
+      closeMedia();
     }
-    if (event === "end" || event === "reject") closeMedia();
     if (event === "full_duplex" || event === "listen" || event === "talk") applyPeerMode(event);
     log(`Sent ${event}`);
   })().catch((error) => {
     if (button.dataset.event === "accept") {
-      button.disabled = false;
-      button.textContent = "Accept";
-      element("incomingState").textContent = "Could not answer — tap to retry";
+      const callId = currentCall?.id ?? mediaCallId;
+      if (callId) incomingRecovery.fail(callId, `Could not connect: ${error instanceof Error ? error.message : String(error)}`);
     }
     log(`ERROR: ${String(error)}`);
   }));
@@ -1597,16 +1967,16 @@ element("startReplacePeer").addEventListener("click", () => void (async () => {
 })().catch((error) => log(`Peer replacement failed: ${String(error)}`)));
 
 window.addEventListener("online", () => {
-  void recoverForegroundSession().catch((error) => log(`Online recovery failed: ${String(error)}`));
+  void recoverForegroundSession("network_online").catch((error) => log(`Online recovery failed: ${String(error)}`));
   if (peerConnection && peerConnection.connectionState !== "connected") void requestRelayRestart("network_online");
 });
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible" && firebaseUser) {
-    void recoverForegroundSession().catch((error) => log(`Foreground recovery failed: ${String(error)}`));
+    void recoverForegroundSession("visibility_restore").catch((error) => log(`Foreground recovery failed: ${String(error)}`));
   }
 });
-window.addEventListener("focus", () => void recoverForegroundSession().catch((error) => log(`Focus recovery failed: ${String(error)}`)));
-window.addEventListener("pageshow", () => void recoverForegroundSession().catch((error) => log(`Page recovery failed: ${String(error)}`)));
+window.addEventListener("focus", () => void recoverForegroundSession("focus_restore").catch((error) => log(`Focus recovery failed: ${String(error)}`)));
+window.addEventListener("pageshow", () => void recoverForegroundSession("pageshow_restore").catch((error) => log(`Page recovery failed: ${String(error)}`)));
 window.addEventListener("beforeunload", () => {
   deliberatelyDisconnected = true;
   stopSignalHeartbeat();

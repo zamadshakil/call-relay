@@ -23,8 +23,10 @@ import dev.zamad.callrelay.network.PairingSignalClient
 import dev.zamad.callrelay.network.RelayApiClient
 import dev.zamad.callrelay.telecom.NumberPolicy
 import dev.zamad.callrelay.telecom.RelayInCallService
+import java.util.UUID
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -42,12 +44,19 @@ class RelayReadyService : Service() {
     private lateinit var connectivity: ConnectivityManager
     private var watchdog: Job? = null
     private var setupJob: Job? = null
+    private var restoreJob: Job? = null
+    private val incomingAnswerJobs = IncomingAnswerJobSlot()
+    private val incomingAnswerGate = IncomingAnswerGate()
+    private val callLifecycleBarrier = CallLifecycleBarrier()
     private var setupGeneration = 0L
     private var activeReportJob: Job? = null
     private var activeReportedCallId: String? = null
     private var mediaExpected = false
     private var mediaLostAt: Long? = null
     private var lastHeartbeatAt = 0L
+    private var lastDeviceHeartbeatAt = 0L
+    @Volatile private var signalState = "Disconnected"
+    @Volatile private var lastErrorCode: String? = null
     private var commandDrainJob: Job? = null
     private var serviceArmed = false
     private val remoteCommandsInFlight = mutableSetOf<String>()
@@ -64,6 +73,7 @@ class RelayReadyService : Service() {
         watchdog = scope.launch {
             while (isActive) {
                 enforceMediaWatchdog()
+                sendDeviceHeartbeatIfDue()
                 sendHeartbeatIfDue()
                 delay(1_000)
             }
@@ -93,9 +103,24 @@ class RelayReadyService : Service() {
             }
             ACTION_ACCEPT -> ifReady { acceptIncoming(intent.getStringExtra(EXTRA_CALL_ID)) }
             ACTION_CALL_ACTIVE -> ifReady { callBecameActive() }
-            ACTION_END -> ifReady {
+            ACTION_END -> {
+                // Terminal cleanup must remain available even if entitlement,
+                // pairing, or the in-memory runtime changed while a call was
+                // active. A foreground-service wake still has to foreground
+                // itself before performing the bounded server termination.
+                ensureForeground()
                 val requestedCallId = intent.getStringExtra(EXTRA_CALL_ID)
-                if (requestedCallId.isNullOrBlank() || isCurrentCall(requestedCallId)) endRelay(remoteRequest = !requestedCallId.isNullOrBlank())
+                val callId = PersistedCallRecoveryPolicy.resolveEndCallId(
+                    explicitCallId = requestedCallId,
+                    runtimeCallId = RelayRuntime.snapshot().callId,
+                    persistedCallId = preferences.activeCallId,
+                )
+                if (requestedCallId.isNullOrBlank() || callId != null) {
+                    endRelay(
+                        remoteRequest = !requestedCallId.isNullOrBlank(),
+                        requestedCallId = callId,
+                    )
+                }
             }
             ACTION_SET_MODE -> ifReady {
                 val requestedCallId = intent.getStringExtra(EXTRA_CALL_ID)
@@ -132,10 +157,11 @@ class RelayReadyService : Service() {
     override fun onDestroy() {
         watchdog?.cancel()
         invalidateSetup()
+        cancelIncomingAnswer()
         activeReportJob?.cancel()
         commandDrainJob?.cancel()
-        media.disconnect()
-        signal.close()
+        media.close()
+        signal.shutdown()
         runCatching { connectivity.unregisterNetworkCallback(networkCallback) }
         scope.cancel()
         RelayRuntime.update { RelayRuntime.Snapshot() }
@@ -155,6 +181,7 @@ class RelayReadyService : Service() {
             return
         }
         serviceArmed = true
+        lastDeviceHeartbeatAt = 0L
         RelayRuntime.update { it.copy(ready = true, error = null) }
         signal.start()
         restorePersistedCall()
@@ -165,6 +192,7 @@ class RelayReadyService : Service() {
         preferences.relayReadyDesired = false
         serviceArmed = false
         invalidateSetup()
+        cancelIncomingAnswer()
         activeReportJob?.cancel()
         activeReportJob = null
         activeReportedCallId = null
@@ -173,6 +201,35 @@ class RelayReadyService : Service() {
         signal.close()
         preferences.clearActiveCall()
         RelayRuntime.update { it.copy(ready = false, callId = null) }
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
+
+    private fun handlePairingRevoked(revokedPairingId: String, reason: String) {
+        // A delayed revocation from a replaced signaling socket must never
+        // erase a newer pairing that onboarding has already installed.
+        if (revokedPairingId.isNotBlank() && preferences.pairingId != revokedPairingId) return
+        invalidateSetup()
+        cancelIncomingAnswer()
+        activeReportJob?.cancel()
+        activeReportJob = null
+        commandDrainJob?.cancel()
+        commandDrainJob = null
+        if (RelayInCallService.isActive()) RelayInCallService.disconnect()
+        mediaExpected = false
+        mediaLostAt = null
+        media.disconnect()
+        serviceArmed = false
+        preferences.clearPairing()
+        signal.close()
+        RelayRuntime.update {
+            it.copy(
+                ready = false,
+                callId = null,
+                mediaState = "Pairing revoked",
+                error = "The paired browser was revoked ($reason). Open the app to pair again.",
+            )
+        }
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
@@ -197,7 +254,7 @@ class RelayReadyService : Service() {
             var createdCallId: String? = null
             runCatching {
                 check(RelayInCallService.activeCallCount() == 1) { "The cellular call ended before relay setup" }
-                val call = api.createIncomingCall()
+                val call = createIncomingCallAfterPriorTermination()
                 createdCallId = call.callId
                 checkSetupIsCurrent(generation)
                 check(RelayInCallService.activeCallCount() == 1) { "The cellular call ended before relay setup" }
@@ -239,6 +296,10 @@ class RelayReadyService : Service() {
                 connectMedia(callId)
                 checkSetupIsCurrent(generation)
                 awaitPairedPeer(generation)
+                checkSetupIsCurrent(generation)
+                check(RelayInCallService.activeCallCount() == 0) { "A cellular call started before remote dialing completed" }
+                check(preferences.markActiveCallDialIssued(callId)) { "The outgoing SIM call was already issued" }
+                checkSetupIsCurrent(generation)
                 placeCellularCall(number)
             }.onFailure { failure ->
                 if (failure is CancellationException) return@onFailure
@@ -257,44 +318,164 @@ class RelayReadyService : Service() {
 
     private fun acceptIncoming(requestedCallId: String?, commandId: String? = null, expectedVersion: Long = 0L) {
         val activeCallId = RelayRuntime.snapshot().callId ?: preferences.activeCallId.ifBlank { null }
-        if (requestedCallId != null && activeCallId != null && requestedCallId != activeCallId) return
-        if (activeCallId == null) return
-        scope.launch {
-            runCatching {
+        if (activeCallId == null || (requestedCallId != null && requestedCallId != activeCallId)) {
+            commandId?.let { finishRemoteCommand(it, completed = false) }
+            return
+        }
+        when (incomingAnswerGate.register(activeCallId, commandId, expectedVersion)) {
+            IncomingAnswerGate.Decision.JOIN -> return
+            IncomingAnswerGate.Decision.ALREADY_ISSUED -> {
+                commandId?.let { finishRemoteCommand(it, completed = true) }
+                if (RelayInCallService.isActive()) callBecameActive()
+                return
+            }
+            IncomingAnswerGate.Decision.REJECTED -> {
+                commandId?.let { finishRemoteCommand(it, completed = false) }
+                return
+            }
+            IncomingAnswerGate.Decision.START -> Unit
+        }
+        val answerSetupGeneration = setupGeneration
+        val gateGeneration = incomingAnswerGate.currentGeneration(activeCallId)
+        val answerJob = scope.launch(start = CoroutineStart.LAZY) {
+            val ownerJob = coroutineContext[Job] ?: error("Incoming answer job has no coroutine Job")
+            var completed = false
+            try {
+                ensureIncomingAnswerCurrent(activeCallId, gateGeneration, answerSetupGeneration)
                 adoptPersistedCall(activeCallId, "incoming")
                 val authoritativeCall = api.currentCall()
+                ensureIncomingAnswerCurrent(activeCallId, gateGeneration, answerSetupGeneration)
                 check(authoritativeCall?.id == activeCallId && authoritativeCall.direction == "incoming") {
                     "The incoming relay session is no longer current"
                 }
-                check(expectedVersion <= 0L || authoritativeCall.version >= expectedVersion) {
+                val requiredVersion = incomingAnswerGate.expectedVersion(activeCallId, gateGeneration)
+                check(requiredVersion <= 0L || authoritativeCall.version >= requiredVersion) {
                     "The incoming relay command is newer than the server session"
                 }
-                if (authoritativeCall.state == "active") {
+                if (authoritativeCall.state == "active" || RelayInCallService.isActive()) {
+                    ensureIncomingAnswerCurrent(activeCallId, gateGeneration, answerSetupGeneration)
+                    incomingAnswerGate.markIssued(activeCallId, gateGeneration)
                     RelayInCallService.routeCurrentCallToSpeaker()
-                    commandId?.let { finishRemoteCommand(it, completed = true) }
-                    return@runCatching
+                    if (RelayInCallService.isActive()) callBecameActive()
+                    completed = true
+                    return@launch
                 }
                 check(authoritativeCall.state == "accepted") { "The incoming relay session is not accepted" }
                 if (!mediaExpected) connectMedia(activeCallId)
-                awaitPairedPeer(setupGeneration)
+                ensureIncomingAnswerCurrent(activeCallId, gateGeneration, answerSetupGeneration)
+                awaitPairedPeer(answerSetupGeneration)
+                ensureIncomingAnswerCurrent(activeCallId, gateGeneration, answerSetupGeneration)
                 check(RelayInCallService.activeCallCount() == 1) { "Incoming SIM call ended before WebRTC connected" }
                 api.event(activeCallId, "answering_sim")
-                RelayInCallService.answer()
-                RelayInCallService.routeCurrentCallToSpeaker()
-                if (RelayInCallService.isActive()) callBecameActive()
-                commandId?.let { finishRemoteCommand(it, completed = true) }
-            }.onFailure { failure ->
-                if (failure !is CancellationException) {
-                    runCatching { api.event(activeCallId, "failed", "media_not_ready_before_answer") }
-                    commandId?.let { finishRemoteCommand(it, completed = false) }
-                    reportFailure(failure)
+                ensureIncomingAnswerCurrent(activeCallId, gateGeneration, answerSetupGeneration)
+                if (RelayInCallService.isActive()) {
+                    incomingAnswerGate.markIssued(activeCallId, gateGeneration)
+                    callBecameActive()
+                    completed = true
+                    return@launch
                 }
+                repeat(MAX_TELECOM_ANSWER_ATTEMPTS) { attempt ->
+                    ensureIncomingAnswerCurrent(activeCallId, gateGeneration, answerSetupGeneration)
+                    incomingAnswerGate.markIssued(activeCallId, gateGeneration)
+                    RelayInCallService.answer()
+                    if (awaitTelecomActivation(activeCallId, gateGeneration, answerSetupGeneration)) {
+                        ensureIncomingAnswerCurrent(activeCallId, gateGeneration, answerSetupGeneration)
+                        runCatching { RelayInCallService.routeCurrentCallToSpeaker() }
+                        callBecameActive()
+                        completed = true
+                        return@launch
+                    }
+                    incomingAnswerGate.clearIssued(activeCallId, gateGeneration)
+                    if (attempt + 1 < MAX_TELECOM_ANSWER_ATTEMPTS) delay(250)
+                }
+                error("Android Telecom did not activate the incoming call after two answer attempts")
+            } catch (failure: Throwable) {
+                if (failure !is CancellationException) {
+                    val recovered = reconcileIncomingAnswer(activeCallId, gateGeneration, answerSetupGeneration)
+                    completed = recovered
+                    if (!recovered) {
+                        incomingAnswerGate.clearIssued(activeCallId, gateGeneration)
+                        val markedFailed = failIncomingIfStillCurrent(activeCallId, gateGeneration, answerSetupGeneration)
+                        reportFailure(
+                            failure,
+                            if (markedFailed) "media_not_ready_before_answer" else "incoming_answer_recoverable",
+                        )
+                    }
+                }
+            } finally {
+                incomingAnswerGate.finish(activeCallId, gateGeneration).forEach {
+                    finishRemoteCommand(it, completed = completed)
+                }
+                incomingAnswerJobs.clearIfOwner(ownerJob)
             }
         }
+        incomingAnswerJobs.install(answerJob)?.cancel()
+        answerJob.start()
+    }
+
+    private suspend fun reconcileIncomingAnswer(callId: String, gateGeneration: Long, setupGeneration: Long): Boolean {
+        ensureIncomingAnswerCurrent(callId, gateGeneration, setupGeneration)
+        if (RelayInCallService.isActive()) {
+            incomingAnswerGate.markIssued(callId, gateGeneration)
+            runCatching { RelayInCallService.routeCurrentCallToSpeaker() }
+            callBecameActive()
+            return true
+        }
+        val serverResult = runCatching { api.currentCall() }
+        ensureIncomingAnswerCurrent(callId, gateGeneration, setupGeneration)
+        if (serverResult.isFailure) return false
+        val serverCall = serverResult.getOrNull() ?: return true
+        if (serverCall.id == callId && serverCall.state == "active") {
+            incomingAnswerGate.markIssued(callId, gateGeneration)
+            runCatching { RelayInCallService.routeCurrentCallToSpeaker() }
+            return true
+        }
+        // A closed or replaced call must not be overwritten with a late failed
+        // event from an obsolete local job.
+        return serverCall.id != callId || serverCall.state in setOf("ending", "ended", "failed")
+    }
+
+    private suspend fun failIncomingIfStillCurrent(callId: String, gateGeneration: Long, setupGeneration: Long): Boolean {
+        ensureIncomingAnswerCurrent(callId, gateGeneration, setupGeneration)
+        if (RelayInCallService.isActive()) return false
+        val serverCall = runCatching { api.currentCall() }.getOrNull() ?: return false
+        ensureIncomingAnswerCurrent(callId, gateGeneration, setupGeneration)
+        if (serverCall.id != callId || serverCall.state != "accepted") return false
+        return runCatching {
+            api.event(callId, "failed", "media_not_ready_before_answer")
+            true
+        }.getOrDefault(false)
+    }
+
+    private suspend fun awaitTelecomActivation(callId: String, gateGeneration: Long, setupGeneration: Long): Boolean {
+        val deadline = SystemClock.elapsedRealtime() + TELECOM_ANSWER_CONFIRM_TIMEOUT_MS
+        while (SystemClock.elapsedRealtime() < deadline) {
+            ensureIncomingAnswerCurrent(callId, gateGeneration, setupGeneration)
+            if (RelayInCallService.isActive()) return true
+            if (RelayRuntime.snapshot().callId != callId || RelayInCallService.activeCallCount() != 1) return false
+            delay(100)
+        }
+        return RelayInCallService.isActive()
+    }
+
+    private fun ensureIncomingAnswerCurrent(callId: String, gateGeneration: Long, expectedSetupGeneration: Long) {
+        if (
+            !incomingAnswerGate.isCurrent(callId, gateGeneration) ||
+            setupGeneration != expectedSetupGeneration ||
+            RelayRuntime.snapshot().callId != callId
+        ) {
+            throw CancellationException("Incoming answer workflow was superseded")
+        }
+    }
+
+    private fun cancelIncomingAnswer(callId: String? = null) {
+        incomingAnswerJobs.take()?.cancel()
+        incomingAnswerGate.cancel(callId).forEach { finishRemoteCommand(it, completed = false) }
     }
 
     private fun callBecameActive() {
         val callId = RelayRuntime.snapshot().callId ?: return
+        incomingAnswerGate.markIssued(callId)
         RelayInCallService.routeCurrentCallToSpeaker()
         if (activeReportedCallId == callId || activeReportJob?.isActive == true) return
         activeReportJob = scope.launch {
@@ -322,9 +503,15 @@ class RelayReadyService : Service() {
         }
     }
 
-    private fun endRelay(remoteRequest: Boolean) {
-        val callId = RelayRuntime.snapshot().callId
+    private fun endRelay(remoteRequest: Boolean, requestedCallId: String? = null) {
+        val callId = requestedCallId?.takeIf(String::isNotBlank)
+            ?: PersistedCallRecoveryPolicy.resolveEndCallId(
+                explicitCallId = null,
+                runtimeCallId = RelayRuntime.snapshot().callId,
+                persistedCallId = preferences.activeCallId,
+            )
         invalidateSetup()
+        cancelIncomingAnswer(callId)
         activeReportJob?.cancel()
         activeReportJob = null
         activeReportedCallId = null
@@ -332,19 +519,77 @@ class RelayReadyService : Service() {
         mediaExpected = false
         mediaLostAt = null
         lastHeartbeatAt = 0L
-        val summary = media.summary().json()
         media.disconnect()
         preferences.clearActiveCall(callId)
-        RelayRuntime.update { it.copy(callId = null, mediaState = "Disconnected") }
-        if (callId != null) scope.launch {
-            runCatching { api.event(callId, "media_summary", payload = summary) }
-            runCatching { api.event(callId, "end") }
+        RelayRuntime.update { current ->
+            if (callId == null || current.callId == null || current.callId == callId) {
+                current.copy(callId = null, mediaState = "Disconnected")
+            } else {
+                current
+            }
+        }
+        val termination = if (callId != null) {
+            // Terminalization gates the next incoming call. Optional media
+            // telemetry must never sit in front of this authoritative end.
+            callLifecycleBarrier.begin(scope, callId) { terminateCallOnServer(callId) }
+        } else {
+            null
         }
         if (!preferences.entitlementActive) {
-            disarm()
+            if (termination == null) {
+                disarm()
+            } else {
+                scope.launch {
+                    runCatching { termination.await() }
+                    disarm()
+                }
+            }
             return
         }
         updateNotification("Ready for one paired peer")
+    }
+
+    private suspend fun createIncomingCallAfterPriorTermination(): RelayApiClient.CreatedCall {
+        val priorTermination = callLifecycleBarrier.awaitPending()
+        val requestId = UUID.randomUUID().toString()
+        var lastFailure: Throwable? = priorTermination?.failure
+        repeat(2) { attempt ->
+            try {
+                return api.createIncomingCall(requestId)
+            } catch (failure: Throwable) {
+                if (failure is CancellationException) throw failure
+                lastFailure = failure
+                val staleCallId = priorTermination?.callId ?: callLifecycleBarrier.lastCallId()
+                val conflict = failure is RelayApiClient.RelayApiException && failure.status == 409
+                val current = if (conflict) runCatching { api.currentCall() }.getOrNull() else null
+                if (!conflict || staleCallId.isNullOrBlank() || current?.id != staleCallId || attempt == 1) throw failure
+                terminateCallOnServer(staleCallId)
+                delay(250)
+            }
+        }
+        throw lastFailure ?: IllegalStateException("Could not create incoming relay session")
+    }
+
+    private suspend fun terminateCallOnServer(callId: String) {
+        var lastFailure: Throwable? = null
+        repeat(CALL_END_ATTEMPTS) { attempt ->
+            try {
+                api.event(
+                    callId = callId,
+                    type = "end",
+                    attempts = 1,
+                    connectTimeoutMs = CALL_END_CONNECT_TIMEOUT_MS,
+                    readTimeoutMs = CALL_END_READ_TIMEOUT_MS,
+                )
+                return
+            } catch (failure: Throwable) {
+                if (failure is CancellationException) throw failure
+                if (failure is RelayApiClient.RelayApiException && failure.status == 409) return
+                lastFailure = failure
+                if (attempt + 1 < CALL_END_ATTEMPTS) delay(250L * (attempt + 1))
+            }
+        }
+        throw lastFailure ?: IllegalStateException("Could not terminate the previous relay session")
     }
 
     private suspend fun enforceMediaWatchdog() {
@@ -368,7 +613,8 @@ class RelayReadyService : Service() {
     private suspend fun sendHeartbeatIfDue() {
         val callId = RelayRuntime.snapshot().callId ?: return
         if (!mediaExpected || !media.isPeerConnected()) return
-        if (RelayInCallService.isActive() && activeReportedCallId != callId) {
+        if (!RelayInCallService.isActive()) return
+        if (activeReportedCallId != callId) {
             callBecameActive()
             return
         }
@@ -379,34 +625,121 @@ class RelayReadyService : Service() {
             .onFailure { lastHeartbeatAt = 0L }
     }
 
+    private suspend fun sendDeviceHeartbeatIfDue() {
+        if (!preferences.relayReadyDesired || !preferences.configured()) return
+        val now = System.currentTimeMillis()
+        if (now - lastDeviceHeartbeatAt < DEVICE_HEARTBEAT_INTERVAL_MS) return
+        lastDeviceHeartbeatAt = now
+        val heartbeat = DeviceHeartbeat(
+            serviceInstanceId = DeviceHeartbeatIdentity.serviceInstanceId,
+            sequence = DeviceHeartbeatIdentity.nextSequence(),
+            relayReady = serviceArmed && preferences.entitlementActive,
+            signalState = signalState,
+            activeCallId = RelayRuntime.snapshot().callId,
+            processStartedAt = DeviceHeartbeatIdentity.processStartedAt,
+            lastErrorCode = lastErrorCode,
+        )
+        runCatching { api.deviceHeartbeat(heartbeat) }
+            .onFailure { lastErrorCode = "heartbeat_failed" }
+    }
+
     private fun isCurrentCall(requestedCallId: String?): Boolean {
         val currentCallId = RelayRuntime.snapshot().callId
         return !requestedCallId.isNullOrBlank() && currentCallId != null && requestedCallId == currentCallId
     }
 
+    private fun isKnownCall(requestedCallId: String?): Boolean =
+        isCurrentCall(requestedCallId) ||
+            (!requestedCallId.isNullOrBlank() && requestedCallId == preferences.activeCallId)
+
     private fun restorePersistedCall() {
-        scope.launch {
-            runCatching {
+        val generation = setupGeneration
+        val nextRestore = scope.launch(start = CoroutineStart.LAZY) {
+            val ownerJob = coroutineContext[Job] ?: error("Restore job has no coroutine Job")
+            try {
                 val serverCall = api.currentCall()
+                checkSetupIsCurrent(generation)
                 if (serverCall == null) {
                     if (RelayInCallService.activeCallCount() == 0) {
                         preferences.clearActiveCall()
                         RelayRuntime.update { it.copy(callId = null) }
                     }
-                    return@runCatching
+                    return@launch
                 }
                 adoptPersistedCall(serverCall.id, serverCall.direction)
+                checkSetupIsCurrent(generation)
                 media.applyMode(RelayMode.fromWire(serverCall.relayMode))
-                if (!mediaExpected) connectMedia(serverCall.id)
-                if (
-                    serverCall.direction == "incoming" && serverCall.state == "accepted" &&
-                    RelayInCallService.activeCallCount() == 1 && !RelayInCallService.isActive()
-                ) {
-                    acceptIncoming(serverCall.id)
+                val outgoingAction = PersistedCallRecoveryPolicy.outgoingAction(
+                    direction = serverCall.direction,
+                    state = serverCall.state,
+                    phoneNumber = serverCall.phoneNumber,
+                    activeTelecomCalls = RelayInCallService.activeCallCount(),
+                    dialAlreadyIssued = preferences.activeCallDialIssued,
+                )
+                when (outgoingAction) {
+                    PersistedCallRecoveryPolicy.OutgoingAction.TERMINALIZE -> {
+                        terminalizeRestoredOutgoing(serverCall.id, generation, "android_restart_unsafe_to_redial")
+                    }
+                    PersistedCallRecoveryPolicy.OutgoingAction.RESUME_DIAL -> {
+                        try {
+                            if (!mediaExpected) connectMedia(serverCall.id)
+                            resumeRestoredOutgoing(serverCall.id, checkNotNull(serverCall.phoneNumber), generation)
+                        } catch (failure: Throwable) {
+                            if (failure is CancellationException) throw failure
+                            if (generation == setupGeneration) {
+                                runCatching {
+                                    terminalizeRestoredOutgoing(serverCall.id, generation, "android_restart_dial_failed")
+                                }
+                            }
+                            throw failure
+                        }
+                    }
+                    PersistedCallRecoveryPolicy.OutgoingAction.KEEP_EXISTING_TELECOM_CALL,
+                    PersistedCallRecoveryPolicy.OutgoingAction.NONE,
+                    -> {
+                        if (!mediaExpected) connectMedia(serverCall.id)
+                        checkSetupIsCurrent(generation)
+                        if (
+                            serverCall.direction == "incoming" && serverCall.state == "accepted" &&
+                            RelayInCallService.activeCallCount() == 1 && !RelayInCallService.isActive()
+                        ) {
+                            acceptIncoming(serverCall.id)
+                        }
+                    }
                 }
-            }.onFailure { failure ->
+            } catch (failure: Throwable) {
                 if (failure !is CancellationException) reportFailure(failure)
+            } finally {
+                if (restoreJob === ownerJob) restoreJob = null
             }
+        }
+        restoreJob?.cancel()
+        restoreJob = nextRestore
+        nextRestore.start()
+    }
+
+    private suspend fun resumeRestoredOutgoing(callId: String, phoneNumber: String, generation: Long) {
+        validateOutgoing(phoneNumber)
+        checkSetupIsCurrent(generation)
+        awaitPairedPeer(generation)
+        checkSetupIsCurrent(generation)
+        check(RelayInCallService.activeCallCount() == 0) { "A cellular call appeared before outgoing recovery" }
+        check(preferences.markActiveCallDialIssued(callId)) { "The outgoing SIM call was already issued" }
+        checkSetupIsCurrent(generation)
+        if (RelayInCallService.activeCallCount() == 0) {
+            placeCellularCall(phoneNumber)
+        }
+    }
+
+    private suspend fun terminalizeRestoredOutgoing(callId: String, generation: Long, code: String) {
+        checkSetupIsCurrent(generation)
+        api.event(callId, "failed", code)
+        checkSetupIsCurrent(generation)
+        mediaExpected = false
+        media.disconnect()
+        preferences.clearActiveCall(callId)
+        RelayRuntime.update { current ->
+            if (current.callId == callId) current.copy(callId = null, mediaState = "Disconnected") else current
         }
     }
 
@@ -508,6 +841,8 @@ class RelayReadyService : Service() {
         setupGeneration += 1
         setupJob?.cancel()
         setupJob = null
+        restoreJob?.cancel()
+        restoreJob = null
     }
 
     private fun checkSetupIsCurrent(generation: Long) {
@@ -563,7 +898,8 @@ class RelayReadyService : Service() {
     private fun accountKey(handle: PhoneAccountHandle): String =
         "${handle.componentName.flattenToString()}|${handle.id}"
 
-    private fun reportFailure(failure: Throwable) {
+    private fun reportFailure(failure: Throwable, code: String = "relay_error") {
+        lastErrorCode = code
         RelayRuntime.update { it.copy(error = failure.message ?: failure::class.java.simpleName) }
         updateNotification("Relay error — open app for details")
     }
@@ -615,14 +951,27 @@ class RelayReadyService : Service() {
         private const val NOTIFICATION_ID = 2001
         private const val MEDIA_LOSS_TIMEOUT_MS = 15_000L
         private const val PEER_JOIN_TIMEOUT_MS = 20_000L
+        private const val TELECOM_ANSWER_CONFIRM_TIMEOUT_MS = 4_000L
+        private const val MAX_TELECOM_ANSWER_ATTEMPTS = 2
+        private const val CALL_END_ATTEMPTS = 2
+        private const val CALL_END_CONNECT_TIMEOUT_MS = 2_000
+        private const val CALL_END_READ_TIMEOUT_MS = 3_000
         private const val HEARTBEAT_INTERVAL_MS = 30_000L
+        private const val DEVICE_HEARTBEAT_INTERVAL_MS = 30_000L
         private const val REMOTE_COMMAND_MAX_AGE_MS = 2 * 60_000L
     }
 
     private val signalListener = object : PairingSignalClient.Listener {
         override fun onSignalState(state: String) {
+            signalState = state
             RelayRuntime.update { current ->
                 if (current.callId == null) current.copy(mediaState = "Signaling: $state") else current
+            }
+            if (state == "Connected" && mediaExpected && RelayRuntime.snapshot().callId != null && !media.isPeerConnected()) {
+                scope.launch {
+                    runCatching { media.ensureOffer() }
+                        .onFailure { reportFailure(it, "offer_regeneration_failed") }
+                }
             }
         }
 
@@ -632,15 +981,23 @@ class RelayReadyService : Service() {
 
         override fun onCallSnapshot(call: PairingSignalClient.CallSnapshot) {
             scope.launch {
+                // END clears local state before its bounded network request
+                // completes. Ignore snapshots for that exact terminalizing
+                // call so a delayed accepted/dialing snapshot cannot re-adopt
+                // it while Telecom is still unwinding.
+                if (callLifecycleBarrier.isTerminating(call.id)) return@launch
                 if (call.state == "ending" || call.state == "ended" || call.state == "failed") {
-                    if (isCurrentCall(call.id)) endRelay(remoteRequest = true)
+                    if (isKnownCall(call.id)) endRelay(remoteRequest = true, requestedCallId = call.id)
                     return@launch
                 }
                 if (call.direction == "incoming" && RelayRuntime.snapshot().callId == null && RelayInCallService.activeCallCount() == 1) {
                     adoptPersistedCall(call.id, call.direction)
                     if (!mediaExpected) connectMedia(call.id)
                 }
-                if (call.direction == "outgoing" && RelayRuntime.snapshot().callId == null && !call.phoneNumber.isNullOrBlank()) {
+                if (
+                    call.direction == "outgoing" && call.state == "dialing_sim" &&
+                    RelayRuntime.snapshot().callId == null && !call.phoneNumber.isNullOrBlank()
+                ) {
                     beginOutgoing(call.id, call.phoneNumber)
                     return@launch
                 }
@@ -651,20 +1008,26 @@ class RelayReadyService : Service() {
             }
         }
 
-        override fun onEnvelope(type: String, payload: org.json.JSONObject, callId: String) {
+        override fun onEnvelope(type: String, payload: org.json.JSONObject, callId: String, negotiationId: String?) {
             scope.launch {
-                runCatching { media.handleSignal(type, payload, callId) }
+                runCatching { media.handleSignal(type, payload, callId, negotiationId) }
                     .onFailure(::reportFailure)
             }
         }
 
+        override fun onPairingRevoked(pairingId: String, reason: String) {
+            scope.launch { handlePairingRevoked(pairingId, reason) }
+        }
+
         override fun onSignalError(message: String) {
+            lastErrorCode = "signaling_error"
             RelayRuntime.update { it.copy(error = message) }
         }
     }
 
     private val mediaListener = object : WebRtcRelaySession.Listener {
         override fun onMediaConnected(candidateType: String, icePolicy: String) {
+            lastErrorCode = null
             val callId = RelayRuntime.snapshot().callId ?: return
             scope.launch {
                 runCatching {
@@ -687,7 +1050,7 @@ class RelayReadyService : Service() {
                 if (RelayInCallService.isActive()) RelayInCallService.disconnect()
                 runCatching { api.event(failedCallId, "media_summary", payload = summary) }
                 runCatching { api.event(failedCallId, "failed", code) }
-                reportFailure(IllegalStateException(message))
+                reportFailure(IllegalStateException(message), code)
             }
         }
     }

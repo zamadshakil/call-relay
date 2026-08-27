@@ -1,27 +1,28 @@
 package dev.zamad.callrelay.relay
 
 import android.content.Context
-import android.media.AudioAttributes
-import android.media.AudioFormat
-import android.media.AudioManager
-import android.media.MediaRecorder
 import android.os.SystemClock
-import dev.zamad.callrelay.audio.CaptureSampleRateSelector
 import dev.zamad.callrelay.audio.DuplexEchoGuard
 import dev.zamad.callrelay.audio.PcmGainProcessor
 import dev.zamad.callrelay.network.PairingSignalClient
 import dev.zamad.callrelay.network.RelayApiClient
 import java.nio.ByteBuffer
+import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.suspendCancellableCoroutine
 import livekit.org.webrtc.AudioSource
 import livekit.org.webrtc.AudioTrack
@@ -32,15 +33,15 @@ import livekit.org.webrtc.MediaConstraints
 import livekit.org.webrtc.MediaStream
 import livekit.org.webrtc.MediaStreamTrack
 import livekit.org.webrtc.PeerConnection
-import livekit.org.webrtc.PeerConnectionFactory
 import livekit.org.webrtc.RTCStatsReport
 import livekit.org.webrtc.RtpReceiver
 import livekit.org.webrtc.RtpTransceiver
 import livekit.org.webrtc.SdpObserver
 import livekit.org.webrtc.SessionDescription
-import livekit.org.webrtc.audio.JavaAudioDeviceModule
 import org.json.JSONArray
 import org.json.JSONObject
+
+private typealias ConnectionBinding = ConnectionGenerationGate.Binding<PeerConnection>
 
 class WebRtcRelaySession(
     context: Context,
@@ -86,15 +87,21 @@ class WebRtcRelaySession(
     private val connected = AtomicBoolean(false)
     private val gainProcessor = PcmGainProcessor()
     private val echoGuard = DuplexEchoGuard()
+    private val iceGenerationRouter = IceGenerationRouter()
+    private val connectionGenerationGate = ConnectionGenerationGate<PeerConnection>()
     private val pendingCandidates = mutableListOf<IceCandidate>()
-    private var factory: PeerConnectionFactory? = null
-    private var audioModule: JavaAudioDeviceModule? = null
-    private var audioProcessing: ExternalAudioProcessingFactory? = null
+    private val engineLeaseDelegate = lazy {
+        ProcessWebRtcEngine.attach(appContext, captureProcessor, renderProcessor)
+    }
+    private val engineLease by engineLeaseDelegate
+    private val connectMutex = Mutex()
+    private val negotiationMutex = Mutex()
+    private val sessionGeneration = AtomicLong()
     private var audioSource: AudioSource? = null
     private var localTrack: AudioTrack? = null
     private var remoteTrack: AudioTrack? = null
-    private var peerConnection: PeerConnection? = null
-    private var callId = ""
+    @Volatile private var peerConnection: PeerConnection? = null
+    @Volatile private var callId = ""
     private var mediaConfig: RelayApiClient.MediaConfig? = null
     private var icePolicy = "all"
     private var setupStartedAt = 0L
@@ -104,38 +111,59 @@ class WebRtcRelaySession(
     private var refreshTimer: Job? = null
     private var statsTimer: Job? = null
     private var restartCount = 0
+    @Volatile private var currentNegotiationId: String? = null
+    @Volatile private var lifecycleState = MediaLifecycle.IDLE
     @Volatile private var statsSummary = StatsSummary()
 
-    suspend fun connect(nextCallId: String) {
+    suspend fun connect(nextCallId: String) = connectMutex.withLock {
         require(nextCallId.matches(Regex("^call_[a-f0-9]{32}$"))) { "Call ID is invalid" }
+        if (callId == nextCallId && peerConnection != null) return@withLock
         disconnect()
+        val generation = sessionGeneration.incrementAndGet()
         signal.awaitConnected()
+        checkGeneration(generation)
         callId = nextCallId
+        lifecycleState = MediaLifecycle.CONNECTING
         setupStartedAt = System.currentTimeMillis()
         setupDurationMs = 0L
         icePolicy = "all"
         restartCount = 0
         RelayRuntime.update { it.copy(mediaState = "Requesting Cloudflare STUN/TURN", error = null) }
         mediaConfig = api.mediaConfig(nextCallId)
-        initializeFactory()
-        createPeerConnection()
+        checkGeneration(generation)
+        engineLease.factory
+        createPeerConnection(generation, nextCallId)
+        checkGeneration(generation)
         createAndSendOffer(iceRestart = false)
+        checkGeneration(generation)
         RelayRuntime.update { it.copy(mediaState = "Connecting direct-first WebRTC") }
         startDeadlines()
         scheduleCredentialRefresh()
     }
 
-    suspend fun handleSignal(type: String, payload: JSONObject, envelopeCallId: String) {
+    suspend fun handleSignal(type: String, payload: JSONObject, envelopeCallId: String, negotiationId: String? = null) {
         if (envelopeCallId != callId || callId.isBlank()) return
+        if (
+            type in NEGOTIATION_SCOPED_MESSAGES && negotiationId != null &&
+            currentNegotiationId != null && negotiationId != currentNegotiationId
+        ) {
+            // Safari can flush candidates or an answer after a reconnect. They
+            // belong to the old DTLS/ICE exchange and must not contaminate the
+            // replacement peer connection negotiation.
+            return
+        }
         when (type) {
             "answer" -> {
+                val binding = currentConnectionBinding() ?: return
                 val answer = SessionDescription(SessionDescription.Type.ANSWER, payload.getString("sdp"))
-                setRemoteDescription(answer)
+                setRemoteDescription(answer, binding)
+                if (!isCurrent(binding)) return
                 synchronized(pendingCandidates) {
                     pendingCandidates.toList().also { pendingCandidates.clear() }
-                }.forEach { peerConnection?.addIceCandidate(it) }
+                }.forEach { binding.connection.addIceCandidate(it) }
             }
             "ice_candidates" -> {
+                val binding = currentConnectionBinding() ?: return
                 val candidates = payload.getJSONArray("candidates")
                 check(candidates.length() <= 128) { "Too many ICE candidates" }
                 for (index in 0 until candidates.length()) {
@@ -145,12 +173,29 @@ class WebRtcRelaySession(
                         value.getInt("sdpMLineIndex"),
                         value.getString("candidate"),
                     )
-                    if (peerConnection?.remoteDescription != null) peerConnection?.addIceCandidate(candidate)
+                    if (!isCurrent(binding)) return
+                    if (binding.connection.remoteDescription != null) binding.connection.addIceCandidate(candidate)
                     else synchronized(pendingCandidates) { pendingCandidates += candidate }
                 }
             }
             "ice_complete" -> Unit
-            "ice_restart_request" -> restartIce(payload.optString("reason", "peer_request"), forceRelay = true)
+            "ice_restart_request" -> {
+                val binding = currentConnectionBinding() ?: return
+                restartIce(
+                    reason = payload.optString("reason", "peer_request"),
+                    forceRelay = true,
+                    negotiationId = negotiationId,
+                    expectedBinding = binding,
+                )
+            }
+            "offer_request" -> {
+                require(negotiationId != null) { "Offer request is missing its negotiation ID" }
+                ensureOffer(
+                    iceRestart = payload.optBoolean("iceRestart", payload.optBoolean("ice_restart", false)),
+                    negotiationId = negotiationId,
+                    forceRelay = payload.optString("icePolicy", payload.optString("ice_policy")) == "relay",
+                )
+            }
             "media_failed" -> fail("peer_media_failed", payload.optString("reason", "Paired peer media failed"))
         }
     }
@@ -172,11 +217,15 @@ class WebRtcRelaySession(
     fun summary(): StatsSummary = statsSummary.copy(iceRestartCount = restartCount)
 
     fun networkChanged() {
-        if (callId.isNotBlank() && peerConnection != null) scope.launch { restartIce("network_change", forceRelay = false) }
+        val binding = currentConnectionBinding() ?: return
+        scope.launch { restartIce("network_change", forceRelay = false, expectedBinding = binding) }
     }
 
     @Synchronized
     fun disconnect() {
+        if (lifecycleState == MediaLifecycle.CLOSING) return
+        lifecycleState = MediaLifecycle.CLOSING
+        sessionGeneration.incrementAndGet()
         directTimer?.cancel()
         failureTimer?.cancel()
         refreshTimer?.cancel()
@@ -191,66 +240,30 @@ class WebRtcRelaySession(
         val connection = peerConnection.also { peerConnection = null }
         val track = localTrack.also { localTrack = null }
         val source = audioSource.also { audioSource = null }
-        val processing = audioProcessing.also { audioProcessing = null }
-        val connectionFactory = factory.also { factory = null }
-        val module = audioModule.also { audioModule = null }
+        // Clear the call before closing native objects so late WebRTC callbacks
+        // cannot re-enter failure handling for a call that is already ending.
+        callId = ""
+        connectionGenerationGate.invalidate()
+        currentNegotiationId = null
+        iceGenerationRouter.reset()
+        mediaConfig = null
         connection?.close()
         connection?.dispose()
         track?.dispose()
         source?.dispose()
-        // The processing factory owns the original native APM reference while the
-        // PeerConnectionFactory owns another. Release the original reference first;
-        // doing this after PeerConnectionFactory.dispose() crashes m144 in nativeDestroy.
-        processing?.destroy()
-        connectionFactory?.dispose()
-        module?.release()
         synchronized(pendingCandidates) { pendingCandidates.clear() }
-        callId = ""
-        mediaConfig = null
+        lifecycleState = MediaLifecycle.IDLE
         RelayRuntime.update { it.copy(mediaState = "Disconnected", captureRms = 0.0, capturePeak = 0) }
     }
 
-    private fun initializeFactory() {
-        synchronized(initializationLock) {
-            if (!initialized) {
-                PeerConnectionFactory.initialize(
-                    PeerConnectionFactory.InitializationOptions.builder(appContext)
-                        .createInitializationOptions(),
-                )
-                initialized = true
-            }
-        }
-        val attributes = AudioAttributes.Builder()
-            .setUsage(AudioAttributes.USAGE_MEDIA)
-            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-            .build()
-        appContext.getSystemService(AudioManager::class.java).mode = AudioManager.MODE_NORMAL
-        val processing = ExternalAudioProcessingFactory().apply {
-            setCapturePostProcessing(captureProcessor)
-            setRenderPreProcessing(renderProcessor)
-        }
-        val module = JavaAudioDeviceModule.builder(appContext)
-            .setAudioSource(MediaRecorder.AudioSource.VOICE_RECOGNITION)
-            .setAudioFormat(AudioFormat.ENCODING_PCM_16BIT)
-            .setInputSampleRate(CaptureSampleRateSelector.choose(appContext))
-            .setOutputSampleRate(SAMPLE_RATE_HZ)
-            .setAudioAttributes(attributes)
-            .setUseLowLatency(true)
-            .setUseHardwareAcousticEchoCanceler(false)
-            .setUseHardwareNoiseSuppressor(false)
-            .setUseStereoInput(false)
-            .setUseStereoOutput(false)
-            .createAudioDeviceModule()
-        audioProcessing = processing
-        audioModule = module
-        factory = PeerConnectionFactory.builder()
-            .setAudioDeviceModule(module)
-            .setAudioProcessingFactory(processing)
-            .createPeerConnectionFactory()
+    fun close() {
+        disconnect()
+        if (engineLeaseDelegate.isInitialized()) engineLease.detach()
+        scope.cancel()
     }
 
-    private fun createPeerConnection() {
-        val createdFactory = checkNotNull(factory)
+    private fun createPeerConnection(generation: Long, expectedCallId: String) {
+        val createdFactory = engineLease.factory
         val config = PeerConnection.RTCConfiguration(checkNotNull(mediaConfig).iceServers.map(::iceServer)).apply {
             iceTransportsType = PeerConnection.IceTransportsType.ALL
             bundlePolicy = PeerConnection.BundlePolicy.MAXBUNDLE
@@ -258,7 +271,14 @@ class WebRtcRelaySession(
             sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
             continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
         }
-        val connection = checkNotNull(createdFactory.createPeerConnection(config, observer)) { "WebRTC peer connection creation failed" }
+        val connectionReference = AtomicReference<PeerConnection?>()
+        val connection = checkNotNull(
+            createdFactory.createPeerConnection(
+                config,
+                createPeerObserver(generation, expectedCallId, connectionReference),
+            ),
+        ) { "WebRTC peer connection creation failed" }
+        connectionReference.set(connection)
         val constraints = MediaConstraints().apply {
             mandatory += MediaConstraints.KeyValuePair("googEchoCancellation", "true")
             mandatory += MediaConstraints.KeyValuePair("googAutoGainControl", "false")
@@ -274,47 +294,172 @@ class WebRtcRelaySession(
         audioSource = source
         localTrack = track
         peerConnection = connection
+        connectionGenerationGate.activate(generation, expectedCallId, connection)
         applyAudioDirection()
     }
 
-    private suspend fun createAndSendOffer(iceRestart: Boolean) {
+    private suspend fun createAndSendOffer(
+        iceRestart: Boolean,
+        negotiationId: String? = null,
+        expectedBinding: ConnectionBinding? = null,
+    ) = negotiationMutex.withLock {
+        val binding = expectedBinding ?: currentConnectionBinding() ?: return@withLock
+        if (!isCurrent(binding)) return@withLock
+        createAndSendOfferLocked(iceRestart, negotiationId, binding)
+    }
+
+    suspend fun ensureOffer(
+        iceRestart: Boolean = false,
+        negotiationId: String? = null,
+        forceRelay: Boolean = false,
+    ) = negotiationMutex.withLock {
+        val binding = currentConnectionBinding() ?: return@withLock
+        val connection = binding.connection
+        val activeCallId = binding.callId
+        val relayPolicyChanged = forceRelay && icePolicy != "relay"
+        if (relayPolicyChanged) configureIcePolicy(connection, relayOnly = true)
+        val shouldRestart = iceRestart || relayPolicyChanged
+        if (shouldRestart) {
+            restartCount += 1
+            connected.set(false)
+            connection.restartIce()
+        }
+        val existing = connection.localDescription
+        if (!shouldRestart && existing?.type == SessionDescription.Type.OFFER) {
+            currentNegotiationId = negotiationId ?: currentNegotiationId ?: UUID.randomUUID().toString()
+            iceGenerationRouter.activate(checkNotNull(currentNegotiationId))
+            iceGenerationRouter.bindLocalDescription(checkNotNull(currentNegotiationId), existing.description)
+            signal.send(
+                "offer",
+                activeCallId,
+                JSONObject().put("sdp", existing.description).put("icePolicy", icePolicy),
+                currentNegotiationId,
+            )
+        } else {
+            createAndSendOfferLocked(shouldRestart, negotiationId, binding)
+        }
+    }
+
+    private suspend fun createAndSendOfferLocked(
+        iceRestart: Boolean,
+        negotiationId: String?,
+        binding: ConnectionBinding,
+    ) {
+        if (!isCurrent(binding)) return
+        val activeCallId = binding.callId
+        val activeNegotiationId = negotiationId ?: UUID.randomUUID().toString()
+        currentNegotiationId = activeNegotiationId
+        iceGenerationRouter.activate(activeNegotiationId)
+        synchronized(pendingCandidates) { pendingCandidates.clear() }
         val constraints = MediaConstraints()
         if (iceRestart) constraints.mandatory += MediaConstraints.KeyValuePair("IceRestart", "true")
-        val offer = createOffer(constraints)
-        setLocalDescription(offer)
+        val offer = createOffer(constraints, binding)
+        if (!isCurrent(binding)) return
+        iceGenerationRouter.bindLocalDescription(activeNegotiationId, offer.description)
+        setLocalDescription(offer, binding)
+        if (!isCurrent(binding)) return
         signal.send(
             "offer",
-            callId,
+            activeCallId,
             JSONObject().put("sdp", offer.description).put("icePolicy", icePolicy),
+            activeNegotiationId,
         )
     }
 
-    private suspend fun createOffer(constraints: MediaConstraints): SessionDescription = suspendCancellableCoroutine { continuation ->
-        peerConnection?.createOffer(object : SimpleSdpObserver() {
+    private suspend fun createOffer(
+        constraints: MediaConstraints,
+        binding: ConnectionBinding,
+    ): SessionDescription = suspendCancellableCoroutine { continuation ->
+        if (!isCurrent(binding)) {
+            continuation.resumeWithException(CancellationException("WebRTC connection was superseded"))
+            return@suspendCancellableCoroutine
+        }
+        binding.connection.createOffer(object : SimpleSdpObserver() {
             override fun onCreateSuccess(description: SessionDescription) {
-                if (continuation.isActive) continuation.resume(description)
+                if (!continuation.isActive) return
+                if (isCurrent(binding)) continuation.resume(description)
+                else continuation.resumeWithException(CancellationException("WebRTC offer callback was superseded"))
             }
             override fun onCreateFailure(error: String) {
-                if (continuation.isActive) continuation.resumeWithException(IllegalStateException(error))
+                if (!continuation.isActive) return
+                if (isCurrent(binding)) continuation.resumeWithException(IllegalStateException(error))
+                else continuation.resumeWithException(CancellationException("WebRTC offer callback was superseded"))
             }
-        }, constraints) ?: continuation.resumeWithException(IllegalStateException("WebRTC is disconnected"))
+        }, constraints)
     }
 
-    private suspend fun setLocalDescription(description: SessionDescription): Unit = suspendCancellableCoroutine { continuation ->
-        peerConnection?.setLocalDescription(object : SimpleSdpObserver() {
-            override fun onSetSuccess() { if (continuation.isActive) continuation.resume(Unit) }
-            override fun onSetFailure(error: String) { if (continuation.isActive) continuation.resumeWithException(IllegalStateException(error)) }
-        }, description) ?: continuation.resumeWithException(IllegalStateException("WebRTC is disconnected"))
+    private fun checkGeneration(expected: Long) {
+        if (sessionGeneration.get() != expected) throw CancellationException("WebRTC session was superseded")
     }
 
-    private suspend fun setRemoteDescription(description: SessionDescription): Unit = suspendCancellableCoroutine { continuation ->
-        peerConnection?.setRemoteDescription(object : SimpleSdpObserver() {
-            override fun onSetSuccess() { if (continuation.isActive) continuation.resume(Unit) }
-            override fun onSetFailure(error: String) { if (continuation.isActive) continuation.resumeWithException(IllegalStateException(error)) }
-        }, description) ?: continuation.resumeWithException(IllegalStateException("WebRTC is disconnected"))
+    private fun currentConnectionBinding(): ConnectionBinding? {
+        val connection = peerConnection ?: return null
+        val activeCallId = callId.takeIf(String::isNotBlank) ?: return null
+        return ConnectionBinding(sessionGeneration.get(), activeCallId, connection).takeIf(::isCurrent)
     }
 
-    private val observer = object : PeerConnection.Observer {
+    private fun isCurrent(binding: ConnectionBinding): Boolean =
+        lifecycleState != MediaLifecycle.IDLE &&
+            lifecycleState != MediaLifecycle.CLOSING &&
+            connectionGenerationGate.isCurrent(binding) &&
+            sessionGeneration.get() == binding.generation &&
+            callId == binding.callId &&
+            peerConnection === binding.connection
+
+    private suspend fun setLocalDescription(
+        description: SessionDescription,
+        binding: ConnectionBinding,
+    ): Unit = suspendCancellableCoroutine { continuation ->
+        if (!isCurrent(binding)) {
+            continuation.resumeWithException(CancellationException("WebRTC connection was superseded"))
+            return@suspendCancellableCoroutine
+        }
+        binding.connection.setLocalDescription(object : SimpleSdpObserver() {
+            override fun onSetSuccess() {
+                if (!continuation.isActive) return
+                if (isCurrent(binding)) continuation.resume(Unit)
+                else continuation.resumeWithException(CancellationException("WebRTC local-description callback was superseded"))
+            }
+            override fun onSetFailure(error: String) {
+                if (!continuation.isActive) return
+                if (isCurrent(binding)) continuation.resumeWithException(IllegalStateException(error))
+                else continuation.resumeWithException(CancellationException("WebRTC local-description callback was superseded"))
+            }
+        }, description)
+    }
+
+    private suspend fun setRemoteDescription(
+        description: SessionDescription,
+        binding: ConnectionBinding,
+    ): Unit = suspendCancellableCoroutine { continuation ->
+        if (!isCurrent(binding)) {
+            continuation.resumeWithException(CancellationException("WebRTC connection was superseded"))
+            return@suspendCancellableCoroutine
+        }
+        binding.connection.setRemoteDescription(object : SimpleSdpObserver() {
+            override fun onSetSuccess() {
+                if (!continuation.isActive) return
+                if (isCurrent(binding)) continuation.resume(Unit)
+                else continuation.resumeWithException(CancellationException("WebRTC remote-description callback was superseded"))
+            }
+            override fun onSetFailure(error: String) {
+                if (!continuation.isActive) return
+                if (isCurrent(binding)) continuation.resumeWithException(IllegalStateException(error))
+                else continuation.resumeWithException(CancellationException("WebRTC remote-description callback was superseded"))
+            }
+        }, description)
+    }
+
+    private fun createPeerObserver(
+        generation: Long,
+        expectedCallId: String,
+        connectionReference: AtomicReference<PeerConnection?>,
+    ): PeerConnection.Observer = object : PeerConnection.Observer {
+        private fun binding(): ConnectionBinding? {
+            val connection = connectionReference.get() ?: return null
+            return ConnectionBinding(generation, expectedCallId, connection).takeIf(::isCurrent)
+        }
+
         override fun onSignalingChange(state: PeerConnection.SignalingState) = Unit
         override fun onIceConnectionReceivingChange(receiving: Boolean) = Unit
         override fun onIceCandidatesRemoved(candidates: Array<IceCandidate>) = Unit
@@ -322,15 +467,11 @@ class WebRtcRelaySession(
         override fun onRemoveStream(stream: MediaStream) = Unit
         override fun onDataChannel(channel: DataChannel) = Unit
         override fun onRenegotiationNeeded() = Unit
-
-        override fun onIceGatheringChange(state: PeerConnection.IceGatheringState) {
-            if (state == PeerConnection.IceGatheringState.COMPLETE && callId.isNotBlank()) {
-                runCatching { signal.send("ice_complete", callId, JSONObject()) }
-            }
-        }
+        override fun onIceGatheringChange(state: PeerConnection.IceGatheringState) = Unit
 
         override fun onIceCandidate(candidate: IceCandidate) {
-            if (callId.isBlank()) return
+            val active = binding() ?: return
+            val candidateNegotiationId = iceGenerationRouter.negotiationForCandidate(candidate.sdp) ?: return
             val payload = JSONObject().put(
                 "candidates",
                 JSONArray().put(
@@ -340,105 +481,134 @@ class WebRtcRelaySession(
                         .put("sdpMLineIndex", candidate.sdpMLineIndex),
                 ),
             )
-            runCatching { signal.send("ice_candidates", callId, payload) }
-                .onFailure { fail("signaling_send_failed", it.message ?: "ICE signaling failed") }
+            runCatching { signal.send("ice_candidates", active.callId, payload, candidateNegotiationId) }
+                .onFailure { fail("signaling_send_failed", it.message ?: "ICE signaling failed", active) }
         }
 
         override fun onIceConnectionChange(state: PeerConnection.IceConnectionState) {
+            val active = binding() ?: return
             if (state == PeerConnection.IceConnectionState.FAILED) {
                 connected.set(false)
-                scope.launch { forceRelayAndRestart("ice_failed") }
+                scope.launch { forceRelayAndRestart("ice_failed", active) }
             }
         }
 
         override fun onConnectionChange(state: PeerConnection.PeerConnectionState) {
+            val active = binding() ?: return
             when (state) {
-                PeerConnection.PeerConnectionState.CONNECTED -> becameConnected()
+                PeerConnection.PeerConnectionState.CONNECTED -> becameConnected(active)
                 PeerConnection.PeerConnectionState.DISCONNECTED -> connected.set(false)
                 PeerConnection.PeerConnectionState.FAILED -> {
                     connected.set(false)
-                    scope.launch { forceRelayAndRestart("connection_failed") }
+                    scope.launch { forceRelayAndRestart("connection_failed", active) }
                 }
                 else -> Unit
             }
         }
 
         override fun onTrack(transceiver: RtpTransceiver) {
+            if (binding() == null) return
             val track = transceiver.receiver.track() as? AudioTrack ?: return
             remoteTrack = track
             applyAudioDirection()
         }
     }
 
-    private fun becameConnected() {
+    private fun becameConnected(binding: ConnectionBinding) {
+        if (!isCurrent(binding)) return
         if (!connected.compareAndSet(false, true)) return
+        lifecycleState = MediaLifecycle.ACTIVE
         if (setupDurationMs == 0L) setupDurationMs = (System.currentTimeMillis() - setupStartedAt).coerceAtLeast(0)
         directTimer?.cancel()
         failureTimer?.cancel()
         RelayRuntime.update { it.copy(mediaState = "Connected WebRTC ($icePolicy)") }
-        runCatching { signal.send("media_ready", callId, JSONObject().put("icePolicy", icePolicy)) }
-        updateStats { route -> listener.onMediaConnected(route.candidateType, icePolicy) }
+        runCatching { signal.send("media_ready", binding.callId, JSONObject().put("icePolicy", icePolicy), currentNegotiationId) }
+        updateStats(binding) { route -> listener.onMediaConnected(route.candidateType, icePolicy) }
         statsTimer?.cancel()
         statsTimer = scope.launch {
-            while (connected.get()) {
+            while (connected.get() && isCurrent(binding)) {
                 delay(5_000)
-                updateStats()
+                updateStats(binding)
             }
         }
     }
 
     private fun startDeadlines() {
+        val binding = currentConnectionBinding() ?: return
         directTimer = scope.launch {
             delay(DIRECT_TIMEOUT_MS)
-            if (!connected.get()) forceRelayAndRestart("direct_timeout")
+            if (!connected.get() && isCurrent(binding)) forceRelayAndRestart("direct_timeout", binding)
         }
         failureTimer = scope.launch {
             delay(SETUP_TIMEOUT_MS)
-            if (!connected.get()) fail("ice_timeout", "WebRTC did not connect within 20 seconds")
-        }
-    }
-
-    private suspend fun forceRelayAndRestart(reason: String) {
-        if (connected.get() || icePolicy == "relay") return
-        restartIce(reason, forceRelay = true)
-    }
-
-    private suspend fun restartIce(reason: String, forceRelay: Boolean) {
-        val connection = peerConnection ?: return
-        if (forceRelay) {
-            icePolicy = "relay"
-            val config = PeerConnection.RTCConfiguration(checkNotNull(mediaConfig).iceServers.map(::iceServer)).apply {
-                iceTransportsType = PeerConnection.IceTransportsType.RELAY
-                bundlePolicy = PeerConnection.BundlePolicy.MAXBUNDLE
-                rtcpMuxPolicy = PeerConnection.RtcpMuxPolicy.REQUIRE
-                sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
-                continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
+            if (!connected.get() && isCurrent(binding)) {
+                fail("ice_timeout", "WebRTC did not connect within 20 seconds", binding)
             }
-            check(connection.setConfiguration(config)) { "Could not force Cloudflare TURN" }
         }
+    }
+
+    private suspend fun forceRelayAndRestart(reason: String, expectedBinding: ConnectionBinding? = null) {
+        val binding = expectedBinding ?: currentConnectionBinding() ?: return
+        if (!isCurrent(binding) || connected.get() || icePolicy == "relay") return
+        restartIce(reason, forceRelay = true, expectedBinding = binding)
+    }
+
+    private suspend fun restartIce(
+        reason: String,
+        forceRelay: Boolean,
+        negotiationId: String? = null,
+        expectedBinding: ConnectionBinding? = null,
+    ) {
+        val binding = expectedBinding ?: currentConnectionBinding() ?: return
+        if (!isCurrent(binding)) return
+        val connection = binding.connection
+        if (forceRelay) configureIcePolicy(connection, relayOnly = true)
         restartCount += 1
         connected.set(false)
         RelayRuntime.update { it.copy(mediaState = "Restarting WebRTC: $reason") }
         runCatching {
             api.event(
-                callId,
+                binding.callId,
                 "media_restarting",
                 payload = JSONObject().put("reason", reason).put("icePolicy", icePolicy),
             )
         }
+        if (!isCurrent(binding)) return
         connection.restartIce()
-        createAndSendOffer(iceRestart = true)
+        createAndSendOffer(iceRestart = true, negotiationId = negotiationId, expectedBinding = binding)
     }
 
-    private fun scheduleCredentialRefresh() {
+    private fun configureIcePolicy(connection: PeerConnection, relayOnly: Boolean) {
+        icePolicy = if (relayOnly) "relay" else "all"
+        val config = PeerConnection.RTCConfiguration(checkNotNull(mediaConfig).iceServers.map(::iceServer)).apply {
+            iceTransportsType = if (relayOnly) {
+                PeerConnection.IceTransportsType.RELAY
+            } else {
+                PeerConnection.IceTransportsType.ALL
+            }
+            bundlePolicy = PeerConnection.BundlePolicy.MAXBUNDLE
+            rtcpMuxPolicy = PeerConnection.RtcpMuxPolicy.REQUIRE
+            sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
+            continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
+        }
+        check(connection.setConfiguration(config)) {
+            if (relayOnly) "Could not force Cloudflare TURN" else "Could not restore direct-first ICE"
+        }
+    }
+
+    private fun scheduleCredentialRefresh(expectedBinding: ConnectionBinding? = null) {
         refreshTimer?.cancel()
+        val binding = expectedBinding ?: currentConnectionBinding() ?: return
+        if (!isCurrent(binding)) return
         val config = mediaConfig ?: return
         val delayMs = ((config.credentialsExpiresAt - System.currentTimeMillis()) * 3 / 4).coerceAtLeast(60_000L)
         refreshTimer = scope.launch {
             delay(delayMs)
+            if (!isCurrent(binding)) return@launch
             runCatching {
-                mediaConfig = api.mediaConfig(callId)
-                val connection = checkNotNull(peerConnection)
+                mediaConfig = api.mediaConfig(binding.callId)
+                if (!isCurrent(binding)) return@runCatching
+                val connection = binding.connection
                 val updated = PeerConnection.RTCConfiguration(checkNotNull(mediaConfig).iceServers.map(::iceServer)).apply {
                     iceTransportsType = if (icePolicy == "relay") PeerConnection.IceTransportsType.RELAY else PeerConnection.IceTransportsType.ALL
                     bundlePolicy = PeerConnection.BundlePolicy.MAXBUNDLE
@@ -447,14 +617,15 @@ class WebRtcRelaySession(
                     continualGatheringPolicy = PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
                 }
                 check(connection.setConfiguration(updated)) { "TURN credential refresh was rejected" }
-                scheduleCredentialRefresh()
-            }.onFailure { fail("turn_refresh_failed", it.message ?: "TURN credential refresh failed") }
+                scheduleCredentialRefresh(binding)
+            }.onFailure { fail("turn_refresh_failed", it.message ?: "TURN credential refresh failed", binding) }
         }
     }
 
-    private fun updateStats(onComplete: ((Route) -> Unit)? = null) {
-        val connection = peerConnection ?: return
-        connection.getStats { report ->
+    private fun updateStats(binding: ConnectionBinding, onComplete: ((Route) -> Unit)? = null) {
+        if (!isCurrent(binding)) return
+        binding.connection.getStats { report ->
+            if (!isCurrent(binding)) return@getStats
             val route = selectedRoute(report)
             var rtt = 0.0
             var jitter = 0.0
@@ -515,9 +686,10 @@ class WebRtcRelaySession(
         remoteTrack?.setVolume(1.0)
     }
 
-    private fun fail(code: String, message: String) {
-        if (callId.isBlank()) return
-        runCatching { signal.send("media_failed", callId, JSONObject().put("reason", code)) }
+    private fun fail(code: String, message: String, expectedBinding: ConnectionBinding? = null) {
+        val binding = expectedBinding ?: currentConnectionBinding() ?: return
+        if (!isCurrent(binding)) return
+        runCatching { signal.send("media_failed", binding.callId, JSONObject().put("reason", code)) }
         RelayRuntime.update { it.copy(mediaState = "Failed", error = message) }
         listener.onMediaFailed(code, message)
     }
@@ -569,11 +741,11 @@ class WebRtcRelaySession(
 
     private data class Route(val candidateType: String, val protocol: String)
 
+    private enum class MediaLifecycle { IDLE, CONNECTING, ACTIVE, CLOSING }
+
     companion object {
-        private const val SAMPLE_RATE_HZ = 48_000
         private const val DIRECT_TIMEOUT_MS = 8_000L
         private const val SETUP_TIMEOUT_MS = 20_000L
-        private val initializationLock = Any()
-        @Volatile private var initialized = false
+        private val NEGOTIATION_SCOPED_MESSAGES = setOf("answer", "ice_candidates", "ice_complete")
     }
 }

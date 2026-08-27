@@ -1,7 +1,9 @@
 package dev.zamad.callrelay.network
 
+import dev.zamad.callrelay.BuildConfig
 import dev.zamad.callrelay.crypto.DeviceIdentity
 import dev.zamad.callrelay.crypto.CallKeyDeriver
+import dev.zamad.callrelay.relay.DeviceHeartbeat
 import dev.zamad.callrelay.relay.RelayPreferences
 import java.io.IOException
 import java.net.HttpURLConnection
@@ -71,13 +73,13 @@ class RelayApiClient(
         response.getString("deviceId").also { preferences.deviceId = it }
     }
 
-    suspend fun createIncomingCall(): CreatedCall = withContext(Dispatchers.IO) {
+    suspend fun createIncomingCall(requestId: String = UUID.randomUUID().toString()): CreatedCall = withContext(Dispatchers.IO) {
         val response = request(
             method = "POST",
             path = "/v1/calls/incoming",
             body = JSONObject()
                 .put("pairingId", preferences.pairingId)
-                .put("requestId", UUID.randomUUID().toString())
+                .put("requestId", requestId)
                 .toString(),
             attempts = 3,
         )
@@ -196,7 +198,29 @@ class RelayApiClient(
         Unit
     }
 
-    suspend fun event(callId: String, type: String, code: String? = null, payload: JSONObject? = null) = withContext(Dispatchers.IO) {
+    suspend fun deviceHeartbeat(heartbeat: DeviceHeartbeat) = withContext(Dispatchers.IO) {
+        val body = JSONObject()
+            .put("serviceInstanceId", heartbeat.serviceInstanceId)
+            .put("sequence", heartbeat.sequence)
+            .put("relayReady", heartbeat.relayReady)
+            .put("signalState", heartbeat.signalState)
+            .put("activeCallId", heartbeat.activeCallId ?: JSONObject.NULL)
+            .put("processStartedAt", heartbeat.processStartedAt)
+            .put("lastErrorCode", heartbeat.lastErrorCode ?: JSONObject.NULL)
+            .toString()
+        request("POST", "/v1/devices/${preferences.deviceId}/heartbeat", body, attempts = 2)
+        Unit
+    }
+
+    suspend fun event(
+        callId: String,
+        type: String,
+        code: String? = null,
+        payload: JSONObject? = null,
+        attempts: Int = 3,
+        connectTimeoutMs: Int = DEFAULT_CONNECT_TIMEOUT_MS,
+        readTimeoutMs: Int = DEFAULT_READ_TIMEOUT_MS,
+    ) = withContext(Dispatchers.IO) {
         val body = JSONObject()
             .put("type", type)
             .put("commandId", UUID.randomUUID().toString())
@@ -205,7 +229,14 @@ class RelayApiClient(
                 if (payload != null) put("payload", payload)
             }
             .toString()
-        request("POST", "/v1/calls/$callId/events", body, attempts = 3)
+        request(
+            "POST",
+            "/v1/calls/$callId/events",
+            body,
+            attempts = attempts,
+            connectTimeoutMs = connectTimeoutMs,
+            readTimeoutMs = readTimeoutMs,
+        )
         Unit
     }
 
@@ -216,12 +247,14 @@ class RelayApiClient(
         signed: Boolean = true,
         extraHeaders: Map<String, String> = emptyMap(),
         attempts: Int = 1,
+        connectTimeoutMs: Int = DEFAULT_CONNECT_TIMEOUT_MS,
+        readTimeoutMs: Int = DEFAULT_READ_TIMEOUT_MS,
     ): JSONObject {
         var lastFailure: Throwable? = null
         val maximumAttempts = attempts.coerceIn(1, 3)
         repeat(maximumAttempts) { attempt ->
             try {
-                return requestOnce(method, path, body, signed, extraHeaders)
+                return requestOnce(method, path, body, signed, extraHeaders, connectTimeoutMs, readTimeoutMs)
             } catch (failure: CancellationException) {
                 throw failure
             } catch (failure: Throwable) {
@@ -254,6 +287,8 @@ class RelayApiClient(
         body: String,
         signed: Boolean,
         extraHeaders: Map<String, String>,
+        connectTimeoutMs: Int,
+        readTimeoutMs: Int,
     ): JSONObject {
         require(preferences.apiBaseUrl.startsWith("https://")) { "Relay API must use HTTPS" }
         val timestamp = System.currentTimeMillis().toString()
@@ -263,12 +298,12 @@ class RelayApiClient(
         try {
             connection.apply {
                 requestMethod = method
-                connectTimeout = 10_000
-                readTimeout = 15_000
+                connectTimeout = connectTimeoutMs
+                readTimeout = readTimeoutMs
                 doInput = true
                 setRequestProperty("content-type", "application/json")
                 setRequestProperty("accept", "application/json")
-                setRequestProperty("x-relay-app-version", "android-webrtc-5")
+                setRequestProperty("x-relay-app-version", "android-webrtc-${BuildConfig.VERSION_CODE}")
                 extraHeaders.forEach(::setRequestProperty)
                 if (signed) {
                     check(preferences.deviceId.isNotBlank()) { "Android device is not enrolled" }
@@ -294,7 +329,11 @@ class RelayApiClient(
                 }
             }
             if (status !in 200..299) {
-                throw RelayApiException(status, json.optString("error", "Relay API failed ($status)"))
+                throw RelayApiException(
+                    status = status,
+                    code = json.optString("code").ifBlank { null },
+                    message = json.optString("error", "Relay API failed ($status)"),
+                )
             }
             return json
         } finally {
@@ -306,5 +345,14 @@ class RelayApiClient(
         .digest(value)
         .joinToString("") { "%02x".format(it) }
 
-    private class RelayApiException(val status: Int, message: String) : IOException(message)
+    class RelayApiException(
+        val status: Int,
+        val code: String?,
+        message: String,
+    ) : IOException(message)
+
+    companion object {
+        private const val DEFAULT_CONNECT_TIMEOUT_MS = 10_000
+        private const val DEFAULT_READ_TIMEOUT_MS = 15_000
+    }
 }

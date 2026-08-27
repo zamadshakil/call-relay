@@ -42,7 +42,8 @@ class PairingSignalClient(
         fun onSignalState(state: String)
         fun onPeerPresence(online: Boolean)
         fun onCallSnapshot(call: CallSnapshot)
-        fun onEnvelope(type: String, payload: JSONObject, callId: String)
+        fun onEnvelope(type: String, payload: JSONObject, callId: String, negotiationId: String?)
+        fun onPairingRevoked(pairingId: String, reason: String)
         fun onSignalError(message: String)
     }
 
@@ -54,16 +55,19 @@ class PairingSignalClient(
         .build()
     private val sendSequence = AtomicLong()
     private val remoteSequences = ConcurrentHashMap<String, Long>()
+    private val connectionGuard = SignalingConnectionGuard<WebSocket>()
     @Volatile private var socket: WebSocket? = null
     @Volatile private var sessionId = ""
     @Volatile private var currentCall: CallSnapshot? = null
     @Volatile private var peerOnline = false
     @Volatile private var wanted = false
+    @Volatile private var revocationNotified = false
     private var connectJob: Job? = null
 
     fun start() {
         if (wanted) return
         wanted = true
+        revocationNotified = false
         connectJob = scope.launch {
             var attempt = 0
             while (isActive && wanted) {
@@ -72,7 +76,19 @@ class PairingSignalClient(
                     continue
                 }
                 runCatching { openSocket() }
-                    .onFailure { listener.onSignalError(it.message ?: "Signaling connection failed") }
+                    .onFailure { failure ->
+                        if (failure is RelayApiClient.RelayApiException &&
+                            failure.code in setOf("PAIRING_REVOKED", "DEVICE_REVOKED")
+                        ) {
+                            notifyPairingRevoked(
+                                connection = null,
+                                pairingId = preferences.pairingId,
+                                reason = failure.code ?: "PAIRING_REVOKED",
+                            )
+                        } else {
+                            listener.onSignalError(failure.message ?: "Signaling connection failed")
+                        }
+                    }
                 if (sessionId.isBlank()) {
                     val wait = (500L shl attempt.coerceAtMost(4)).coerceAtMost(10_000L)
                     attempt += 1
@@ -95,7 +111,8 @@ class PairingSignalClient(
 
     fun isPeerOnline(): Boolean = peerOnline
 
-    fun send(type: String, callId: String, payload: JSONObject) {
+    fun send(type: String, callId: String, payload: JSONObject, negotiationId: String? = null) {
+        require(negotiationId == null || NEGOTIATION_ID.matches(negotiationId)) { "Signal negotiation ID is invalid" }
         val connectedSocket = socket ?: error("Cloudflare signaling is disconnected")
         val connectedSession = sessionId.ifBlank { error("Cloudflare signaling is not authenticated") }
         val sequence = sendSequence.incrementAndGet()
@@ -104,7 +121,7 @@ class PairingSignalClient(
             payload.toString().encodeToByteArray(),
             Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING,
         )
-        val canonical = canonical(
+        val canonical = canonicalSignalEnvelope(
             callId = callId,
             senderDeviceId = preferences.deviceId,
             role = "android",
@@ -113,6 +130,7 @@ class PairingSignalClient(
             timestamp = timestamp,
             type = type,
             payload = encodedPayload,
+            negotiationId = negotiationId,
         )
         val envelope = JSONObject()
             .put("version", 1)
@@ -125,6 +143,7 @@ class PairingSignalClient(
             .put("type", type)
             .put("payload", encodedPayload)
             .put("mac", SignalAuthenticator.mac(preferences.pairingSecret, callId, canonical))
+            .apply { if (negotiationId != null) put("negotiationId", negotiationId) }
         check(connectedSocket.send(envelope.toString())) { "Cloudflare signaling send failed" }
     }
 
@@ -132,11 +151,21 @@ class PairingSignalClient(
         wanted = false
         connectJob?.cancel()
         connectJob = null
-        socket?.close(1000, "relay ready stopped")
+        val closingSocket = socket
+        closingSocket?.close(1000, "relay ready stopped")
+        connectionGuard.clear(closingSocket)
         socket = null
         sessionId = ""
         peerOnline = false
         currentCall = null
+        revocationNotified = false
+        listener.onPeerPresence(false)
+        listener.onSignalState("Disconnected")
+    }
+
+    /** Terminal cleanup for a service instance. Use [close] when it may be re-armed. */
+    fun shutdown() {
+        close()
         scope.cancel()
         client.dispatcher.executorService.shutdown()
         client.connectionPool.evictAll()
@@ -144,16 +173,19 @@ class PairingSignalClient(
 
     private suspend fun openSocket() {
         check(preferences.configured()) { "Enroll and confirm pairing before signaling" }
+        val pairingId = preferences.pairingId
         val ticket = api.signalTicket()
         check(ticket.protocol == PROTOCOL) { "Worker returned an unsupported signaling protocol" }
         val webSocketUrl = preferences.apiBaseUrl
-            .replaceFirst("https://", "wss://") + "/v1/pairings/${preferences.pairingId}/signal"
+            .replaceFirst("https://", "wss://") + "/v1/pairings/$pairingId/signal"
         val request = Request.Builder()
             .url(webSocketUrl)
             .header("Sec-WebSocket-Protocol", "$PROTOCOL, cr-ticket.${ticket.ticket}")
             .build()
         listener.onSignalState("Connecting")
-        socket = client.newWebSocket(request, socketListener)
+        val createdSocket = client.newWebSocket(request, socketListener(pairingId))
+        connectionGuard.bind(createdSocket, pairingId)
+        socket = createdSocket
         val deadline = System.currentTimeMillis() + 10_000L
         while (wanted && sessionId.isBlank() && socket != null) {
             check(System.currentTimeMillis() < deadline) { "Signaling session hello timed out" }
@@ -161,15 +193,21 @@ class PairingSignalClient(
         }
     }
 
-    private val socketListener = object : WebSocketListener() {
+    private fun socketListener(pairingId: String) = object : WebSocketListener() {
         override fun onMessage(webSocket: WebSocket, text: String) {
-            runCatching { handleMessage(text) }
+            if (connectionGuard.pairingIdIfCurrent(webSocket) != pairingId || socket !== webSocket) return
+            runCatching { handleMessage(webSocket, pairingId, text) }
                 .onFailure { listener.onSignalError(it.message ?: "Invalid signaling message") }
         }
 
-        override fun onClosed(webSocket: WebSocket, code: Int, reason: String) = disconnected(webSocket)
+        override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+            if (connectionGuard.pairingIdIfCurrent(webSocket) != pairingId || socket !== webSocket) return
+            if (code == 4003 || reason == "PAIRING_REVOKED") notifyPairingRevoked(webSocket, pairingId, reason)
+            else disconnected(webSocket)
+        }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+            if (connectionGuard.pairingIdIfCurrent(webSocket) != pairingId || socket !== webSocket) return
             listener.onSignalError(t.message ?: "Signaling WebSocket failed")
             disconnected(webSocket)
         }
@@ -177,6 +215,7 @@ class PairingSignalClient(
 
     private fun disconnected(webSocket: WebSocket) {
         if (socket === webSocket) {
+            connectionGuard.clear(webSocket)
             socket = null
             sessionId = ""
             peerOnline = false
@@ -185,10 +224,28 @@ class PairingSignalClient(
         }
     }
 
-    private fun handleMessage(text: String) {
+    private fun notifyPairingRevoked(connection: WebSocket?, pairingId: String, reason: String) {
+        if (connection != null && connectionGuard.pairingIdIfCurrent(connection) != pairingId) return
+        if (connection == null && preferences.pairingId != pairingId) return
+        if (revocationNotified) return
+        revocationNotified = true
+        wanted = false
+        connection?.close(4003, "PAIRING_REVOKED")
+        connectionGuard.clear(connection)
+        socket = null
+        sessionId = ""
+        peerOnline = false
+        listener.onPeerPresence(false)
+        listener.onSignalState("Pairing revoked")
+        listener.onPairingRevoked(pairingId, reason.ifBlank { "PAIRING_REVOKED" })
+    }
+
+    private fun handleMessage(webSocket: WebSocket, pairingId: String, text: String) {
+        if (connectionGuard.pairingIdIfCurrent(webSocket) != pairingId || socket !== webSocket) return
         val message = JSONObject(text)
         when (message.optString("type")) {
             "hello" -> {
+                if (!wanted) return
                 check(message.getInt("protocolVersion") == 1 && message.getString("role") == "android") {
                     "Signaling hello is invalid"
                 }
@@ -220,6 +277,10 @@ class PairingSignalClient(
                 currentCall = call.takeUnless { it.state == "ended" || it.state == "failed" }
                 listener.onCallSnapshot(call)
             }
+            "pairing_revoked" -> {
+                check(message.optString("code") == "PAIRING_REVOKED") { "Pairing revocation frame is invalid" }
+                notifyPairingRevoked(webSocket, pairingId, message.optString("reason", "PAIRING_REVOKED"))
+            }
             "protocol_error" -> listener.onSignalError(message.optString("message", "Signaling protocol error"))
             else -> handleEnvelope(message)
         }
@@ -235,31 +296,38 @@ class PairingSignalClient(
         val timestamp = message.getLong("timestamp")
         val type = message.getString("type")
         val payload = message.getString("payload")
+        val negotiationId = message.optString("negotiationId").ifBlank { null }
+        check(negotiationId == null || NEGOTIATION_ID.matches(negotiationId)) { "Signal negotiation ID is invalid" }
         val call = currentCall
         check(call != null && call.id == callId && sender == call.peerDeviceId && role == "peer") { "Signal sender is not the paired peer" }
         check(kotlin.math.abs(System.currentTimeMillis() - timestamp) <= 5 * 60_000L) { "Signal timestamp is stale" }
         check(sequence > (remoteSequences[remoteSession] ?: 0L)) { "Signal replay was rejected" }
-        val canonical = canonical(callId, sender, role, remoteSession, sequence, timestamp, type, payload)
+        val canonical = canonicalSignalEnvelope(callId, sender, role, remoteSession, sequence, timestamp, type, payload, negotiationId)
         check(SignalAuthenticator.verify(preferences.pairingSecret, callId, canonical, message.getString("mac"))) {
             "Signal HMAC verification failed"
         }
         remoteSequences[remoteSession] = sequence
         val decoded = String(Base64.decode(payload, Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING))
-        listener.onEnvelope(type, JSONObject(decoded), callId)
+        listener.onEnvelope(type, JSONObject(decoded), callId, negotiationId)
     }
-
-    private fun canonical(
-        callId: String,
-        senderDeviceId: String,
-        role: String,
-        sessionId: String,
-        sequence: Long,
-        timestamp: Long,
-        type: String,
-        payload: String,
-    ): String = listOf(1, callId, senderDeviceId, role, sessionId, sequence, timestamp, type, payload).joinToString("\n")
 
     companion object {
         const val PROTOCOL = "call-relay.signal.v1"
+        private val NEGOTIATION_ID = Regex("^[A-Za-z0-9_-]{8,80}$")
     }
 }
+
+internal fun canonicalSignalEnvelope(
+    callId: String,
+    senderDeviceId: String,
+    role: String,
+    sessionId: String,
+    sequence: Long,
+    timestamp: Long,
+    type: String,
+    payload: String,
+    negotiationId: String? = null,
+): String = buildList {
+    addAll(listOf(1, callId, senderDeviceId, role, sessionId, sequence, timestamp, type, payload))
+    if (negotiationId != null) add(negotiationId)
+}.joinToString("\n")

@@ -98,6 +98,9 @@ class RelayPreferences(context: Context) {
         get() = preferences.getLong(KEY_ACTIVE_CALL_GENERATION, 0L)
         private set(value) = preferences.edit().putLong(KEY_ACTIVE_CALL_GENERATION, value).commit().let { Unit }
 
+    val activeCallDialIssued: Boolean
+        get() = preferences.getBoolean(KEY_ACTIVE_CALL_DIAL_ISSUED, false)
+
     var captureGain: Float
         get() = preferences.getFloat(KEY_CAPTURE_GAIN, 1.0f)
         set(value) = preferences.edit().putFloat(KEY_CAPTURE_GAIN, value.coerceIn(0f, 4f)).apply()
@@ -184,13 +187,47 @@ class RelayPreferences(context: Context) {
             .putString(KEY_ACTIVE_CALL_ID, callId)
             .putString(KEY_ACTIVE_CALL_DIRECTION, direction)
             .putLong(KEY_ACTIVE_CALL_GENERATION, nextGeneration)
+            .putBoolean(KEY_ACTIVE_CALL_DIAL_ISSUED, false)
             .commit()
         nextGeneration
     }
 
+    /** Persist before Telecom.placeCall so a process restart cannot double-dial. */
+    fun markActiveCallDialIssued(expectedCallId: String): Boolean = synchronized(commandLock) {
+        if (expectedCallId.isBlank() || activeCallId != expectedCallId || activeCallDialIssued) {
+            return@synchronized false
+        }
+        preferences.edit().putBoolean(KEY_ACTIVE_CALL_DIAL_ISSUED, true).commit()
+    }
+
     fun clearActiveCall(expectedCallId: String? = null) = synchronized(commandLock) {
         if (!expectedCallId.isNullOrBlank() && activeCallId != expectedCallId) return@synchronized
-        preferences.edit().remove(KEY_ACTIVE_CALL_ID).remove(KEY_ACTIVE_CALL_DIRECTION).commit()
+        preferences.edit()
+            .remove(KEY_ACTIVE_CALL_ID)
+            .remove(KEY_ACTIVE_CALL_DIRECTION)
+            .remove(KEY_ACTIVE_CALL_DIAL_ISSUED)
+            .commit()
+        Unit
+    }
+
+    /**
+     * Remove only peer-scoped state. The Firebase account and Android device
+     * registration intentionally survive so onboarding can create a new QR
+     * without unexpectedly signing the user out.
+     */
+    fun clearPairing() = synchronized(commandLock) {
+        preferences.edit()
+            .remove(KEY_PAIRING_ID)
+            .remove(KEY_PAIRING_SECRET)
+            .remove(KEY_PAIRING_CONFIRMED)
+            .remove(KEY_PENDING_REMOTE_COMMANDS)
+            .remove(KEY_PROCESSED_REMOTE_COMMANDS)
+            .remove(KEY_ACTIVE_CALL_ID)
+            .remove(KEY_ACTIVE_CALL_DIRECTION)
+            .remove(KEY_ACTIVE_CALL_DIAL_ISSUED)
+            .putBoolean(KEY_RELAY_READY_DESIRED, false)
+            .commit()
+        secureSecretStore.put("")
         Unit
     }
 
@@ -229,6 +266,7 @@ class RelayPreferences(context: Context) {
             .remove(KEY_PROCESSED_REMOTE_COMMANDS)
             .remove(KEY_ACTIVE_CALL_ID)
             .remove(KEY_ACTIVE_CALL_DIRECTION)
+            .remove(KEY_ACTIVE_CALL_DIAL_ISSUED)
             .putBoolean(KEY_RELAY_READY_DESIRED, false)
             .apply()
         secureSecretStore.put("")
@@ -251,6 +289,7 @@ class RelayPreferences(context: Context) {
         private const val KEY_ACTIVE_CALL_ID = "active_call_id"
         private const val KEY_ACTIVE_CALL_DIRECTION = "active_call_direction"
         private const val KEY_ACTIVE_CALL_GENERATION = "active_call_generation"
+        private const val KEY_ACTIVE_CALL_DIAL_ISSUED = "active_call_dial_issued"
         private const val KEY_PENDING_REMOTE_COMMANDS = "pending_remote_commands"
         private const val KEY_PROCESSED_REMOTE_COMMANDS = "processed_remote_commands"
         private const val MAX_PENDING_COMMANDS = 32

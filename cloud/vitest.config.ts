@@ -50,6 +50,9 @@ export default defineConfig(async () => {
     test: {
       include: ["src/**/*.test.ts", "web/**/*.test.ts", "test/**/*.test.ts"],
       setupFiles: ["./test/apply-migrations.ts"],
+      // Worker integration tests exercise real Durable Object WebSockets and
+      // crypto. Five seconds is flaky on parallel Windows workerd isolates.
+      testTimeout: 15_000,
     },
   };
 });

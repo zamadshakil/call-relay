@@ -3,6 +3,7 @@ import { env } from "cloudflare:workers";
 import { exportJWK, SignJWT } from "jose";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import worker from "../src/index";
+import { revokeDueTurnCredentials } from "../src/turn";
 import type { Env } from "../src/types";
 
 interface TestDevice {
@@ -12,6 +13,7 @@ interface TestDevice {
 
 let firebasePrivateKey: CryptoKey;
 let firebasePublicJwk: Record<string, unknown>;
+const failNextTurnRevocation = new Set<string>();
 
 function base64Url(bytes: Uint8Array): string {
   let binary = "";
@@ -118,6 +120,11 @@ beforeAll(async () => {
     }
     if (request.url === "https://oauth2.googleapis.com/token") return Response.json({ access_token: "firebase-admin-access-token" });
     if (request.url.includes("identitytoolkit.googleapis.com")) return Response.json({ users: [{ localId: "firebase-user-v2", validSince: "0" }] });
+    if (request.url.includes("rtc.live.cloudflare.com") && request.url.endsWith("/revoke")) {
+      const username = decodeURIComponent(request.url.split("/credentials/")[1]?.split("/revoke")[0] ?? "");
+      if (failNextTurnRevocation.delete(username)) return Response.json({ error: "temporary TURN failure" }, { status: 503 });
+      return Response.json({ revoked: true });
+    }
     throw new Error(`unexpected fetch in onboarding test: ${request.url}`);
   });
 });
@@ -145,6 +152,79 @@ describe("consumer onboarding v2", () => {
 
     const android = await createDevice(token, "android", "Relay Android");
     const browser = await createDevice(token, "browser", "iPhone browser");
+
+    const serviceInstanceId = crypto.randomUUID();
+    const processStartedAt = Date.now() - 5_000;
+    const heartbeatBody = {
+      serviceInstanceId,
+      sequence: 1,
+      relayReady: true,
+      signalState: "Connected",
+      processStartedAt,
+      lastErrorCode: null,
+    };
+    const heartbeat = await invoke(await signedRequest(
+      android,
+      `/v1/devices/${android.deviceId}/heartbeat`,
+      "POST",
+      heartbeatBody,
+    ));
+    expect(heartbeat.status).toBe(200);
+    expect(await responseJson(heartbeat)).toMatchObject({ accepted: true, duplicate: false, heartbeatAt: expect.any(Number) });
+    const duplicateHeartbeat = await invoke(await signedRequest(
+      android,
+      `/v1/devices/${android.deviceId}/heartbeat`,
+      "POST",
+      heartbeatBody,
+    ));
+    expect(duplicateHeartbeat.status).toBe(409);
+    expect((await responseJson(duplicateHeartbeat)).code).toBe("HEARTBEAT_REPLAY");
+    const restartedServiceInstanceId = crypto.randomUUID();
+    const restartedProcessStartedAt = processStartedAt + 1_000;
+    const restartedHeartbeat = await invoke(await signedRequest(
+      android,
+      `/v1/devices/${android.deviceId}/heartbeat`,
+      "POST",
+      {
+        ...heartbeatBody,
+        serviceInstanceId: restartedServiceInstanceId,
+        processStartedAt: restartedProcessStartedAt,
+        lastErrorCode: "signaling_error",
+      },
+    ));
+    expect(restartedHeartbeat.status).toBe(200);
+    const staleHeartbeat = await invoke(await signedRequest(
+      android,
+      `/v1/devices/${android.deviceId}/heartbeat`,
+      "POST",
+      { ...heartbeatBody, sequence: 2 },
+    ));
+    expect(staleHeartbeat.status).toBe(409);
+    expect((await responseJson(staleHeartbeat)).code).toBe("STALE_SERVICE_INSTANCE");
+    const peerHeartbeat = await invoke(await signedRequest(
+      browser,
+      `/v1/devices/${browser.deviceId}/heartbeat`,
+      "POST",
+      heartbeatBody,
+    ));
+    expect(peerHeartbeat.status).toBe(403);
+
+    const accountAfterHeartbeat = await responseJson(await invoke(bearerRequest("/v1/me", token)));
+    const accountDevices = accountAfterHeartbeat.devices as Array<Record<string, unknown>>;
+    const androidAccountDevice = accountDevices.find((candidate) => candidate.id === android.deviceId);
+    expect(androidAccountDevice).toMatchObject({
+      lastAuthenticatedAt: expect.any(Number),
+      relayPresence: {
+        relayReady: true,
+        signalState: "connected",
+        serviceInstanceId: restartedServiceInstanceId,
+        processStartedAt: restartedProcessStartedAt,
+        heartbeatAt: expect.any(Number),
+        heartbeatFresh: true,
+        lastErrorCode: "signaling_error",
+      },
+    });
+    expect(androidAccountDevice).not.toHaveProperty("online");
 
     const sim = await invoke(await signedRequest(android, `/v1/devices/${android.deviceId}/sim-profile`, "PUT", {
       slotIndex: 0,
@@ -256,5 +336,107 @@ describe("consumer onboarding v2", () => {
       requestId: crypto.randomUUID(),
     }));
     expect(blockedCall.status).toBe(402);
+
+    await env.CALL_RELAY_DB.prepare("UPDATE billing_subscriptions SET status = 'active' WHERE user_id = ?").bind(uid).run();
+    const replacementCallId = `call_${"b".repeat(32)}`;
+    const replacementTurnUsername = "replacement-active-turn";
+    const activeCallCreatedAt = Date.now();
+    await env.CALL_RELAY_DB.batch([
+      env.CALL_RELAY_DB.prepare(
+        `INSERT INTO call_sessions(id, pairing_id, android_device_id, peer_device_id, direction, state, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 'incoming', 'active', ?, ?)`,
+      ).bind(replacementCallId, pairingId, android.deviceId, browser.deviceId, activeCallCreatedAt, activeCallCreatedAt),
+      env.CALL_RELAY_DB.prepare(
+        `INSERT INTO turn_credentials(username, call_id, device_id, custom_identifier, created_at, expires_at)
+         VALUES (?, ?, ?, 'replacement-test', ?, ?)`,
+      ).bind(replacementTurnUsername, replacementCallId, browser.deviceId, activeCallCreatedAt, activeCallCreatedAt + 7_200_000),
+    ]);
+    const replacementSigning = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
+    const replacementAgreement = await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]);
+    const replacementResponse = await invoke(bearerRequest("/v1/devices/register", token, "POST", {
+      platform: "browser",
+      displayName: "Replacement iPhone browser",
+      publicKeySpki: base64Url(new Uint8Array(await crypto.subtle.exportKey("spki", replacementSigning.publicKey))),
+      agreementPublicKeyRaw: base64Url(new Uint8Array(await crypto.subtle.exportKey("raw", replacementAgreement.publicKey))),
+      appVersion: 3,
+      replaceExisting: true,
+    }));
+    expect(replacementResponse.status).toBe(201);
+    const replacementDeviceId = String((await responseJson(replacementResponse)).deviceId);
+    const revokedPairing = await env.CALL_RELAY_DB.prepare(
+      "SELECT revoked_at FROM pairings WHERE id = ?",
+    ).bind(pairingId).first<{ revoked_at: number | null }>();
+    expect(revokedPairing?.revoked_at).toEqual(expect.any(Number));
+    const revocationDelivery = await env.CALL_RELAY_DB.prepare(
+      "SELECT delivered_at, attempts FROM pairing_control_outbox WHERE pairing_id = ?",
+    ).bind(pairingId).first<{ delivered_at: number | null; attempts: number }>();
+    expect(revocationDelivery).toMatchObject({ delivered_at: expect.any(Number), attempts: 1 });
+    const failedReplacementCall = await env.CALL_RELAY_DB.prepare(
+      "SELECT state, failure_code, media_failure_code, ended_at FROM call_sessions WHERE id = ?",
+    ).bind(replacementCallId).first<{ state: string; failure_code: string | null; media_failure_code: string | null; ended_at: number | null }>();
+    expect(failedReplacementCall).toMatchObject({
+      state: "failed",
+      failure_code: "pairing_revoked",
+      media_failure_code: "pairing_revoked",
+      ended_at: expect.any(Number),
+    });
+    const revokedReplacementTurn = await env.CALL_RELAY_DB.prepare(
+      "SELECT revoked_at, last_error FROM turn_credentials WHERE username = ?",
+    ).bind(replacementTurnUsername).first<{ revoked_at: number | null; last_error: string | null }>();
+    expect(revokedReplacementTurn).toMatchObject({ revoked_at: expect.any(Number), last_error: null });
+    const revokedDeviceRequest = await invoke(await signedRequest(browser, "/v1/calls/current", "GET"));
+    expect(revokedDeviceRequest.status).toBe(410);
+    expect((await responseJson(revokedDeviceRequest)).code).toBe("DEVICE_REVOKED");
+
+    const revokedSignal = await env.PAIRING_SIGNAL.getByName(pairingId).fetch(new Request("https://pairing-signal.internal/connect", {
+      headers: {
+        upgrade: "websocket",
+        "x-relay-signal-device": browser.deviceId,
+        "x-relay-signal-role": "peer",
+        "x-relay-signal-jti": crypto.randomUUID(),
+        "x-relay-signal-exp": String(Date.now() + 60_000),
+      },
+    }));
+    expect(revokedSignal.status).toBe(410);
+    expect((await responseJson(revokedSignal)).code).toBe("PAIRING_REVOKED");
+
+    const revokePairingId = `pair_${"c".repeat(32)}`;
+    const revokeCallId = `call_${"d".repeat(32)}`;
+    const revokeTurnUsername = "explicit-revoke-active-turn";
+    const revokeCreatedAt = Date.now();
+    await env.CALL_RELAY_DB.batch([
+      env.CALL_RELAY_DB.prepare(
+        `INSERT INTO pairings(id, device_a_id, device_b_id, secret_commitment, created_at, created_by_device_id,
+          confirmed_by_device_id, confirmed_at, protocol_version, user_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 2, ?)`,
+      ).bind(
+        revokePairingId, android.deviceId, replacementDeviceId, commitment, revokeCreatedAt,
+        android.deviceId, replacementDeviceId, revokeCreatedAt, uid,
+      ),
+      env.CALL_RELAY_DB.prepare(
+        `INSERT INTO call_sessions(id, pairing_id, android_device_id, peer_device_id, direction, state, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 'incoming', 'active', ?, ?)`,
+      ).bind(revokeCallId, revokePairingId, android.deviceId, replacementDeviceId, revokeCreatedAt, revokeCreatedAt),
+      env.CALL_RELAY_DB.prepare(
+        `INSERT INTO turn_credentials(username, call_id, device_id, custom_identifier, created_at, expires_at)
+         VALUES (?, ?, ?, 'explicit-revoke-test', ?, ?)`,
+      ).bind(revokeTurnUsername, revokeCallId, replacementDeviceId, revokeCreatedAt, revokeCreatedAt + 7_200_000),
+    ]);
+    failNextTurnRevocation.add(revokeTurnUsername);
+    const explicitRevoke = await invoke(bearerRequest(`/v1/devices/${replacementDeviceId}/revoke`, token, "POST"));
+    expect(explicitRevoke.status).toBe(200);
+    const explicitlyFailedCall = await env.CALL_RELAY_DB.prepare(
+      "SELECT state, failure_code, ended_at FROM call_sessions WHERE id = ?",
+    ).bind(revokeCallId).first<{ state: string; failure_code: string | null; ended_at: number | null }>();
+    expect(explicitlyFailedCall).toMatchObject({ state: "failed", failure_code: "pairing_revoked", ended_at: expect.any(Number) });
+    const explicitlyRevokedTurn = await env.CALL_RELAY_DB.prepare(
+      "SELECT revoked_at, revoke_attempts, last_error FROM turn_credentials WHERE username = ?",
+    ).bind(revokeTurnUsername).first<{ revoked_at: number | null; revoke_attempts: number; last_error: string | null }>();
+    expect(explicitlyRevokedTurn).toMatchObject({ revoked_at: null, revoke_attempts: 1, last_error: "Cloudflare TURN revoke failed (503)" });
+    await revokeDueTurnCredentials(env as unknown as Env);
+    const retriedTurn = await env.CALL_RELAY_DB.prepare(
+      "SELECT revoked_at, revoke_attempts, last_error FROM turn_credentials WHERE username = ?",
+    ).bind(revokeTurnUsername).first<{ revoked_at: number | null; revoke_attempts: number; last_error: string | null }>();
+    expect(retriedTurn).toMatchObject({ revoked_at: expect.any(Number), revoke_attempts: 1, last_error: null });
   });
 });

@@ -148,7 +148,7 @@
         "FIREBASE_PROJECT_ID": "call-relay-3dec7",
         "ACCESS_MODE": "approval_only",
         "ONBOARDING_V2_ENABLED": "true",
-        "MIN_ANDROID_APP_VERSION": "5",
+        "MIN_ANDROID_APP_VERSION": "6",
         "PUBLIC_APP_URL": "https://call-relay-staging.zamadshakil.workers.dev",
         "PADDLE_ENVIRONMENT": "sandbox",
         "PADDLE_MONTHLY_PRICE_ID": "replace-me",

@@ -1,7 +1,9 @@
 import { authenticateFirebase, hasActiveEntitlement, requireEntitlement } from "./firebase-auth";
 import { base64Url, fromBase64Url, HttpError, json, readJson, requireString } from "./http";
+import { activePairingIdsForDevice, deliverPairingRevocations, pairingRevocationStatements } from "./pairing-control";
+import { RELAY_HEARTBEAT_FRESH_MS } from "./presence";
 import { secretValue } from "./secrets";
-import type { AccountContext, DeviceRow, Env, Platform } from "./types";
+import type { AccountContext, DeviceRow, Env, Platform, SignalState } from "./types";
 
 type JsonObject = Record<string, unknown>;
 
@@ -44,10 +46,15 @@ function publicSubscription(account: AccountContext, env: Env): Record<string, u
 }
 
 async function accountSnapshot(env: Env, account: AccountContext): Promise<Record<string, unknown>> {
+  const now = Date.now();
   const devices = await env.CALL_RELAY_DB.prepare(
     `SELECT d.id, d.platform, d.display_name, d.last_seen_at, d.revoked_at,
-      sp.slot_index, sp.carrier_name, sp.country_iso, sp.number_source, sp.phone_number_last4
-     FROM devices d LEFT JOIN sim_profiles sp ON sp.device_id = d.id
+      sp.slot_index, sp.carrier_name, sp.country_iso, sp.number_source, sp.phone_number_last4,
+      dp.service_instance_id, dp.relay_ready, dp.signal_state, dp.active_call_id,
+      dp.process_started_at, dp.last_heartbeat_at, dp.last_error_code
+     FROM devices d
+     LEFT JOIN sim_profiles sp ON sp.device_id = d.id
+     LEFT JOIN device_presence dp ON dp.device_id = d.id
      WHERE d.user_id = ? AND d.revoked_at IS NULL ORDER BY d.created_at`,
   ).bind(account.identity.uid).all<{
     id: string;
@@ -60,11 +67,17 @@ async function accountSnapshot(env: Env, account: AccountContext): Promise<Recor
     country_iso: string | null;
     number_source: string | null;
     phone_number_last4: string | null;
+    service_instance_id: string | null;
+    relay_ready: number | null;
+    signal_state: SignalState | null;
+    active_call_id: string | null;
+    process_started_at: number | null;
+    last_heartbeat_at: number | null;
+    last_error_code: string | null;
   }>();
   const pairing = await env.CALL_RELAY_DB.prepare(
     `SELECT p.id, p.confirmed_at, p.protocol_version, p.device_a_id, p.device_b_id,
-      da.display_name AS device_a_name, db.display_name AS device_b_name,
-      da.last_seen_at AS device_a_seen, db.last_seen_at AS device_b_seen
+      da.display_name AS device_a_name, db.display_name AS device_b_name
      FROM pairings p
      JOIN devices da ON da.id = p.device_a_id
      JOIN devices db ON db.id = p.device_b_id
@@ -83,7 +96,17 @@ async function accountSnapshot(env: Env, account: AccountContext): Promise<Recor
       id: device.id,
       platform: device.platform,
       displayName: device.display_name,
-      online: Date.now() - device.last_seen_at < 90_000,
+      lastAuthenticatedAt: device.last_seen_at,
+      relayPresence: device.platform === "android" ? {
+        relayReady: device.relay_ready === 1,
+        signalState: device.signal_state ?? "disconnected",
+        activeCallId: device.active_call_id,
+        serviceInstanceId: device.service_instance_id,
+        processStartedAt: device.process_started_at,
+        heartbeatAt: device.last_heartbeat_at,
+        heartbeatFresh: device.last_heartbeat_at !== null && now - device.last_heartbeat_at < RELAY_HEARTBEAT_FRESH_MS,
+        lastErrorCode: device.last_error_code,
+      } : null,
       sim: device.slot_index === null ? null : {
         slotIndex: device.slot_index,
         carrierName: device.carrier_name,
@@ -141,10 +164,12 @@ export async function registerDevice(request: Request, env: Env): Promise<Respon
     throw new HttpError(409, platform === "android" ? "this account already has an Android relay; explicit replacement is required" : "this account already has a peer; explicit replacement is required");
   }
   if (existing) {
+    const pairingIds = await activePairingIdsForDevice(env, existing.id);
     await env.CALL_RELAY_DB.batch([
-      env.CALL_RELAY_DB.prepare("UPDATE pairings SET revoked_at = ? WHERE revoked_at IS NULL AND (device_a_id = ? OR device_b_id = ?)").bind(now, existing.id, existing.id),
+      ...pairingRevocationStatements(env, pairingIds, "device_replaced", now),
       env.CALL_RELAY_DB.prepare("UPDATE devices SET revoked_at = ? WHERE id = ? AND user_id = ?").bind(now, existing.id, account.identity.uid),
     ]);
+    await deliverPairingRevocations(env, pairingIds);
   }
   const deviceId = id("dev");
   await env.CALL_RELAY_DB.prepare(
@@ -211,10 +236,12 @@ export async function revokeDevice(request: Request, env: Env, deviceId: string)
     .bind(deviceId, account.identity.uid).first<{ id: string }>();
   if (!device) throw new HttpError(404, "device not found");
   const now = Date.now();
+  const pairingIds = await activePairingIdsForDevice(env, deviceId);
   await env.CALL_RELAY_DB.batch([
-    env.CALL_RELAY_DB.prepare("UPDATE pairings SET revoked_at = ? WHERE revoked_at IS NULL AND (device_a_id = ? OR device_b_id = ?)").bind(now, deviceId, deviceId),
+    ...pairingRevocationStatements(env, pairingIds, "device_revoked", now),
     env.CALL_RELAY_DB.prepare("UPDATE pairing_invitations SET revoked_at = ? WHERE android_device_id = ? AND revoked_at IS NULL").bind(now, deviceId),
     env.CALL_RELAY_DB.prepare("UPDATE devices SET revoked_at = ?, fcm_token = NULL WHERE id = ? AND user_id = ?").bind(now, deviceId, account.identity.uid),
   ]);
+  await deliverPairingRevocations(env, pairingIds);
   return json({ revoked: true });
 }

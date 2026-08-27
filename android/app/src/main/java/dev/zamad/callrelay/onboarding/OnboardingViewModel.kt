@@ -490,7 +490,7 @@ class OnboardingViewModel(application: Application) : AndroidViewModel(applicati
         }
     }
 
-    private suspend fun idToken(): String = auth.currentUser?.getIdToken(false)?.await()?.token
+    private suspend fun idToken(forceRefresh: Boolean): String = auth.currentUser?.getIdToken(forceRefresh)?.await()?.token
         ?: throw IllegalStateException("Sign in again to continue")
 
     private suspend fun moveTo(stage: OnboardingStage) {
@@ -510,11 +510,17 @@ class OnboardingViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     private fun showError(error: Throwable) {
-        if (error is ConsumerApiException && error.status == 401) auth.signOut()
+        val terminalAuthenticationFailure = error is ConsumerApiException && AuthFailurePolicy.shouldSignOut(error)
+        if (terminalAuthenticationFailure) auth.signOut()
+        val message = if (error is ConsumerApiException && !terminalAuthenticationFailure) {
+            AuthFailurePolicy.recoverableMessage(error)
+        } else {
+            error.message ?: "Something went wrong"
+        }
         _state.value = _state.value.copy(
             stage = if (auth.currentUser == null) OnboardingStage.SIGN_IN else _state.value.stage,
             busy = false,
-            error = error.message ?: "Something went wrong",
+            error = message,
         )
     }
 

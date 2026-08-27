@@ -4,6 +4,8 @@ export type Platform = "android" | "browser" | "ios";
 export type Direction = "incoming" | "outgoing";
 export type RelayMode = "full_duplex" | "listen" | "talk";
 export type SignalRole = "android" | "peer";
+export type SignalState = "connecting" | "connected" | "disconnected";
+export type PairingRevocationReason = "device_replaced" | "device_revoked" | "pairing_replaced" | "manual";
 export type ApprovalStatus = "approved" | "unknown" | "suspended";
 export type AccessMode = "paid" | "approval_only";
 export type SubscriptionStatus = "none" | "pending" | "active" | "past_due" | "paused" | "canceled" | "refunded" | "disputed";
@@ -167,4 +169,28 @@ export interface PushDeliveryResult {
   accepted: boolean;
   gone: boolean;
   providerMessageId?: string;
+}
+
+export interface DevicePresenceRow {
+  device_id: string;
+  service_instance_id: string;
+  sequence: number;
+  relay_ready: number;
+  signal_state: SignalState;
+  active_call_id: string | null;
+  process_started_at: number;
+  last_heartbeat_at: number;
+  last_error_code: string | null;
+  updated_at: number;
+}
+
+export interface PairingControlOutboxRow {
+  id: string;
+  pairing_id: string;
+  action: "revoke";
+  reason: PairingRevocationReason;
+  created_at: number;
+  delivered_at: number | null;
+  attempts: number;
+  last_error: string | null;
 }

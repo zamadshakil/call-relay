@@ -29,6 +29,7 @@ class RelayInCallService : InCallService() {
     private val availableEndpoints = mutableListOf<CallEndpoint>()
     private val callbacks = ConcurrentHashMap<Call, Call.Callback>()
     private val relayEligibleCalls = ConcurrentHashMap.newKeySet<Call>()
+    private val incomingNotifications = IncomingCallNotificationGate<Call>()
     private lateinit var preferences: RelayPreferences
 
     override fun onCreate() {
@@ -59,6 +60,7 @@ class RelayInCallService : InCallService() {
                 callState.set(stateName(state))
                 RelayRuntime.update { it.copy(callState = stateName(state)) }
                 showCallNotification(changedCall)
+                notifyIncomingIfNeeded(changedCall, state)
                 if (relayDesired() && changedCall in relayEligibleCalls && state == Call.STATE_ACTIVE) {
                     routeToSpeaker()
                     notifyRelay(RelayReadyService.ACTION_CALL_ACTIVE)
@@ -71,6 +73,7 @@ class RelayInCallService : InCallService() {
                     relayEligibleCalls.add(changedCall)
                 }
                 showCallNotification(changedCall)
+                notifyIncomingIfNeeded(changedCall, changedCall.state)
             }
 
         }
@@ -81,13 +84,12 @@ class RelayInCallService : InCallService() {
         RelayRuntime.update { it.copy(callState = stateName(call.state)) }
         call.registerCallback(callback)
         showCallNotification(call)
-        if (relayDesired() && call in relayEligibleCalls && call.state == Call.STATE_RINGING) {
-            notifyRelay(RelayReadyService.ACTION_INCOMING)
-        }
+        notifyIncomingIfNeeded(call, call.state)
     }
 
     override fun onCallRemoved(call: Call) {
         val wasRelayEligible = relayEligibleCalls.remove(call)
+        incomingNotifications.remove(call)
         callbacks.remove(call)?.let(call::unregisterCallback)
         getSystemService(NotificationManager::class.java).cancel(CALL_NOTIFICATION_ID)
         activeCalls.remove(call)
@@ -105,10 +107,18 @@ class RelayInCallService : InCallService() {
         ContextCompat.startForegroundService(this, Intent(this, RelayReadyService::class.java).setAction(action))
     }
 
+    private fun notifyIncomingIfNeeded(call: Call, state: Int) {
+        val eligible = relayDesired() && call in relayEligibleCalls
+        if (incomingNotifications.shouldNotify(call, eligible, state == Call.STATE_RINGING)) {
+            notifyRelay(RelayReadyService.ACTION_INCOMING)
+        }
+    }
+
     private fun relayDesired(): Boolean = preferences.relayReadyDesired && preferences.configured() && preferences.entitlementActive
 
     private fun cleanupDisconnectedCall(call: Call) {
         val wasRelayEligible = relayEligibleCalls.remove(call)
+        incomingNotifications.remove(call)
         activeCalls.remove(call)
         if (currentCall.compareAndSet(call, activeCalls.lastOrNull { it.state != Call.STATE_DISCONNECTED })) {
             callState.set(currentCall.get()?.let { stateName(it.state) } ?: "No call")

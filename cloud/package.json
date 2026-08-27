@@ -14,8 +14,10 @@
     "providers:validate": "node scripts/validate-provider-credentials.mjs",
     "preflight:production": "node scripts/preflight-production.mjs",
     "db:local": "wrangler d1 migrations apply CALL_RELAY_DB --local",
-    "deploy": "node scripts/preflight-production.mjs && wrangler deploy",
-    "deploy:staging": "wrangler deploy --env staging"
+    "db:migrate": "wrangler d1 migrations apply CALL_RELAY_DB --remote",
+    "db:migrate:staging": "wrangler d1 migrations apply CALL_RELAY_DB --env staging --remote",
+    "deploy": "node scripts/preflight-production.mjs && pnpm run db:migrate && wrangler deploy",
+    "deploy:staging": "pnpm run db:migrate:staging && wrangler deploy --env staging"
   },
   "dependencies": {
     "@paddle/paddle-js": "1.6.5",
