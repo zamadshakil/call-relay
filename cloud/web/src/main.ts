@@ -9,6 +9,7 @@ import {
   signInWithPopup,
   signInWithRedirect,
   signOut as firebaseSignOut,
+  type Auth,
   type User,
 } from "firebase/auth";
 import { assertFirebaseWebConfigured, firebaseConfig } from "./firebase-config";
@@ -117,8 +118,23 @@ const pairingKeyName = "pairing-hkdf";
 const pairingProofKeyName = "pairing-proof";
 const pendingPairingStorageKey = "call-relay-pending-pairing-v2";
 const signalProtocol = "call-relay.signal.v1";
-const firebaseApp = initializeApp(firebaseConfig);
-const firebaseAuth = getAuth(firebaseApp);
+let firebaseAuth: Auth | undefined;
+let firebaseInitializationError: unknown;
+try {
+  assertFirebaseWebConfigured();
+  firebaseAuth = getAuth(initializeApp(firebaseConfig));
+} catch (error) {
+  firebaseInitializationError = error;
+}
+
+function requireFirebaseAuth(): Auth {
+  if (!firebaseAuth) {
+    throw firebaseInitializationError instanceof Error
+      ? firebaseInitializationError
+      : new Error("Firebase web sign-in is not configured on this deployment");
+  }
+  return firebaseAuth;
+}
 
 let identity: StoredIdentity | undefined = loadIdentity();
 let signingKey: CryptoKey | undefined;
@@ -295,7 +311,6 @@ function render(): void {
     renderAccountDetails();
     return;
   }
-  if (!firebaseUser) return showScreen("signInScreen");
   if (startupError) {
     showScreen("approvalScreen");
     element("approvalTitle").textContent = "Could not restore this browser session";
@@ -304,6 +319,7 @@ function render(): void {
     element<HTMLAnchorElement>("approvalContact").hidden = true;
     return;
   }
+  if (!firebaseUser) return showScreen("signInScreen");
   if (!account) return showScreen("loadingScreen");
   if (account.account.approvalStatus !== "approved") {
     showScreen("approvalScreen");
@@ -1306,15 +1322,15 @@ element("sendDtmf").addEventListener("click", () => void (async () => {
 })().catch((error) => log(`ERROR: ${String(error)}`)));
 
 element("googleSignIn").addEventListener("click", () => void (async () => {
-  assertFirebaseWebConfigured();
+  const auth = requireFirebaseAuth();
   const provider = new GoogleAuthProvider();
   provider.setCustomParameters({ prompt: "select_account" });
   try {
-    await signInWithPopup(firebaseAuth, provider);
+    await signInWithPopup(auth, provider);
   } catch (error) {
     const code = typeof error === "object" && error !== null && "code" in error ? String(error.code) : "";
     if (code === "auth/popup-blocked" || code === "auth/operation-not-supported-in-this-environment") {
-      await signInWithRedirect(firebaseAuth, provider);
+      await signInWithRedirect(auth, provider);
       return;
     }
     throw error;
@@ -1338,7 +1354,8 @@ async function performSignOut(revoke = true): Promise<void> {
   await clearLocalDevice();
   account = undefined;
   accountScreenOpen = false;
-  await firebaseSignOut(firebaseAuth);
+  const auth = requireFirebaseAuth();
+  await firebaseSignOut(auth);
   firebaseUser = null;
   render();
 }
@@ -1395,17 +1412,21 @@ window.addEventListener("beforeunload", () => {
 render();
 void initializeHostedCheckout().catch((error) => log(`Checkout initialization failed: ${String(error)}`));
 if (androidBillingReturn && !checkoutPageActive) window.setTimeout(() => { location.href = "callrelay://billing/complete"; }, 250);
-void getRedirectResult(firebaseAuth).catch((error) => log(`Google redirect failed: ${String(error)}`));
-onAuthStateChanged(firebaseAuth, (user) => {
-  if (!user) {
-    if (accountRefreshTimer !== undefined) window.clearInterval(accountRefreshTimer);
-    accountRefreshTimer = undefined;
-    firebaseUser = null;
-    account = undefined;
-    startupError = undefined;
-    render();
-    return;
-  }
-  void bootstrapAuthenticatedUser(user).catch(showStartupError);
-});
+if (firebaseAuth) {
+  void getRedirectResult(firebaseAuth).catch((error) => log(`Google redirect failed: ${String(error)}`));
+  onAuthStateChanged(firebaseAuth, (user) => {
+    if (!user) {
+      if (accountRefreshTimer !== undefined) window.clearInterval(accountRefreshTimer);
+      accountRefreshTimer = undefined;
+      firebaseUser = null;
+      account = undefined;
+      startupError = undefined;
+      render();
+      return;
+    }
+    void bootstrapAuthenticatedUser(user).catch(showStartupError);
+  });
+} else {
+  showStartupError(firebaseInitializationError ?? new Error("Firebase web sign-in is not configured on this deployment"));
+}
 if ("serviceWorker" in navigator) void navigator.serviceWorker.register("/sw.js").catch((error) => log(`Offline shell unavailable: ${String(error)}`));

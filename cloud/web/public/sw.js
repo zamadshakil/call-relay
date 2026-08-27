@@ -1,6 +1,6 @@
-const CACHE = "call-relay-shell-v3";
+const CACHE = "call-relay-shell-v4";
 self.addEventListener("install", (event) => {
-  event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(["/", "/manifest.webmanifest", "/icon.svg"])));
+  event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(["/manifest.webmanifest", "/icon.svg"])));
   self.skipWaiting();
 });
 self.addEventListener("activate", (event) => {
@@ -9,5 +9,9 @@ self.addEventListener("activate", (event) => {
 });
 self.addEventListener("fetch", (event) => {
   if (event.request.method !== "GET" || new URL(event.request.url).origin !== location.origin) return;
+  if (event.request.mode === "navigate") {
+    event.respondWith(fetch(new Request(event.request, { cache: "reload" })));
+    return;
+  }
   event.respondWith(fetch(event.request).catch(() => caches.match(event.request).then((response) => response ?? Response.error())));
 });

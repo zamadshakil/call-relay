@@ -569,8 +569,18 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
   throw new HttpError(405, "method not allowed");
 }
 
-function secureAssetResponse(response: Response): Response {
+function secureAssetResponse(request: Request, response: Response): Response {
   const headers = new Headers(response.headers);
+  const path = new URL(request.url).pathname;
+  const contentType = headers.get("content-type") ?? "";
+  if (contentType.includes("text/html")) {
+    // The application shell contains the current hashed bundle name. Caching
+    // it can strand an installed PWA on an obsolete or misconfigured bundle.
+    headers.set("cache-control", "no-store");
+  } else if (path === "/sw.js") {
+    headers.set("cache-control", "no-cache, max-age=0, must-revalidate");
+    headers.set("service-worker-allowed", "/");
+  }
   headers.set("content-security-policy", "default-src 'self'; script-src 'self' https://cdn.paddle.com; style-src 'self' 'unsafe-inline' https://cdn.paddle.com; connect-src 'self' https: wss:; media-src 'self' blob:; worker-src 'self' blob:; img-src 'self' data: https:; frame-src 'self' https://accounts.google.com https://*.firebaseapp.com https://*.paddle.com https://*.paddle.dev; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self' https://accounts.google.com");
   headers.set("permissions-policy", "camera=(self), microphone=(self), geolocation=()");
   headers.set("referrer-policy", "no-referrer");
@@ -586,7 +596,7 @@ export default {
       if (request.method !== "GET") return json({ error: "method not allowed" }, { status: 405 });
       return json({ ok: true, audioStored: false, mediaTransport: "webrtc_p2p" });
     }
-    if (!url.pathname.startsWith("/v1/")) return secureAssetResponse(await env.ASSETS.fetch(request));
+    if (!url.pathname.startsWith("/v1/")) return secureAssetResponse(request, await env.ASSETS.fetch(request));
     try {
       const signalMatch = /^\/v1\/pairings\/(pair_[a-f0-9]{32})\/signal$/u.exec(url.pathname);
       if (request.method === "GET" && signalMatch) return await openSignalSocket(request, env, signalMatch[1] ?? "");
