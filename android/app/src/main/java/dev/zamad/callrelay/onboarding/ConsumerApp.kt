@@ -95,7 +95,7 @@ fun CallRelayConsumerApp(
             if (navController.currentDestination?.route != route) {
                 navController.navigate(route) {
                     launchSingleTop = true
-                    popUpTo(navController.graph.startDestinationId) { inclusive = route == OnboardingStage.SPLASH.name }
+                    popUpTo(OnboardingStage.SPLASH.name) { inclusive = route == OnboardingStage.SPLASH.name }
                 }
             }
         }

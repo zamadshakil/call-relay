@@ -175,6 +175,7 @@ class WebRtcRelaySession(
         if (callId.isNotBlank() && peerConnection != null) scope.launch { restartIce("network_change", forceRelay = false) }
     }
 
+    @Synchronized
     fun disconnect() {
         directTimer?.cancel()
         failureTimer?.cancel()
@@ -187,19 +188,22 @@ class WebRtcRelaySession(
         connected.set(false)
         echoGuard.reset()
         remoteTrack = null
-        peerConnection?.close()
-        peerConnection?.dispose()
-        peerConnection = null
-        localTrack?.dispose()
-        localTrack = null
-        audioSource?.dispose()
-        audioSource = null
-        factory?.dispose()
-        factory = null
-        audioModule?.release()
-        audioModule = null
-        audioProcessing?.destroy()
-        audioProcessing = null
+        val connection = peerConnection.also { peerConnection = null }
+        val track = localTrack.also { localTrack = null }
+        val source = audioSource.also { audioSource = null }
+        val processing = audioProcessing.also { audioProcessing = null }
+        val connectionFactory = factory.also { factory = null }
+        val module = audioModule.also { audioModule = null }
+        connection?.close()
+        connection?.dispose()
+        track?.dispose()
+        source?.dispose()
+        // The processing factory owns the original native APM reference while the
+        // PeerConnectionFactory owns another. Release the original reference first;
+        // doing this after PeerConnectionFactory.dispose() crashes m144 in nativeDestroy.
+        processing?.destroy()
+        connectionFactory?.dispose()
+        module?.release()
         synchronized(pendingCandidates) { pendingCandidates.clear() }
         callId = ""
         mediaConfig = null
