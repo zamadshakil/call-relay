@@ -1623,4 +1623,14 @@ if (firebaseAuth) {
 } else {
   showStartupError(firebaseInitializationError ?? new Error("Firebase web sign-in is not configured on this deployment"));
 }
-if ("serviceWorker" in navigator) void navigator.serviceWorker.register("/sw.js").catch((error) => log(`Offline shell unavailable: ${String(error)}`));
+if ("serviceWorker" in navigator) {
+  let reloadingForWorkerUpdate = false;
+  navigator.serviceWorker.addEventListener("controllerchange", () => {
+    if (reloadingForWorkerUpdate) return;
+    reloadingForWorkerUpdate = true;
+    location.reload();
+  });
+  void navigator.serviceWorker.register("/sw.js", { updateViaCache: "none" })
+    .then((registration) => registration.update())
+    .catch((error) => log(`Offline shell unavailable: ${String(error)}`));
+}

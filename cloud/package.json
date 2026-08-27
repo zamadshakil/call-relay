@@ -14,8 +14,8 @@
     "providers:validate": "node scripts/validate-provider-credentials.mjs",
     "preflight:production": "node scripts/preflight-production.mjs",
     "db:local": "wrangler d1 migrations apply CALL_RELAY_DB --local",
-    "deploy": "node scripts/preflight-production.mjs && vite build && wrangler deploy",
-    "deploy:staging": "vite build --mode staging && wrangler deploy --env staging"
+    "deploy": "node scripts/preflight-production.mjs && wrangler deploy",
+    "deploy:staging": "wrangler deploy --env staging"
   },
   "dependencies": {
     "@paddle/paddle-js": "1.6.5",

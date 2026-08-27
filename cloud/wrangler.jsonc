@@ -2,6 +2,9 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "call-relay",
   "main": "src/index.ts",
+  "build": {
+    "command": "pnpm exec vite build --mode production && node scripts/verify-web-config.mjs production"
+  },
   "compatibility_date": "2026-08-27",
   "compatibility_flags": ["nodejs_compat"],
   "secrets": {
@@ -92,6 +95,9 @@
   "env": {
     "staging": {
       "name": "call-relay-staging",
+      "build": {
+        "command": "pnpm exec vite build --mode staging && node scripts/verify-web-config.mjs staging"
+      },
       "secrets": {
         "required": [
           "CF_TURN_KEY_ID",
