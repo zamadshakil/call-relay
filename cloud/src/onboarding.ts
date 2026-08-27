@@ -29,14 +29,17 @@ async function validateAgreementKey(encoded: string): Promise<void> {
   }
 }
 
-function publicSubscription(account: AccountContext): Record<string, unknown> {
+function publicSubscription(account: AccountContext, env: Env): Record<string, unknown> {
   const subscription = account.subscription;
+  const billingRequired = env.ACCESS_MODE !== "approval_only";
   return {
-    status: subscription?.status ?? "none",
-    plan: subscription?.plan_code ?? null,
-    currentPeriodEndsAt: subscription?.current_period_ends_at ?? null,
-    cancelAtPeriodEnd: subscription?.cancel_at_period_end === 1,
-    active: hasActiveEntitlement(account),
+    status: billingRequired ? subscription?.status ?? "none" : "access_granted",
+    plan: billingRequired ? subscription?.plan_code ?? null : null,
+    currentPeriodEndsAt: billingRequired ? subscription?.current_period_ends_at ?? null : null,
+    cancelAtPeriodEnd: billingRequired && subscription?.cancel_at_period_end === 1,
+    active: hasActiveEntitlement(account, Date.now(), env.ACCESS_MODE),
+    billingRequired,
+    accessMode: env.ACCESS_MODE,
   };
 }
 
@@ -75,7 +78,7 @@ async function accountSnapshot(env: Env, account: AccountContext): Promise<Recor
       photoUrl: account.identity.photoUrl,
       approvalStatus: account.approvalStatus,
     },
-    subscription: publicSubscription(account),
+    subscription: publicSubscription(account, env),
     devices: devices.results.map((device) => ({
       id: device.id,
       platform: device.platform,
@@ -105,7 +108,7 @@ export async function me(request: Request, env: Env): Promise<Response> {
 
 export async function registerDevice(request: Request, env: Env): Promise<Response> {
   const account = await authenticateFirebase(request, env);
-  requireEntitlement(account);
+  requireEntitlement(account, env.ACCESS_MODE);
   const body = await readJson<JsonObject>(request);
   const platform = requireString(body.platform, "platform", 16) as Platform;
   if (!(["android", "browser", "ios"] satisfies Platform[]).includes(platform)) throw new HttpError(400, "platform is invalid");

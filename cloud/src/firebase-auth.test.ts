@@ -106,4 +106,11 @@ describe("account entitlement", () => {
     expect(hasActiveEntitlement(account("suspended", "active"))).toBe(false);
     expect(hasActiveEntitlement(account("approved", "active", Date.now() - 1))).toBe(false);
   });
+
+  it("allows approved accounts without a subscription in approval-only mode", () => {
+    const approvedWithoutSubscription = { ...account("approved", "none"), subscription: null };
+    expect(hasActiveEntitlement(approvedWithoutSubscription, Date.now(), "approval_only")).toBe(true);
+    expect(hasActiveEntitlement({ ...approvedWithoutSubscription, approvalStatus: "unknown" }, Date.now(), "approval_only")).toBe(false);
+    expect(hasActiveEntitlement({ ...approvedWithoutSubscription, approvalStatus: "suspended" }, Date.now(), "approval_only")).toBe(false);
+  });
 });

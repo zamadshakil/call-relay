@@ -17,9 +17,11 @@ export async function requireDeviceEntitlement(env: Env, device: DeviceRow): Pro
     subscription_status: string | null;
     current_period_ends_at: number | null;
   }>();
-  const active = row?.approval_status === "approved" && row.subscription_status === "active" &&
+  if (row?.approval_status !== "approved") throw new HttpError(403, "an approved account is required");
+  if (env.ACCESS_MODE === "approval_only") return;
+  const active = row.subscription_status === "active" &&
     (row.current_period_ends_at === null || row.current_period_ends_at > Date.now());
-  if (!active) throw new HttpError(402, "an approved account with an active subscription is required");
+  if (!active) throw new HttpError(402, "an active paid subscription is required");
 }
 
 export async function assertSameAccount(env: Env, firstDeviceId: string, secondDeviceId: string): Promise<string> {

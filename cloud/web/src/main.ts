@@ -33,7 +33,15 @@ interface StoredIdentity {
 
 interface AccountSnapshot {
   account: { uid: string; email: string; displayName: string | null; photoUrl: string | null; approvalStatus: "approved" | "unknown" | "suspended" };
-  subscription: { status: string; plan: "monthly" | "annual" | null; currentPeriodEndsAt: number | null; cancelAtPeriodEnd: boolean; active: boolean };
+  subscription: {
+    status: string;
+    plan: "monthly" | "annual" | null;
+    currentPeriodEndsAt: number | null;
+    cancelAtPeriodEnd: boolean;
+    active: boolean;
+    billingRequired: boolean;
+    accessMode: "paid" | "approval_only";
+  };
   devices: Array<{ id: string; platform: "android" | "browser" | "ios"; displayName: string; online: boolean; sim: { carrierName: string; maskedNumber: string | null } | null }>;
   pairing: Record<string, unknown> | null;
 }
@@ -313,7 +321,9 @@ function render(): void {
   showScreen("homeScreen");
   const android = account.devices.find((device) => device.platform === "android");
   element("accountEmail").textContent = account.account.email;
-  element("planSummary").textContent = `${account.subscription.plan === "annual" ? "Annual" : "Monthly"} plan${account.subscription.currentPeriodEndsAt ? ` · renews ${new Date(account.subscription.currentPeriodEndsAt).toLocaleDateString()}` : ""}`;
+  element("planSummary").textContent = account.subscription.billingRequired
+    ? `${account.subscription.plan === "annual" ? "Annual" : "Monthly"} plan${account.subscription.currentPeriodEndsAt ? ` · renews ${new Date(account.subscription.currentPeriodEndsAt).toLocaleDateString()}` : ""}`
+    : "Approved access · payment not required";
   element("androidName").textContent = android?.displayName ?? "Android relay";
   element<HTMLOutputElement>("presence").value = android?.online ? "Android online" : "Android offline";
 }
@@ -328,7 +338,9 @@ function renderAccountDetails(): void {
   const android = account.devices.find((device) => device.platform === "android");
   const values: Array<[string, string]> = [
     ["Google account", account.account.email],
-    ["Plan", account.subscription.plan === "annual" ? "Annual" : account.subscription.plan === "monthly" ? "Monthly" : account.subscription.status],
+    ["Access", account.subscription.billingRequired
+      ? account.subscription.plan === "annual" ? "Annual" : account.subscription.plan === "monthly" ? "Monthly" : account.subscription.status
+      : "Approved account"],
     ["Android", android?.displayName ?? "Not registered"],
     ["SIM", android?.sim ? `${android.sim.carrierName}${android.sim.maskedNumber ? ` · ${android.sim.maskedNumber}` : ""}` : "Not configured"],
     ["Peer", account.pairing ? "Paired" : "Not paired"],
@@ -343,6 +355,7 @@ function renderAccountDetails(): void {
     row.appendChild(content);
     return row;
   }));
+  element<HTMLButtonElement>("managePlan").hidden = !account.subscription.billingRequired;
 }
 
 function apiUrl(path: string): string {
@@ -597,7 +610,7 @@ function qrParameters(text: string): { invitationId: string; challenge: Uint8Arr
 }
 
 async function consumePairingQr(text: string): Promise<void> {
-  if (!identity || !firebaseUser || !account?.subscription.active) throw new Error("finish sign-in and payment first");
+  if (!identity || !firebaseUser || !account?.subscription.active) throw new Error("finish sign-in and account approval first");
   const { invitationId, challenge, androidPublicKey } = qrParameters(text);
   scannerControls?.stop();
   scannerControls = undefined;

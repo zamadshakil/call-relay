@@ -65,7 +65,7 @@ export async function consumePairingInvitation(
   invitationId: string,
 ): Promise<Response> {
   const account = await authenticateFirebase(request, env);
-  requireEntitlement(account);
+  requireEntitlement(account, env.ACCESS_MODE);
   const body = await readJson<JsonObject>(request);
   const peerDeviceId = requireString(body.peerDeviceId, "peerDeviceId", 80);
   if (!/^dev_[a-f0-9]{32}$/u.test(peerDeviceId)) throw new HttpError(400, "peerDeviceId is invalid");

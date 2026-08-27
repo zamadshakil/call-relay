@@ -468,12 +468,25 @@ async function openSignalSocket(request: Request, env: Env, pairingId: string): 
 
 async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const url = new URL(request.url);
-  if (request.method === "POST" && url.pathname === "/v1/billing/webhooks/paddle") return paddleWebhook(request, env, ctx);
+  const billingDisabled = env.ACCESS_MODE === "approval_only";
+  if (request.method === "POST" && url.pathname === "/v1/billing/webhooks/paddle") {
+    if (billingDisabled) throw new HttpError(410, "billing is disabled; approved accounts receive access directly");
+    return paddleWebhook(request, env, ctx);
+  }
   if (request.method === "POST" && url.pathname === "/v1/auth/session") return authSession(request, env);
   if (request.method === "GET" && url.pathname === "/v1/me") return me(request, env);
-  if (request.method === "GET" && url.pathname === "/v1/billing/plans") return billingPlans(request, env);
-  if (request.method === "POST" && url.pathname === "/v1/billing/checkout") return createCheckout(request, env);
-  if (request.method === "POST" && url.pathname === "/v1/billing/portal") return createPortal(request, env);
+  if (request.method === "GET" && url.pathname === "/v1/billing/plans") {
+    if (billingDisabled) throw new HttpError(410, "billing is disabled; approved accounts receive access directly");
+    return billingPlans(request, env);
+  }
+  if (request.method === "POST" && url.pathname === "/v1/billing/checkout") {
+    if (billingDisabled) throw new HttpError(410, "billing is disabled; approved accounts receive access directly");
+    return createCheckout(request, env);
+  }
+  if (request.method === "POST" && url.pathname === "/v1/billing/portal") {
+    if (billingDisabled) throw new HttpError(410, "billing is disabled; approved accounts receive access directly");
+    return createPortal(request, env);
+  }
   if (request.method === "POST" && url.pathname === "/v1/devices/register") return registerDevice(request, env);
   if (request.method === "GET" && url.pathname === "/v1/pairings/current") return currentPairingForAccount(request, env);
   const consumeInvitationMatch = /^\/v1\/pairing-invitations\/(inv_[a-f0-9]{32})\/consume$/u.exec(url.pathname);

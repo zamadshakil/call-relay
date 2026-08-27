@@ -5,6 +5,7 @@ export type Direction = "incoming" | "outgoing";
 export type RelayMode = "full_duplex" | "listen" | "talk";
 export type SignalRole = "android" | "peer";
 export type ApprovalStatus = "approved" | "unknown" | "suspended";
+export type AccessMode = "paid" | "approval_only";
 export type SubscriptionStatus = "none" | "pending" | "active" | "past_due" | "paused" | "canceled" | "refunded" | "disputed";
 export type PlanCode = "monthly" | "annual";
 export type CallState =
@@ -26,6 +27,7 @@ export type Env = Omit<Cloudflare.Env, "PUSH_QUEUE"> & {
   FCM_CLIENT_EMAIL?: SecretValue;
   FCM_PRIVATE_KEY?: SecretValue;
   FIREBASE_PROJECT_ID: string;
+  ACCESS_MODE: AccessMode;
   ONBOARDING_V2_ENABLED: string;
   MIN_ANDROID_APP_VERSION: string;
   PUBLIC_APP_URL: string;

@@ -12,8 +12,6 @@
       "ENROLLMENT_INVITE",
       "FCM_CLIENT_EMAIL",
       "FCM_PRIVATE_KEY",
-      "PADDLE_API_KEY",
-      "PADDLE_WEBHOOK_SECRET",
       "SIM_PROFILE_ENCRYPTION_KEY"
     ]
   },
@@ -79,6 +77,7 @@
   "vars": {
     "FCM_PROJECT_ID": "call-relay-3dec7",
     "FIREBASE_PROJECT_ID": "call-relay-3dec7",
+    "ACCESS_MODE": "approval_only",
     "ONBOARDING_V2_ENABLED": "false",
     "MIN_ANDROID_APP_VERSION": "2",
     "PUBLIC_APP_URL": "https://call-relay.zamadshakil.workers.dev",
@@ -94,11 +93,8 @@
           "CF_TURN_KEY_ID",
           "CF_TURN_API_TOKEN",
           "SIGNAL_TICKET_SECRET",
-          "ENROLLMENT_INVITE",
           "FCM_CLIENT_EMAIL",
           "FCM_PRIVATE_KEY",
-          "PADDLE_API_KEY",
-          "PADDLE_WEBHOOK_SECRET",
           "SIM_PROFILE_ENCRYPTION_KEY"
         ]
       },
@@ -138,8 +134,9 @@
       "vars": {
         "FCM_PROJECT_ID": "call-relay-3dec7",
         "FIREBASE_PROJECT_ID": "call-relay-3dec7",
-        "ONBOARDING_V2_ENABLED": "false",
-        "MIN_ANDROID_APP_VERSION": "2",
+        "ACCESS_MODE": "approval_only",
+        "ONBOARDING_V2_ENABLED": "true",
+        "MIN_ANDROID_APP_VERSION": "3",
         "PUBLIC_APP_URL": "https://call-relay-staging.zamadshakil.workers.dev",
         "PADDLE_ENVIRONMENT": "sandbox",
         "PADDLE_MONTHLY_PRICE_ID": "replace-me",

@@ -7,6 +7,7 @@ declare namespace Cloudflare {
     FCM_CLIENT_EMAIL: string;
     FCM_PRIVATE_KEY: string;
     FIREBASE_PROJECT_ID: string;
+    ACCESS_MODE: "paid" | "approval_only";
     ONBOARDING_V2_ENABLED: string;
     MIN_ANDROID_APP_VERSION: string;
     PUBLIC_APP_URL: string;

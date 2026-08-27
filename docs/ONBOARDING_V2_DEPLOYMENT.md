@@ -1,5 +1,9 @@
 # Gmail, billing, and automatic pairing deployment
 
+## Approval-only testing (no payment)
+
+Set `ACCESS_MODE` to `approval_only` in the selected Wrangler environment. An email in `approved_emails` then receives relay access immediately after Google sign-in; no Paddle keys, product IDs, checkout, webhook, or customer portal are used. Unknown and suspended accounts remain blocked. Switch to `paid` only when billing is intentionally enabled and all Paddle production requirements are ready.
+
 The onboarding-v2 code is additive. Keep `ONBOARDING_V2_ENABLED=false` while staging is configured; that keeps the legacy test APK usable. The new authenticated endpoints still work. Set the flag to `true` only after the new APK/PWA passes staging, which makes manual enrollment return `410 Gone`.
 
 ## 1. Firebase Google authentication

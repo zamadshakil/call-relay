@@ -327,11 +327,21 @@ private fun ReadyScreen(state: OnboardingUiState, callbacks: ConsumerCallbacks) 
         }
     }
     InfoCard("Google account", state.email)
-    InfoCard("Plan", listOfNotNull(state.activePlan?.replaceFirstChar(Char::uppercase), state.renewalAt?.let { "renews ${DateFormat.getDateInstance().format(Date(it))}" }).joinToString(" · "))
+    InfoCard(
+        "Access",
+        if (state.billingRequired) {
+            listOfNotNull(state.activePlan?.replaceFirstChar(Char::uppercase), state.renewalAt?.let { "renews ${DateFormat.getDateInstance().format(Date(it))}" })
+                .joinToString(" · ")
+        } else {
+            "Approved account · payment not required"
+        },
+    )
     InfoCard("SIM", listOfNotNull(state.carrierName, state.maskedNumber).joinToString(" · ").ifBlank { "Configured" })
     InfoCard("Paired peer", state.peerName ?: "iPhone browser")
     Button({ callbacks.toggleRelay(!runtime.ready) }, Modifier.fillMaxWidth()) { Text(if (runtime.ready) "Pause relay" else "Resume relay") }
-    OutlinedButton(callbacks.managePlan, Modifier.fillMaxWidth()) { Text("Manage plan") }
+    if (state.billingRequired) {
+        OutlinedButton(callbacks.managePlan, Modifier.fillMaxWidth()) { Text("Manage plan") }
+    }
     OutlinedButton(
         onClick = { confirmPeerReplacement = true },
         modifier = Modifier.fillMaxWidth(),

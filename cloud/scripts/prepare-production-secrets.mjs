@@ -39,7 +39,10 @@ async function savedOrGenerated(path, label) {
 
 const firebasePath = resolve(required(option("--firebase"), "--firebase path"));
 const turnPath = resolve(required(option("--turn"), "--turn path"));
-const paddlePath = resolve(required(option("--paddle"), "--paddle path"));
+const accessMode = option("--access-mode") ?? "paid";
+if (accessMode !== "paid" && accessMode !== "approval_only") throw new Error("--access-mode must be paid or approval_only");
+const paddleOption = option("--paddle");
+const paddlePath = accessMode === "paid" ? resolve(required(paddleOption, "--paddle path")) : undefined;
 const outputPath = resolve(option("--output") ?? ".secrets.production.json");
 const invitePath = resolve(option("--invite-output") ?? ".enrollment-invite.txt");
 const signalPath = resolve(option("--signal-secret-output") ?? ".signal-ticket-secret.txt");
@@ -47,7 +50,7 @@ const simKeyPath = resolve(option("--sim-secret-output") ?? ".sim-profile-encryp
 const includeEnrollmentInvite = !process.argv.includes("--omit-enrollment-invite");
 const firebase = JSON.parse(await readFile(firebasePath, "utf8"));
 const turn = parseValues(await readFile(turnPath, "utf8"));
-const paddle = parseValues(await readFile(paddlePath, "utf8"));
+const paddle = paddlePath ? parseValues(await readFile(paddlePath, "utf8")) : new Map();
 
 const secrets = {
   CF_TURN_KEY_ID: required(turn.get("CF_TURN_KEY_ID"), "CF_TURN_KEY_ID"),
@@ -56,8 +59,10 @@ const secrets = {
   ...(includeEnrollmentInvite ? { ENROLLMENT_INVITE: await savedOrGenerated(invitePath, "enrollment invite") } : {}),
   FCM_CLIENT_EMAIL: required(firebase.client_email, "Firebase client_email"),
   FCM_PRIVATE_KEY: required(firebase.private_key, "Firebase private_key"),
-  PADDLE_API_KEY: required(paddle.get("PADDLE_API_KEY"), "PADDLE_API_KEY"),
-  PADDLE_WEBHOOK_SECRET: required(paddle.get("PADDLE_WEBHOOK_SECRET"), "PADDLE_WEBHOOK_SECRET"),
+  ...(accessMode === "paid" ? {
+    PADDLE_API_KEY: required(paddle.get("PADDLE_API_KEY"), "PADDLE_API_KEY"),
+    PADDLE_WEBHOOK_SECRET: required(paddle.get("PADDLE_WEBHOOK_SECRET"), "PADDLE_WEBHOOK_SECRET"),
+  } : {}),
   SIM_PROFILE_ENCRYPTION_KEY: await savedOrGenerated(simKeyPath, "SIM profile encryption key"),
 };
 

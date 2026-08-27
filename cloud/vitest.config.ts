@@ -30,6 +30,7 @@ export default defineConfig(async () => {
             ...testSecrets,
             FCM_PROJECT_ID: "integration-project",
             FIREBASE_PROJECT_ID: "integration-project",
+            ACCESS_MODE: "paid",
             ONBOARDING_V2_ENABLED: "false",
             MIN_ANDROID_APP_VERSION: "2",
             PUBLIC_APP_URL: "https://relay.test",

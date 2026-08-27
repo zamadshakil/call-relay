@@ -12,11 +12,15 @@ if (!config.vars?.FCM_PROJECT_ID || String(config.vars.FCM_PROJECT_ID).includes(
 if (!config.vars?.FIREBASE_PROJECT_ID || String(config.vars.FIREBASE_PROJECT_ID).includes("replace-me")) {
   failures.push("set vars.FIREBASE_PROJECT_ID to the Firebase project ID");
 }
-if (!/^pri_[a-z0-9]{26}$/u.test(String(config.vars?.PADDLE_MONTHLY_PRICE_ID ?? "")) ||
-    !/^pri_[a-z0-9]{26}$/u.test(String(config.vars?.PADDLE_ANNUAL_PRICE_ID ?? ""))) {
-  failures.push("set production Paddle monthly and annual price IDs");
+const accessMode = config.vars?.ACCESS_MODE;
+if (accessMode !== "paid" && accessMode !== "approval_only") failures.push("set ACCESS_MODE to paid or approval_only");
+if (accessMode === "paid") {
+  if (!/^pri_[a-z0-9]{26}$/u.test(String(config.vars?.PADDLE_MONTHLY_PRICE_ID ?? "")) ||
+      !/^pri_[a-z0-9]{26}$/u.test(String(config.vars?.PADDLE_ANNUAL_PRICE_ID ?? ""))) {
+    failures.push("set production Paddle monthly and annual price IDs");
+  }
+  if (config.vars?.PADDLE_ENVIRONMENT !== "production") failures.push("set production PADDLE_ENVIRONMENT to production");
 }
-if (config.vars?.PADDLE_ENVIRONMENT !== "production") failures.push("set production PADDLE_ENVIRONMENT to production");
 const onboardingV2Enabled = config.vars?.ONBOARDING_V2_ENABLED === "true";
 if (!onboardingV2Enabled) failures.push("enable ONBOARDING_V2_ENABLED only at the approved production cutover");
 if (Number(config.vars?.MIN_ANDROID_APP_VERSION) < 3) failures.push("set MIN_ANDROID_APP_VERSION to 3 or newer");
@@ -26,10 +30,9 @@ const expectedSecrets = [
   "SIGNAL_TICKET_SECRET",
   "FCM_CLIENT_EMAIL",
   "FCM_PRIVATE_KEY",
-  "PADDLE_API_KEY",
-  "PADDLE_WEBHOOK_SECRET",
   "SIM_PROFILE_ENCRYPTION_KEY",
 ];
+if (accessMode === "paid") expectedSecrets.push("PADDLE_API_KEY", "PADDLE_WEBHOOK_SECRET");
 const declaredSecrets = new Set(config.secrets?.required ?? []);
 if (!onboardingV2Enabled) expectedSecrets.push("ENROLLMENT_INVITE");
 const missingSecretDeclarations = expectedSecrets.filter((name) => !declaredSecrets.has(name));

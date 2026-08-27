@@ -12,7 +12,7 @@ pnpm test
 pnpm dev
 ```
 
-Required encrypted production secrets are `CF_TURN_KEY_ID`, `CF_TURN_API_TOKEN`, `SIGNAL_TICKET_SECRET`, `FCM_CLIENT_EMAIL`, `FCM_PRIVATE_KEY`, `PADDLE_API_KEY`, `PADDLE_WEBHOOK_SECRET`, and `SIM_PROFILE_ENCRYPTION_KEY`. `ENROLLMENT_INVITE` remains only until legacy staging is disabled. Firebase project, Paddle environment, and monthly/annual price IDs are non-secret Worker variables; the public Firebase/Paddle browser tokens are Vite environment values.
+Required encrypted production secrets in `approval_only` mode are `CF_TURN_KEY_ID`, `CF_TURN_API_TOKEN`, `SIGNAL_TICKET_SECRET`, `FCM_CLIENT_EMAIL`, `FCM_PRIVATE_KEY`, and `SIM_PROFILE_ENCRYPTION_KEY`. `PADDLE_API_KEY` and `PADDLE_WEBHOOK_SECRET` are required only when `ACCESS_MODE=paid`. `ENROLLMENT_INVITE` remains only until legacy onboarding is disabled. Firebase project, access mode, Paddle environment, and monthly/annual price IDs are non-secret Worker variables; the public Firebase/Paddle browser tokens are Vite environment values.
 
 ## Consumer APIs
 

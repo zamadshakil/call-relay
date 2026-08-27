@@ -1,7 +1,7 @@
 import { createRemoteJWKSet, jwtVerify, type JWTVerifyGetKey } from "jose";
 import { googleAccessToken } from "./google-oauth";
 import { HttpError } from "./http";
-import type { AccountContext, ApprovalStatus, Env, FirebaseIdentity, SubscriptionRow } from "./types";
+import type { AccessMode, AccountContext, ApprovalStatus, Env, FirebaseIdentity, SubscriptionRow } from "./types";
 
 const FIREBASE_JWKS = createRemoteJWKSet(
   new URL("https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com"),
@@ -110,9 +110,11 @@ export async function authenticateFirebase(
   return { identity, approvalStatus, subscription };
 }
 
-export function hasActiveEntitlement(account: AccountContext, now = Date.now()): boolean {
+export function hasActiveEntitlement(account: AccountContext, now = Date.now(), accessMode: AccessMode = "paid"): boolean {
+  if (account.approvalStatus !== "approved") return false;
+  if (accessMode === "approval_only") return true;
   const subscription = account.subscription;
-  return account.approvalStatus === "approved" && subscription?.status === "active" &&
+  return subscription?.status === "active" &&
     (subscription.current_period_ends_at === null || subscription.current_period_ends_at > now);
 }
 
@@ -121,7 +123,7 @@ export function requireApproved(account: AccountContext): void {
   if (account.approvalStatus === "suspended") throw new HttpError(403, "this account is suspended");
 }
 
-export function requireEntitlement(account: AccountContext): void {
+export function requireEntitlement(account: AccountContext, accessMode: AccessMode = "paid"): void {
   requireApproved(account);
-  if (!hasActiveEntitlement(account)) throw new HttpError(402, "an active paid subscription is required");
+  if (!hasActiveEntitlement(account, Date.now(), accessMode)) throw new HttpError(402, "an active paid subscription is required");
 }
