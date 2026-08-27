@@ -581,9 +581,10 @@ function secureAssetResponse(request: Request, response: Response): Response {
     headers.set("cache-control", "no-cache, max-age=0, must-revalidate");
     headers.set("service-worker-allowed", "/");
   }
-  headers.set("content-security-policy", "default-src 'self'; script-src 'self' https://cdn.paddle.com; style-src 'self' 'unsafe-inline' https://cdn.paddle.com; connect-src 'self' https: wss:; media-src 'self' blob:; worker-src 'self' blob:; img-src 'self' data: https:; frame-src 'self' https://accounts.google.com https://*.firebaseapp.com https://*.paddle.com https://*.paddle.dev; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self' https://accounts.google.com");
+  headers.set("content-security-policy", "default-src 'self'; script-src 'self' https://apis.google.com https://cdn.paddle.com; style-src 'self' 'unsafe-inline' https://cdn.paddle.com; connect-src 'self' https: wss:; media-src 'self' blob:; worker-src 'self' blob:; img-src 'self' data: https:; frame-src 'self' https://accounts.google.com https://*.firebaseapp.com https://*.paddle.com https://*.paddle.dev; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self' https://accounts.google.com");
   headers.set("permissions-policy", "camera=(self), microphone=(self), geolocation=()");
   headers.set("referrer-policy", "no-referrer");
+  headers.set("cross-origin-opener-policy", "same-origin-allow-popups");
   headers.set("x-frame-options", "DENY");
   headers.set("x-content-type-options", "nosniff");
   return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
