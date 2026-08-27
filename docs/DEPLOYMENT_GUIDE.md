@@ -1,5 +1,7 @@
 # Cloudflare-only deployment guide
 
+> The consumer Gmail/Paddle/guided-setup release supersedes the manual enrollment steps in this document. Use [ONBOARDING_V2_DEPLOYMENT.md](./ONBOARDING_V2_DEPLOYMENT.md) for the current application. This document remains the media/TURN qualification runbook.
+
 The existing production Worker stays online while this replacement is validated in an isolated staging environment. Do not deploy the migration directly to production.
 
 ## 1. Accounts and local checks

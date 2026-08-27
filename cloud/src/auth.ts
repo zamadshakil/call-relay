@@ -18,7 +18,8 @@ export async function authenticate(request: Request, env: Env, body: Uint8Array)
   }
 
   const device = await env.CALL_RELAY_DB.prepare(
-    "SELECT id, platform, display_name, public_key_spki, fcm_token, revoked_at FROM devices WHERE id = ?",
+    `SELECT id, platform, display_name, public_key_spki, fcm_token, fcm_target_kind, revoked_at, user_id,
+      agreement_public_key_raw, app_version FROM devices WHERE id = ?`,
   ).bind(deviceId).first<DeviceRow>();
   if (!device || device.revoked_at !== null) throw new HttpError(401, "unknown or revoked device");
 

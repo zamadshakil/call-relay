@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">Call Relay Lab</string>
+    <string name="app_name">Call Relay</string>
+    <string name="google_web_client_id">replace-me.apps.googleusercontent.com</string>
     <string name="accessibility_description">Allows the user-started relay to retain microphone priority during an active cellular call. It does not inspect screen content or interact with other apps.</string>
 </resources>

@@ -16,6 +16,8 @@ Thumbs.db
 **/.enrollment-invite*.txt
 **/.signal-ticket-secret*.txt
 **/turn-keys.txt
+**/paddle-keys.txt
+**/.sim-profile-encryption-key*.txt
 **/*service-account*.json
 **/firebase-adminsdk*.json
 **/*firebase-adminsdk*.json

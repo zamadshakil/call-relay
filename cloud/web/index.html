@@ -2,70 +2,93 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#071a17" />
     <meta name="color-scheme" content="dark" />
-    <title>Call Relay Console</title>
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="icon" href="/icon.svg" type="image/svg+xml" />
+    <title>Call Relay</title>
   </head>
   <body>
     <main>
-      <header>
-        <p class="eyebrow">PRIVATE TEST CONSOLE</p>
-        <h1>Call Relay</h1>
-        <p>Browser peer for the stock-Android acoustic relay. Audio is never recorded.</p>
+      <header class="brand">
+        <div class="mark" aria-hidden="true">↗</div>
+        <div><p class="eyebrow">CALL RELAY</p><h1>Your Android SIM.<br />On this phone.</h1></div>
       </header>
 
-      <section>
-        <h2>1. Enroll this browser</h2>
-        <label>API base <input id="apiBase" value="" placeholder="Leave blank on the hosted console" /></label>
-        <small>For safety, the console only sends signed requests back to its own origin.</small>
-        <label>Invite <input id="invite" type="password" autocomplete="off" /></label>
-        <label>Name <input id="deviceName" value="Browser test peer" /></label>
-        <button id="enroll">Generate key and enroll</button>
-        <output id="identity">Not enrolled</output>
+      <section id="loadingScreen" class="screen hero-card">
+        <span class="spinner" aria-hidden="true"></span><h2>Getting things ready</h2><p>Restoring your secure session…</p>
       </section>
 
-      <section>
-        <h2>2. Pair</h2>
-        <label>Android device ID <input id="peerDevice" placeholder="dev_…" /></label>
-        <button id="pair">Create pairing</button>
-        <output id="pairing">Not paired</output>
-        <canvas id="pairingQr" hidden aria-label="Android pairing QR code"></canvas>
+      <section id="signInScreen" class="screen hero-card" hidden>
+        <span class="step">Step 1 of 2</span><h2>Continue with your approved Google account</h2>
+        <p>Your Android relay and this iPhone browser must use the same account.</p>
+        <button id="googleSignIn" class="primary google"><span>G</span> Continue with Google</button>
+        <p class="privacy">Your password is handled by Google. Call Relay receives only your verified account identity.</p>
       </section>
 
-      <section>
-        <h2>3. Call</h2>
-        <label>E.164 number <input id="phoneNumber" inputmode="tel" placeholder="+923001234567" /></label>
-        <button id="dial">Ask Android to dial</button>
-        <label>Call ID <input id="callId" placeholder="call_…" /></label>
-        <div class="controls">
-          <button data-event="accept">Accept</button>
-          <button data-event="reject" class="danger">Reject</button>
-          <button data-event="end" class="danger">End</button>
-          <button data-event="full_duplex">Full duplex</button>
-          <button data-event="listen">Listen</button>
-          <button data-event="talk">Talk</button>
-          <button id="mute">Mute relay mic</button>
-          <button id="unmute">Unmute relay mic</button>
+      <section id="approvalScreen" class="screen hero-card" hidden>
+        <span class="status-dot warning"></span><h2 id="approvalTitle">Account unavailable</h2><p id="approvalMessage"></p>
+        <a class="button secondary" href="mailto:support@callrelay.app">Contact support</a>
+        <button id="approvalSignOut" class="text-button">Use another Google account</button>
+      </section>
+
+      <section id="plansScreen" class="screen" hidden>
+        <span class="step">Choose your plan</span><h2>One relay. One paired iPhone.</h2>
+        <p class="lede">Localized prices and taxes are calculated securely by Paddle.</p>
+        <div id="planCards" class="plans" aria-live="polite"></div>
+        <p class="privacy">No trial. Cancel or update payment details from the Paddle customer portal.</p>
+      </section>
+
+      <section id="paymentScreen" class="screen hero-card" hidden>
+        <span class="spinner" aria-hidden="true"></span><h2>Confirming payment</h2>
+        <p>Paddle is finalizing your subscription. Access unlocks only after its verified webhook arrives.</p>
+        <button id="refreshPayment" class="secondary">Check again</button>
+        <a id="returnToAndroid" class="button primary" href="callrelay://billing/complete" hidden>Return to Android app</a>
+      </section>
+
+      <section id="pairScreen" class="screen" hidden>
+        <span class="step">Step 2 of 2</span><h2>Pair your Android</h2>
+        <p class="lede">Open Call Relay on Android and show its secure five-minute QR code.</p>
+        <div class="scanner-shell">
+          <video id="qrVideo" muted playsinline></video><div class="scan-frame" aria-hidden="true"></div>
+          <p id="scannerStatus">Camera stays off until you choose Scan.</p>
         </div>
-        <div class="controls">
-          <input id="dtmf" maxlength="1" inputmode="tel" placeholder="DTMF 0-9, * or #" />
-          <button id="sendDtmf">Send DTMF</button>
+        <button id="scanQr" class="primary">Scan Android QR</button>
+        <button id="replacePeer" class="danger-outline" hidden>Replace previously paired browser</button>
+      </section>
+
+      <section id="homeScreen" class="screen" hidden>
+        <div class="account-row">
+          <div><span class="status-pill"><span class="status-dot"></span> Relay ready</span><h2 id="accountEmail">Signed in</h2><p id="planSummary"></p></div>
+          <button id="accountMenu" class="icon-button" aria-label="Account and diagnostics">•••</button>
         </div>
+        <article class="relay-card">
+          <div><span class="label">ANDROID RELAY</span><strong id="androidName">Android relay</strong><span id="presence">Android offline</span></div>
+          <div class="route"><span id="signal">Connecting…</span><span id="media">No active call</span></div>
+        </article>
+        <article class="call-card">
+          <label for="phoneNumber">Call from Android SIM</label><input id="phoneNumber" inputmode="tel" autocomplete="tel" placeholder="+92 300 1234567" />
+          <button id="dial" class="primary call-button">Call</button>
+          <div id="incomingBanner" class="incoming" hidden><strong>Incoming SIM call</strong><span id="incomingState">Waiting for you</span></div>
+          <div class="controls">
+            <button data-event="accept" class="success">Accept</button><button data-event="reject" class="danger">Reject</button><button data-event="end" class="danger">End</button>
+            <button id="mute" class="secondary">Mute</button><button id="unmute" class="secondary">Unmute</button>
+          </div>
+          <details><summary>More call controls</summary>
+            <div class="controls"><button data-event="full_duplex" class="secondary">Full duplex</button><button data-event="listen" class="secondary">Listen only</button><button data-event="talk" class="secondary">Talk only</button></div>
+            <div class="dtmf-row"><input id="dtmf" maxlength="1" inputmode="tel" aria-label="DTMF digit" placeholder="0–9, * or #" /><button id="sendDtmf" class="secondary">Send tone</button></div>
+          </details>
+        </article>
+        <output id="stats">No active media</output><audio id="remoteAudio" autoplay playsinline></audio>
       </section>
 
-      <section>
-        <h2>4. WebRTC audio</h2>
-        <p>Direct peer-to-peer when possible; encrypted Cloudflare TURN relay otherwise.</p>
-        <output id="signal">Disconnected</output>
-        <output id="presence">Android offline</output>
-        <button id="join">Prepare WebRTC media</button>
-        <button id="leave">Leave</button>
-        <output id="media">Disconnected</output>
-        <output id="stats">No active media</output>
-        <audio id="remoteAudio" autoplay playsinline></audio>
+      <section id="accountScreen" class="screen" hidden>
+        <button id="closeAccount" class="text-button back">← Back</button><h2>Account</h2><div id="accountDetails" class="detail-list"></div>
+        <button id="managePlan" class="secondary">Manage plan and invoices</button><button id="startReplacePeer" class="secondary">Replace this peer</button>
+        <button id="signOut" class="danger-outline">Sign out</button>
+        <details class="diagnostics"><summary>Developer diagnostics</summary><pre id="log" aria-live="polite"></pre></details>
       </section>
-
-      <pre id="log" aria-live="polite"></pre>
     </main>
     <script type="module" src="/src/main.ts"></script>
   </body>

@@ -1,5 +1,6 @@
 package dev.zamad.callrelay.push
 
+import android.annotation.SuppressLint
 import android.content.Intent
 import com.google.firebase.messaging.FirebaseMessagingService
 import com.google.firebase.messaging.RemoteMessage
@@ -8,6 +9,7 @@ import dev.zamad.callrelay.relay.RelayPreferences
 import dev.zamad.callrelay.relay.RelayRuntime
 
 class RelayMessagingService : FirebaseMessagingService() {
+    @SuppressLint("MissingFirebaseInstanceTokenRefresh")
     override fun onRegistered(installationId: String) {
         val preferences = RelayPreferences(this)
         preferences.fcmToken = installationId
@@ -19,6 +21,18 @@ class RelayMessagingService : FirebaseMessagingService() {
     override fun onMessageReceived(message: RemoteMessage) {
         val data = message.data
         val preferences = RelayPreferences(this)
+        if (data["type"] == "entitlement_changed") {
+            preferences.entitlementActive = data["status"] == "active"
+            if (!preferences.entitlementActive && RelayRuntime.snapshot().callId == null) {
+                stopService(Intent(this, RelayReadyService::class.java))
+            }
+            sendBroadcast(Intent(ACTION_ENTITLEMENT_CHANGED).setPackage(packageName))
+            return
+        }
+        if (data["type"] == "pairing_invitation_consumed") {
+            sendBroadcast(Intent(ACTION_PAIRING_CHANGED).setPackage(packageName))
+            return
+        }
         val callId = data["callId"].orEmpty()
         val commandId = data["commandId"] ?: "${data["type"]}:${data["event"]}:$callId"
         if (!preferences.claimRemoteCommand(commandId)) return
@@ -53,5 +67,10 @@ class RelayMessagingService : FirebaseMessagingService() {
                 RelaySyncWorker.enqueueFailure(this, callId, "relay_dispatch_failed")
             }
         }
+    }
+
+    companion object {
+        const val ACTION_PAIRING_CHANGED = "dev.zamad.callrelay.PAIRING_CHANGED"
+        const val ACTION_ENTITLEMENT_CHANGED = "dev.zamad.callrelay.ENTITLEMENT_CHANGED"
     }
 }

@@ -14,8 +14,10 @@ import javax.crypto.spec.GCMParameterSpec
 class SecureSecretStore(context: Context) {
     private val preferences = context.getSharedPreferences(PREFERENCES_NAME, Context.MODE_PRIVATE)
 
-    fun get(): String? {
-        val encoded = preferences.getString(KEY_CIPHERTEXT, null) ?: return null
+    fun get(): String? = get(KEY_CIPHERTEXT)
+
+    fun get(name: String): String? {
+        val encoded = preferences.getString(name, null) ?: return null
         return runCatching {
             val payload = Base64.decode(encoded, Base64.NO_WRAP)
             require(payload.size > IV_BYTES) { "Encrypted pairing secret is invalid" }
@@ -29,16 +31,18 @@ class SecureSecretStore(context: Context) {
         }.getOrNull()
     }
 
-    fun put(value: String) {
+    fun put(value: String) = put(KEY_CIPHERTEXT, value)
+
+    fun put(name: String, value: String) {
         if (value.isBlank()) {
-            preferences.edit().remove(KEY_CIPHERTEXT).apply()
+            preferences.edit().remove(name).apply()
             return
         }
         val cipher = Cipher.getInstance(TRANSFORMATION)
         cipher.init(Cipher.ENCRYPT_MODE, loadOrCreateKey())
         val encrypted = cipher.doFinal(value.encodeToByteArray())
         val payload = cipher.iv + encrypted
-        preferences.edit().putString(KEY_CIPHERTEXT, Base64.encodeToString(payload, Base64.NO_WRAP)).apply()
+        preferences.edit().putString(name, Base64.encodeToString(payload, Base64.NO_WRAP)).apply()
     }
 
     private fun loadOrCreateKey(): SecretKey {

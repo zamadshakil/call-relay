@@ -33,6 +33,18 @@ class RelayApiClient(
 
     data class CreatedCall(val callId: String, val state: String)
 
+    data class PairingInvitation(val invitationId: String, val expiresAt: Long, val pairingUrlBase: String)
+
+    data class PendingPairing(
+        val pairingId: String,
+        val invitationId: String,
+        val peerDeviceId: String,
+        val peerPublicKeyRaw: String,
+        val commitment: String,
+        val peerProof: String,
+        val confirmed: Boolean,
+    )
+
     suspend fun enroll(invite: String, displayName: String, fcmToken: String?): String = withContext(Dispatchers.IO) {
         val body = JSONObject()
             .put("platform", "android")
@@ -73,6 +85,58 @@ class RelayApiClient(
         Unit
     }
 
+    suspend fun createPairingInvitation(invitationId: String, challengeHash: String): PairingInvitation = withContext(Dispatchers.IO) {
+        val response = request(
+            "POST",
+            "/v1/pairing-invitations",
+            JSONObject().put("invitationId", invitationId).put("challengeHash", challengeHash).toString(),
+            attempts = 2,
+        )
+        PairingInvitation(response.getString("invitationId"), response.getLong("expiresAt"), response.getString("pairingUrlBase"))
+    }
+
+    suspend fun currentDevicePairing(): PendingPairing? = withContext(Dispatchers.IO) {
+        val response = request("GET", "/v1/pairings/current-device", "", attempts = 2)
+        if (response.isNull("pairing")) return@withContext null
+        val pairing = response.getJSONObject("pairing")
+        PendingPairing(
+            pairingId = pairing.getString("id"),
+            invitationId = pairing.getString("invitation_id"),
+            peerDeviceId = pairing.getString("peer_device_id"),
+            peerPublicKeyRaw = pairing.getString("peer_public_key_raw"),
+            commitment = pairing.getString("secret_commitment"),
+            peerProof = pairing.getString("peer_proof"),
+            confirmed = !pairing.isNull("confirmed_at"),
+        )
+    }
+
+    suspend fun confirmPairingV2(pairingId: String, commitment: String, proof: String) = withContext(Dispatchers.IO) {
+        request(
+            "POST",
+            "/v1/pairings/$pairingId/confirm",
+            JSONObject().put("commitment", commitment).put("proof", proof).toString(),
+            attempts = 3,
+        )
+        Unit
+    }
+
+    suspend fun updateSimProfile(
+        slotIndex: Int,
+        carrierName: String,
+        countryIso: String,
+        numberSource: String,
+        phoneNumber: String?,
+    ) = withContext(Dispatchers.IO) {
+        val body = JSONObject()
+            .put("slotIndex", slotIndex)
+            .put("carrierName", carrierName)
+            .put("countryIso", countryIso)
+            .put("numberSource", numberSource)
+            .apply { if (phoneNumber != null) put("phoneNumber", phoneNumber) }
+        request("PUT", "/v1/devices/${preferences.deviceId}/sim-profile", body.toString(), attempts = 2)
+        Unit
+    }
+
     suspend fun mediaConfig(callId: String): MediaConfig = withContext(Dispatchers.IO) {
         val response = request("POST", "/v1/calls/$callId/media-config", "{}", attempts = 2)
         check(response.getString("transport") == "webrtc_p2p") { "Worker returned an unsupported media transport" }
@@ -103,11 +167,11 @@ class RelayApiClient(
         SignalTicket(response.getString("ticket"), response.getString("protocol"), response.getLong("expiresAt"))
     }
 
-    suspend fun updatePushToken(fcmToken: String) = withContext(Dispatchers.IO) {
+    suspend fun updatePushToken(fcmInstallationId: String) = withContext(Dispatchers.IO) {
         request(
             "POST",
             "/v1/devices/push-token",
-            JSONObject().put("fcmToken", fcmToken).toString(),
+            JSONObject().put("fcmInstallationId", fcmInstallationId).toString(),
         )
         Unit
     }
@@ -175,7 +239,7 @@ class RelayApiClient(
                 doInput = true
                 setRequestProperty("content-type", "application/json")
                 setRequestProperty("accept", "application/json")
-                setRequestProperty("x-relay-app-version", "android-webrtc-2")
+                setRequestProperty("x-relay-app-version", "android-webrtc-3")
                 extraHeaders.forEach(::setRequestProperty)
                 if (signed) {
                     check(preferences.deviceId.isNotBlank()) { "Android device is not enrolled" }

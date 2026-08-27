@@ -1,13 +1,49 @@
-import QRCode from "qrcode";
+import { BrowserQRCodeReader, type IScannerControls } from "@zxing/browser";
+import { initializePaddle } from "@paddle/paddle-js";
+import { initializeApp } from "firebase/app";
+import {
+  getAuth,
+  getRedirectResult,
+  GoogleAuthProvider,
+  onAuthStateChanged,
+  signInWithPopup,
+  signInWithRedirect,
+  signOut as firebaseSignOut,
+  type User,
+} from "firebase/auth";
+import { assertFirebaseWebConfigured, firebaseConfig } from "./firebase-config";
+import { paddleClientToken, paddleEnvironment } from "./billing-config";
 import { deriveSignalKey, signalMac, verifySignalMac } from "./key-derivation";
+import {
+  base64Url,
+  createPeerProof,
+  derivePairingSecret,
+  fromBase64Url,
+  importPairingProofKey,
+  pairingCommitment,
+  verifyAndroidProofWithKey,
+} from "./pairing-crypto";
 import "./style.css";
 
 interface StoredIdentity {
   deviceId: string;
   publicKeySpki: string;
   pairingId?: string;
-  privateKeyJwk?: JsonWebKey;
-  pairingSecret?: string;
+}
+
+interface AccountSnapshot {
+  account: { uid: string; email: string; displayName: string | null; photoUrl: string | null; approvalStatus: "approved" | "unknown" | "suspended" };
+  subscription: { status: string; plan: "monthly" | "annual" | null; currentPeriodEndsAt: number | null; cancelAtPeriodEnd: boolean; active: boolean };
+  devices: Array<{ id: string; platform: "android" | "browser" | "ios"; displayName: string; online: boolean; sim: { carrierName: string; maskedNumber: string | null } | null }>;
+  pairing: Record<string, unknown> | null;
+}
+
+interface PendingPairingMaterial {
+  invitationId: string;
+  pairingId: string;
+  androidDeviceId: string;
+  peerDeviceId: string;
+  commitment: string;
 }
 
 interface CallView {
@@ -57,15 +93,6 @@ const logElement = element<HTMLPreElement>("log");
 const log = (message: string): void => {
   logElement.textContent = `${new Date().toLocaleTimeString()}  ${message}\n${logElement.textContent ?? ""}`;
 };
-const base64Url = (bytes: Uint8Array): string => {
-  let binary = "";
-  bytes.forEach((byte) => { binary += String.fromCharCode(byte); });
-  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/u, "");
-};
-const fromBase64Url = (value: string): Uint8Array => {
-  const padded = value.replaceAll("-", "+").replaceAll("_", "/").padEnd(Math.ceil(value.length / 4) * 4, "=");
-  return Uint8Array.from(atob(padded), (character) => character.charCodeAt(0));
-};
 const hex = (bytes: Uint8Array): string => Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 const encodePayload = (value: JsonObject): string => base64Url(new TextEncoder().encode(JSON.stringify(value)));
 const decodePayload = (value: string): JsonObject => {
@@ -74,16 +101,30 @@ const decodePayload = (value: string): JsonObject => {
   return parsed as JsonObject;
 };
 
-const identityKey = "call-relay-browser-identity-v1";
-const keyDatabaseName = "call-relay-browser-keys-v1";
+const identityKey = "call-relay-browser-identity-v2";
+const keyDatabaseName = "call-relay-browser-keys-v2";
 const signingKeyName = "device-signing";
+const agreementKeyName = "device-agreement";
 const pairingKeyName = "pairing-hkdf";
+const pairingProofKeyName = "pairing-proof";
+const pendingPairingStorageKey = "call-relay-pending-pairing-v2";
 const signalProtocol = "call-relay.signal.v1";
+const firebaseApp = initializeApp(firebaseConfig);
+const firebaseAuth = getAuth(firebaseApp);
 
 let identity: StoredIdentity | undefined = loadIdentity();
 let signingKey: CryptoKey | undefined;
+let agreementKey: CryptoKey | undefined;
 let pairingKey: CryptoKey | undefined;
-let pairingQrSecret = "";
+let pairingProofKey: CryptoKey | undefined;
+let firebaseUser: User | null = null;
+let account: AccountSnapshot | undefined;
+let scannerControls: IScannerControls | undefined;
+let pendingPairing: PendingPairingMaterial | undefined = loadPendingPairing();
+let accountScreenOpen = false;
+const initialPageParameters = new URLSearchParams(location.search);
+const androidBillingReturn = initialPageParameters.get("return") === "android";
+let checkoutPageActive = initialPageParameters.has("_ptxn");
 let currentCall: CallView | undefined;
 
 let signalSocket: WebSocket | undefined;
@@ -129,6 +170,23 @@ function loadIdentity(): StoredIdentity | undefined {
   } catch {
     return undefined;
   }
+}
+
+function loadPendingPairing(): PendingPairingMaterial | undefined {
+  try {
+    const value: unknown = JSON.parse(localStorage.getItem(pendingPairingStorageKey) ?? "null");
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+    const record = value as Record<string, unknown>;
+    if (["invitationId", "pairingId", "androidDeviceId", "peerDeviceId", "commitment"].some((key) => typeof record[key] !== "string")) return undefined;
+    return value as PendingPairingMaterial;
+  } catch {
+    return undefined;
+  }
+}
+
+function savePendingPairing(): void {
+  if (pendingPairing) localStorage.setItem(pendingPairingStorageKey, JSON.stringify(pendingPairing));
+  else localStorage.removeItem(pendingPairingStorageKey);
 }
 
 function openKeyDatabase(): Promise<IDBDatabase> {
@@ -189,26 +247,16 @@ async function deleteKey(name: string): Promise<void> {
 
 async function initializeKeys(): Promise<void> {
   signingKey = await storedKey(signingKeyName);
+  agreementKey = await storedKey(agreementKeyName);
   pairingKey = await storedKey(pairingKeyName);
-  if (identity?.privateKeyJwk && !signingKey) {
-    signingKey = await crypto.subtle.importKey("jwk", identity.privateKeyJwk, { name: "ECDSA", namedCurve: "P-256" }, false, ["sign"]);
-    await storeKey(signingKeyName, signingKey);
+  pairingProofKey = await storedKey(pairingProofKeyName);
+  if (identity && (!signingKey || !agreementKey)) {
+    identity = undefined;
+    pairingKey = undefined;
+    localStorage.removeItem(identityKey);
+    await Promise.all([deleteKey(signingKeyName), deleteKey(agreementKeyName), deleteKey(pairingKeyName), deleteKey(pairingProofKeyName)]);
   }
-  if (identity?.pairingSecret && !pairingKey) {
-    const secret = fromBase64Url(identity.pairingSecret);
-    if (secret.byteLength === 32) {
-      pairingQrSecret = identity.pairingSecret;
-      pairingKey = await crypto.subtle.importKey("raw", secret.buffer as ArrayBuffer, "HKDF", false, ["deriveKey"]);
-      await storeKey(pairingKeyName, pairingKey);
-    }
-  }
-  if (identity) {
-    delete identity.privateKeyJwk;
-    delete identity.pairingSecret;
-    saveIdentity();
-  } else {
-    render();
-  }
+  render();
 }
 
 const keysReady = initializeKeys().catch((error) => {
@@ -222,27 +270,91 @@ function saveIdentity(): void {
   render();
 }
 
+const screenIds = ["loadingScreen", "signInScreen", "approvalScreen", "plansScreen", "paymentScreen", "pairScreen", "homeScreen", "accountScreen"] as const;
+
+function showScreen(id: typeof screenIds[number]): void {
+  for (const screenId of screenIds) element<HTMLElement>(screenId).hidden = screenId !== id;
+}
+
 function render(): void {
-  element<HTMLOutputElement>("identity").value = identity ? `Device: ${identity.deviceId}` : "Not enrolled";
-  element<HTMLOutputElement>("pairing").value = identity?.pairingId
-    ? `Pairing: ${identity.pairingId}${pairingQrSecret ? " — scan the QR now" : " — key secured"}`
-    : "Not paired";
-  const canvas = element<HTMLCanvasElement>("pairingQr");
-  if (identity?.pairingId && pairingQrSecret) {
-    const parameters = new URLSearchParams({ pairingId: identity.pairingId, secret: pairingQrSecret });
-    canvas.hidden = false;
-    void QRCode.toCanvas(canvas, `callrelay://pair?${parameters.toString()}`, { width: 240, margin: 2 });
-  } else {
-    canvas.hidden = true;
+  if (checkoutPageActive) {
+    showScreen("paymentScreen");
+    return;
   }
+  if (accountScreenOpen && firebaseUser && account) {
+    showScreen("accountScreen");
+    renderAccountDetails();
+    return;
+  }
+  if (!firebaseUser) return showScreen("signInScreen");
+  if (!account) return showScreen("loadingScreen");
+  if (account.account.approvalStatus !== "approved") {
+    showScreen("approvalScreen");
+    const suspended = account.account.approvalStatus === "suspended";
+    element("approvalTitle").textContent = suspended ? "This account is suspended" : "This account is not approved";
+    element("approvalMessage").textContent = suspended
+      ? "Calling and device access are disabled. Contact support if you believe this is a mistake."
+      : "Call Relay is currently invite-only. Ask support to approve this Google account.";
+    return;
+  }
+  if (!account.subscription.active) {
+    if (location.pathname === "/billing/complete" || account.subscription.status === "pending") showScreen("paymentScreen");
+    else showScreen("plansScreen");
+    return;
+  }
+  const pairingId = typeof account.pairing?.id === "string" ? account.pairing.id : undefined;
+  const pairingConfirmed = typeof account.pairing?.confirmed_at === "number";
+  if (!identity || !pairingId || !pairingConfirmed || !pairingKey) {
+    showScreen("pairScreen");
+    return;
+  }
+  identity.pairingId = pairingId;
+  saveIdentityWithoutRender();
+  showScreen("homeScreen");
+  const android = account.devices.find((device) => device.platform === "android");
+  element("accountEmail").textContent = account.account.email;
+  element("planSummary").textContent = `${account.subscription.plan === "annual" ? "Annual" : "Monthly"} plan${account.subscription.currentPeriodEndsAt ? ` · renews ${new Date(account.subscription.currentPeriodEndsAt).toLocaleDateString()}` : ""}`;
+  element("androidName").textContent = android?.displayName ?? "Android relay";
+  element<HTMLOutputElement>("presence").value = android?.online ? "Android online" : "Android offline";
+}
+
+function saveIdentityWithoutRender(): void {
+  if (identity) localStorage.setItem(identityKey, JSON.stringify(identity));
+  else localStorage.removeItem(identityKey);
+}
+
+function renderAccountDetails(): void {
+  if (!account) return;
+  const android = account.devices.find((device) => device.platform === "android");
+  const values: Array<[string, string]> = [
+    ["Google account", account.account.email],
+    ["Plan", account.subscription.plan === "annual" ? "Annual" : account.subscription.plan === "monthly" ? "Monthly" : account.subscription.status],
+    ["Android", android?.displayName ?? "Not registered"],
+    ["SIM", android?.sim ? `${android.sim.carrierName}${android.sim.maskedNumber ? ` · ${android.sim.maskedNumber}` : ""}` : "Not configured"],
+    ["Peer", account.pairing ? "Paired" : "Not paired"],
+  ];
+  element("accountDetails").replaceChildren(...values.map(([label, value]) => {
+    const row = document.createElement("div");
+    const name = document.createElement("span");
+    const content = document.createElement("strong");
+    name.textContent = label;
+    content.textContent = value;
+    row.appendChild(name);
+    row.appendChild(content);
+    return row;
+  }));
 }
 
 function apiUrl(path: string): string {
-  const configured = element<HTMLInputElement>("apiBase").value.trim().replace(/\/$/u, "");
-  if (!configured) return path;
-  const url = new URL(configured);
-  if (url.origin !== location.origin || (url.pathname !== "" && url.pathname !== "/")) throw new Error("API base must be this console's own origin");
-  return `${url.origin}${path}`;
+  return path;
+}
+
+async function bearerFetch(path: string, init: RequestInit = {}): Promise<Response> {
+  if (!firebaseUser) throw new Error("sign in with Google first");
+  const headers = new Headers(init.headers);
+  headers.set("authorization", `Bearer ${await firebaseUser.getIdToken()}`);
+  if (typeof init.body === "string") headers.set("content-type", "application/json");
+  return fetch(apiUrl(path), { ...init, headers });
 }
 
 async function signedFetch(path: string, init: RequestInit = {}): Promise<Response> {
@@ -272,6 +384,314 @@ async function responseJson(response: Response): Promise<JsonObject> {
   const data = value as JsonObject;
   if (!response.ok) throw new Error(typeof data.error === "string" ? data.error : `request failed (${response.status})`);
   return data;
+}
+
+function parseAccountSnapshot(value: JsonObject): AccountSnapshot {
+  if (typeof value.account !== "object" || value.account === null || Array.isArray(value.account)) throw new Error("server returned an invalid account");
+  if (typeof value.subscription !== "object" || value.subscription === null || Array.isArray(value.subscription)) throw new Error("server returned an invalid subscription");
+  if (!Array.isArray(value.devices)) throw new Error("server returned invalid devices");
+  return value as unknown as AccountSnapshot;
+}
+
+async function refreshAccount(checkRevocation = false): Promise<AccountSnapshot> {
+  const path = checkRevocation ? "/v1/auth/session" : "/v1/me";
+  const snapshot = parseAccountSnapshot(await responseJson(await bearerFetch(path, { method: checkRevocation ? "POST" : "GET" })));
+  account = snapshot;
+  render();
+  return snapshot;
+}
+
+async function clearLocalDevice(): Promise<void> {
+  deliberatelyDisconnected = true;
+  signalSocket?.close(1000, "device identity reset");
+  closeMedia();
+  identity = undefined;
+  signingKey = undefined;
+  agreementKey = undefined;
+  pairingKey = undefined;
+  pairingProofKey = undefined;
+  pendingPairing = undefined;
+  savePendingPairing();
+  saveIdentityWithoutRender();
+  await Promise.all([deleteKey(signingKeyName), deleteKey(agreementKeyName), deleteKey(pairingKeyName), deleteKey(pairingProofKeyName)]);
+}
+
+async function ensureBrowserRegistration(replaceExisting = false): Promise<void> {
+  await keysReady;
+  if (!firebaseUser || !account?.subscription.active) return;
+  const serverOwnsLocalDevice = identity && account.devices.some((device) => device.id === identity?.deviceId && (device.platform === "browser" || device.platform === "ios"));
+  if (serverOwnsLocalDevice && signingKey && agreementKey) return;
+  if (identity || signingKey || agreementKey) await clearLocalDevice();
+  const signing = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, false, ["sign", "verify"]);
+  const agreement = await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, false, ["deriveBits"]);
+  const publicKeySpki = base64Url(new Uint8Array(await crypto.subtle.exportKey("spki", signing.publicKey)));
+  const agreementPublicKeyRaw = base64Url(new Uint8Array(await crypto.subtle.exportKey("raw", agreement.publicKey)));
+  const response = await bearerFetch("/v1/devices/register", {
+    method: "POST",
+    body: JSON.stringify({
+      platform: "browser",
+      displayName: "iPhone browser",
+      publicKeySpki,
+      agreementPublicKeyRaw,
+      appVersion: 2,
+      replaceExisting,
+    }),
+  });
+  if (response.status === 409 && !replaceExisting) {
+    element<HTMLButtonElement>("replacePeer").hidden = false;
+    throw new Error("This account already has a peer. Choose Replace previously paired browser to continue.");
+  }
+  const data = await responseJson(response);
+  signingKey = signing.privateKey;
+  agreementKey = agreement.privateKey;
+  await Promise.all([storeKey(signingKeyName, signingKey), storeKey(agreementKeyName, agreementKey)]);
+  identity = { deviceId: requiredString(data.deviceId, "deviceId"), publicKeySpki };
+  saveIdentityWithoutRender();
+  await refreshAccount();
+}
+
+async function bootstrapAuthenticatedUser(user: User): Promise<void> {
+  firebaseUser = user;
+  showScreen("loadingScreen");
+  const snapshot = await refreshAccount(true);
+  if (snapshot.account.approvalStatus === "approved" && snapshot.subscription.active) {
+    await ensureBrowserRegistration(false).catch((error) => {
+      log(String(error));
+      render();
+    });
+  }
+  await resumePairingFromUrl();
+  render();
+  if (identity?.pairingId && pairingKey) await connectSignal();
+  if (location.pathname === "/billing/complete" && !snapshot.subscription.active) startPaymentPolling();
+  if (snapshot.account.approvalStatus === "approved" && !snapshot.subscription.active && snapshot.subscription.status !== "pending") {
+    await loadPlans().catch((error) => log(`Pricing unavailable: ${String(error)}`));
+  }
+  startAccountRefresh();
+}
+
+let plansLoading = false;
+let paymentTimer: number | undefined;
+let pairingTimer: number | undefined;
+let accountRefreshTimer: number | undefined;
+
+function startAccountRefresh(): void {
+  if (accountRefreshTimer !== undefined) window.clearInterval(accountRefreshTimer);
+  accountRefreshTimer = window.setInterval(() => {
+    if (!firebaseUser || document.visibilityState !== "visible") return;
+    void refreshAccount().catch((error) => log(`Account refresh failed: ${String(error)}`));
+  }, 30_000);
+}
+
+async function loadPlans(): Promise<void> {
+  if (plansLoading || !firebaseUser) return;
+  plansLoading = true;
+  const container = element("planCards");
+  container.textContent = "Loading localized prices…";
+  try {
+    const data = await responseJson(await bearerFetch("/v1/billing/plans"));
+    if (!Array.isArray(data.plans)) throw new Error("server returned invalid plans");
+    const plans = data.plans.filter((plan): plan is { code: "monthly" | "annual"; formattedPrice: string; minorAmount: number } =>
+      typeof plan === "object" && plan !== null && !Array.isArray(plan) &&
+      ((plan as JsonObject).code === "monthly" || (plan as JsonObject).code === "annual") &&
+      typeof (plan as JsonObject).formattedPrice === "string" && typeof (plan as JsonObject).minorAmount === "number");
+    const monthly = plans.find((plan) => plan.code === "monthly");
+    const annual = plans.find((plan) => plan.code === "annual");
+    if (!monthly || !annual) throw new Error("both plans are unavailable");
+    const saving = monthly.minorAmount > 0 ? Math.max(0, Math.round((1 - annual.minorAmount / (monthly.minorAmount * 12)) * 100)) : 0;
+    container.replaceChildren(...plans.map((plan) => {
+      const card = document.createElement("article");
+      const title = document.createElement("h3");
+      const price = document.createElement("strong");
+      const note = document.createElement("p");
+      const button = document.createElement("button");
+      title.textContent = plan.code === "annual" ? "Annual" : "Monthly";
+      if (plan.code === "annual" && saving > 0) {
+        const badge = document.createElement("span");
+        badge.className = "plan-badge";
+        badge.textContent = `Save ${saving}%`;
+        title.appendChild(badge);
+      }
+      price.textContent = plan.formattedPrice;
+      note.textContent = plan.code === "annual" ? "Billed once per year" : "Billed every month";
+      button.className = "primary";
+      button.textContent = `Choose ${plan.code}`;
+      button.addEventListener("click", () => void beginCheckout(plan.code, button));
+      card.appendChild(title);
+      card.appendChild(price);
+      card.appendChild(note);
+      card.appendChild(button);
+      return card;
+    }));
+  } finally {
+    plansLoading = false;
+  }
+}
+
+async function beginCheckout(plan: "monthly" | "annual", button: HTMLButtonElement): Promise<void> {
+  button.disabled = true;
+  try {
+    const data = await responseJson(await bearerFetch("/v1/billing/checkout", { method: "POST", body: JSON.stringify({ plan }) }));
+    const checkoutUrl = requiredString(data.checkoutUrl, "checkoutUrl");
+    const target = new URL(checkoutUrl);
+    if (target.protocol !== "https:") throw new Error("billing provider returned an unsafe checkout URL");
+    location.assign(target.toString());
+  } catch (error) {
+    button.disabled = false;
+    log(`Checkout failed: ${String(error)}`);
+  }
+}
+
+function startPaymentPolling(): void {
+  if (paymentTimer !== undefined) return;
+  const check = async (): Promise<void> => {
+    try {
+      const snapshot = await refreshAccount();
+      if (snapshot.subscription.active) {
+        if (paymentTimer !== undefined) window.clearInterval(paymentTimer);
+        paymentTimer = undefined;
+        await ensureBrowserRegistration(false);
+        history.replaceState({}, "", "/");
+        render();
+      }
+    } catch (error) {
+      log(`Payment confirmation check failed: ${String(error)}`);
+    }
+  };
+  paymentTimer = window.setInterval(() => void check(), 2_000);
+  void check();
+}
+
+async function initializeHostedCheckout(): Promise<void> {
+  if (!checkoutPageActive) return;
+  if (!paddleClientToken) {
+    checkoutPageActive = false;
+    throw new Error("Paddle.js client token is not configured for this deployment");
+  }
+  await initializePaddle({
+    token: paddleClientToken,
+    environment: paddleEnvironment,
+    eventCallback: (event) => {
+      if (event.name !== "checkout.completed") return;
+      checkoutPageActive = false;
+      history.replaceState({}, "", androidBillingReturn ? "/billing/complete?return=android" : "/billing/complete");
+      element<HTMLAnchorElement>("returnToAndroid").hidden = !androidBillingReturn;
+      showScreen("paymentScreen");
+      if (firebaseUser) startPaymentPolling();
+      if (androidBillingReturn) location.href = "callrelay://billing/complete";
+    },
+  });
+}
+
+function qrParameters(text: string): { invitationId: string; challenge: Uint8Array; androidPublicKey: Uint8Array } {
+  const url = new URL(text);
+  if (url.origin !== location.origin || url.pathname !== "/pair") throw new Error("this QR belongs to another Call Relay deployment");
+  const parameters = new URLSearchParams(url.hash.replace(/^#/u, ""));
+  if (parameters.get("v") !== "2") throw new Error("unsupported pairing QR version");
+  const invitationId = parameters.get("id") ?? "";
+  if (!/^inv_[a-f0-9]{32}$/u.test(invitationId)) throw new Error("pairing invitation is invalid");
+  const challenge = fromBase64Url(parameters.get("c") ?? "");
+  const androidPublicKey = fromBase64Url(parameters.get("k") ?? "");
+  if (challenge.byteLength !== 32 || androidPublicKey.byteLength !== 65) throw new Error("pairing QR key material is invalid");
+  return { invitationId, challenge, androidPublicKey };
+}
+
+async function consumePairingQr(text: string): Promise<void> {
+  if (!identity || !firebaseUser || !account?.subscription.active) throw new Error("finish sign-in and payment first");
+  const { invitationId, challenge, androidPublicKey } = qrParameters(text);
+  scannerControls?.stop();
+  scannerControls = undefined;
+  element("scannerStatus").textContent = "Securing the pairing…";
+  history.replaceState({}, "", "/pair");
+  const ephemeral = await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, false, ["deriveBits"]);
+  const peerPublicKeyRaw = base64Url(new Uint8Array(await crypto.subtle.exportKey("raw", ephemeral.publicKey)));
+  const secret = await derivePairingSecret(ephemeral.privateKey, androidPublicKey, challenge);
+  const commitment = await pairingCommitment(secret);
+  const proof = await createPeerProof(secret, invitationId, identity.deviceId, peerPublicKeyRaw, commitment);
+  const challengeHash = base64Url(new Uint8Array(await crypto.subtle.digest("SHA-256", challenge.buffer as ArrayBuffer)));
+  const response = await responseJson(await bearerFetch(`/v1/pairing-invitations/${invitationId}/consume`, {
+    method: "POST",
+    body: JSON.stringify({ peerDeviceId: identity.deviceId, challengeHash, peerPublicKeyRaw, commitment, proof }),
+  }));
+  const pairingId = requiredString(response.pairingId, "pairingId");
+  const android = account.devices.find((device) => device.platform === "android");
+  if (!android) throw new Error("the Android relay is not registered");
+  pairingKey = await crypto.subtle.importKey("raw", secret.buffer as ArrayBuffer, "HKDF", false, ["deriveKey"]);
+  pairingProofKey = await importPairingProofKey(secret);
+  await Promise.all([storeKey(pairingKeyName, pairingKey), storeKey(pairingProofKeyName, pairingProofKey)]);
+  pendingPairing = { invitationId, pairingId, androidDeviceId: android.id, peerDeviceId: identity.deviceId, commitment };
+  savePendingPairing();
+  identity.pairingId = pairingId;
+  saveIdentityWithoutRender();
+  secret.fill(0);
+  challenge.fill(0);
+  element("scannerStatus").textContent = "Waiting for Android to confirm…";
+  startPairingPolling();
+}
+
+function startPairingPolling(): void {
+  if (pairingTimer !== undefined) return;
+  let attempts = 0;
+  const check = async (): Promise<void> => {
+    attempts += 1;
+    try {
+      const data = await responseJson(await bearerFetch("/v1/pairings/current"));
+      if (typeof data.pairing !== "object" || data.pairing === null || Array.isArray(data.pairing)) return;
+      const pairing = data.pairing as JsonObject;
+      if (typeof pairing.confirmed_at !== "number" || typeof pairing.android_proof !== "string") return;
+      if (!pendingPairing || !pairingProofKey || pairing.id !== pendingPairing.pairingId) throw new Error("local pairing verification material is unavailable; replace the peer and scan again");
+      const verified = await verifyAndroidProofWithKey(
+        pairingProofKey,
+        pairing.android_proof,
+        pendingPairing.invitationId,
+        pendingPairing.pairingId,
+        pendingPairing.androidDeviceId,
+        pendingPairing.peerDeviceId,
+        pendingPairing.commitment,
+      );
+      if (!verified) throw new Error("Android pairing proof is invalid");
+      if (pairingTimer !== undefined) window.clearInterval(pairingTimer);
+      pairingTimer = undefined;
+      pendingPairing = undefined;
+      savePendingPairing();
+      pairingProofKey = undefined;
+      await deleteKey(pairingProofKeyName);
+      await refreshAccount();
+      render();
+      await connectSignal();
+    } catch (error) {
+      log(`Pairing check failed: ${String(error)}`);
+      if (attempts >= 30) element("scannerStatus").textContent = "Android has not confirmed yet. Keep both apps open or refresh the QR.";
+    }
+  };
+  pairingTimer = window.setInterval(() => void check(), 500);
+  void check();
+}
+
+async function startScanner(): Promise<void> {
+  if (!identity) throw new Error("browser enrollment is not ready");
+  scannerControls?.stop();
+  element("scannerStatus").textContent = "Point the camera at the Android QR";
+  const reader = new BrowserQRCodeReader();
+  scannerControls = await reader.decodeFromVideoDevice(undefined, element<HTMLVideoElement>("qrVideo"), (result, error, controls) => {
+    if (result) {
+      controls.stop();
+      scannerControls = undefined;
+      void consumePairingQr(result.getText()).catch((cause) => {
+        element("scannerStatus").textContent = cause instanceof Error ? cause.message : String(cause);
+      });
+    } else if (error && error.name !== "NotFoundException") {
+      log(`QR scan error: ${String(error)}`);
+    }
+  });
+}
+
+async function resumePairingFromUrl(): Promise<void> {
+  if (location.pathname === "/pair" && location.hash.length > 1 && account?.subscription.active && identity) {
+    await consumePairingQr(location.href);
+    return;
+  }
+  if (pendingPairing && pairingKey && pairingProofKey) startPairingPolling();
 }
 
 function requiredString(value: unknown, name: string): string {
@@ -464,12 +884,15 @@ async function applyCallSnapshot(call: CallView): Promise<void> {
   if (currentCall?.id !== call.id && currentCall && currentCall.created_at > call.created_at) return;
   const changedCall = currentCall?.id !== call.id;
   currentCall = call;
-  element<HTMLInputElement>("callId").value = call.id;
+  const incoming = element("incomingBanner");
+  incoming.hidden = call.direction !== "incoming" || !["ringing_peer", "accepted", "active"].includes(call.state);
+  element("incomingState").textContent = call.state === "ringing_peer" ? "Waiting for you" : call.state === "accepted" ? "Connecting audio" : "Connected";
   if (changedCall) log(`${call.direction === "incoming" ? "Incoming" : "Outgoing"} call session: ${call.id}`);
   if (call.state === "ended" || call.state === "failed") {
     log(`Call ${call.state}`);
     closeMedia();
     currentCall = undefined;
+    incoming.hidden = true;
     return;
   }
   applyPeerMode(call.relay_mode);
@@ -771,58 +1194,17 @@ async function sendEvent(callId: string, type: string, payload?: JsonObject, cod
   }));
 }
 
-element("enroll").addEventListener("click", () => void (async () => {
-  await keysReady;
-  const keys = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, false, ["sign", "verify"]);
-  const spki = new Uint8Array(await crypto.subtle.exportKey("spki", keys.publicKey));
-  const response = await fetch(apiUrl("/v1/devices/enroll"), {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-enrollment-invite": element<HTMLInputElement>("invite").value,
-      "x-relay-app-version": "web-webrtc-1",
-    },
-    body: JSON.stringify({ platform: "browser", displayName: element<HTMLInputElement>("deviceName").value, publicKeySpki: base64Url(spki) }),
-  });
-  const data = await responseJson(response);
-  signingKey = keys.privateKey;
-  pairingKey = undefined;
-  pairingQrSecret = "";
-  await Promise.all([storeKey(signingKeyName, signingKey), deleteKey(pairingKeyName)]);
-  identity = { deviceId: requiredString(data.deviceId, "deviceId"), publicKeySpki: base64Url(spki) };
-  saveIdentity();
-  log("Browser enrolled");
-})().catch((error) => log(`ERROR: ${String(error)}`)));
-
-element("pair").addEventListener("click", () => void (async () => {
-  await keysReady;
-  if (!identity) throw new Error("enroll first");
-  const secret = crypto.getRandomValues(new Uint8Array(32));
-  const commitment = base64Url(new Uint8Array(await crypto.subtle.digest("SHA-256", secret)));
-  const response = await signedFetch("/v1/pairings", {
-    method: "POST",
-    body: JSON.stringify({ peerDeviceId: element<HTMLInputElement>("peerDevice").value.trim(), secretCommitment: commitment }),
-  });
-  const data = await responseJson(response);
-  identity.pairingId = requiredString(data.pairingId, "pairingId");
-  pairingQrSecret = base64Url(secret);
-  pairingKey = await crypto.subtle.importKey("raw", secret.buffer as ArrayBuffer, "HKDF", false, ["deriveKey"]);
-  await storeKey(pairingKeyName, pairingKey);
-  saveIdentity();
-  log("Pairing created. Transfer the QR to Android, then signaling will connect after confirmation.");
-  await connectSignal();
-})().catch((error) => log(`ERROR: ${String(error)}`)));
-
 element("dial").addEventListener("click", () => void (async () => {
   if (!identity?.pairingId) throw new Error("pair first");
   await ensureSignalConnected();
+  const input = element<HTMLInputElement>("phoneNumber").value.trim().replace(/[\s()-]/gu, "").replace(/^00/u, "+");
+  if (!/^\+[1-9][0-9]{7,14}$/u.test(input)) throw new Error("enter a complete international number, for example +923001234567");
   const response = await signedFetch("/v1/calls/outgoing", {
     method: "POST",
-    body: JSON.stringify({ pairingId: identity.pairingId, phoneNumber: element<HTMLInputElement>("phoneNumber").value.trim(), requestId: crypto.randomUUID() }),
+    body: JSON.stringify({ pairingId: identity.pairingId, phoneNumber: input, requestId: crypto.randomUUID() }),
   });
   const data = await responseJson(response);
   const callId = requiredString(data.callId, "callId");
-  element<HTMLInputElement>("callId").value = callId;
   const callData = await responseJson(await signedFetch(`/v1/calls/${callId}`));
   const call = callView(callData.call);
   if (!call) throw new Error("server returned an invalid call");
@@ -832,7 +1214,8 @@ element("dial").addEventListener("click", () => void (async () => {
 
 document.querySelectorAll<HTMLButtonElement>("[data-event]").forEach((button) => {
   button.addEventListener("click", () => void (async () => {
-    const callId = element<HTMLInputElement>("callId").value.trim();
+    const callId = currentCall?.id ?? mediaCallId;
+    if (!callId) throw new Error("there is no active call");
     const event = button.dataset.event;
     if (!event) throw new Error("button event is missing");
     if (event === "accept") {
@@ -851,26 +1234,95 @@ document.querySelectorAll<HTMLButtonElement>("[data-event]").forEach((button) =>
 
 for (const [id, muted] of [["mute", true], ["unmute", false]] as const) {
   element(id).addEventListener("click", () => void (async () => {
-    await sendEvent(element<HTMLInputElement>("callId").value.trim(), "mute", { muted });
+    const callId = currentCall?.id ?? mediaCallId;
+    if (!callId) throw new Error("there is no active call");
+    await sendEvent(callId, "mute", { muted });
     log(muted ? "Android relay microphone muted" : "Android relay microphone unmuted");
   })().catch((error) => log(`ERROR: ${String(error)}`)));
 }
 
 element("sendDtmf").addEventListener("click", () => void (async () => {
   const digit = element<HTMLInputElement>("dtmf").value.trim();
-  await sendEvent(element<HTMLInputElement>("callId").value.trim(), "dtmf", { digit });
+  const callId = currentCall?.id ?? mediaCallId;
+  if (!callId) throw new Error("there is no active call");
+  await sendEvent(callId, "dtmf", { digit });
   log(`Sent DTMF ${digit}`);
 })().catch((error) => log(`ERROR: ${String(error)}`)));
 
-element("join").addEventListener("click", () => void (async () => {
-  await ensureSignalConnected();
-  await ensurePeerConnection(element<HTMLInputElement>("callId").value.trim());
-})().catch((error) => log(`ERROR: ${String(error)}`)));
-element("leave").addEventListener("click", () => closeMedia());
+element("googleSignIn").addEventListener("click", () => void (async () => {
+  assertFirebaseWebConfigured();
+  const provider = new GoogleAuthProvider();
+  provider.setCustomParameters({ prompt: "select_account" });
+  try {
+    await signInWithPopup(firebaseAuth, provider);
+  } catch (error) {
+    const code = typeof error === "object" && error !== null && "code" in error ? String(error.code) : "";
+    if (code === "auth/popup-blocked" || code === "auth/operation-not-supported-in-this-environment") {
+      await signInWithRedirect(firebaseAuth, provider);
+      return;
+    }
+    throw error;
+  }
+})().catch((error) => {
+  showScreen("signInScreen");
+  log(`Google sign-in failed: ${String(error)}`);
+}));
+
+async function performSignOut(revoke = true): Promise<void> {
+  scannerControls?.stop();
+  scannerControls = undefined;
+  if (paymentTimer !== undefined) window.clearInterval(paymentTimer);
+  if (pairingTimer !== undefined) window.clearInterval(pairingTimer);
+  if (accountRefreshTimer !== undefined) window.clearInterval(accountRefreshTimer);
+  paymentTimer = pairingTimer = undefined;
+  accountRefreshTimer = undefined;
+  if (revoke && identity && firebaseUser) {
+    await responseJson(await bearerFetch(`/v1/devices/${identity.deviceId}/revoke`, { method: "POST", body: "{}" })).catch(() => undefined);
+  }
+  await clearLocalDevice();
+  account = undefined;
+  accountScreenOpen = false;
+  await firebaseSignOut(firebaseAuth);
+  firebaseUser = null;
+  render();
+}
+
+element("approvalSignOut").addEventListener("click", () => void performSignOut(false));
+element("signOut").addEventListener("click", () => void performSignOut(true));
+element("scanQr").addEventListener("click", () => void startScanner().catch((error) => {
+  element("scannerStatus").textContent = error instanceof Error ? error.message : String(error);
+}));
+element("replacePeer").addEventListener("click", () => void ensureBrowserRegistration(true).then(() => {
+  element<HTMLButtonElement>("replacePeer").hidden = true;
+  render();
+}).catch((error) => log(`Peer replacement failed: ${String(error)}`)));
+element("refreshPayment").addEventListener("click", () => startPaymentPolling());
+element<HTMLAnchorElement>("returnToAndroid").hidden = !androidBillingReturn;
+element("accountMenu").addEventListener("click", () => { accountScreenOpen = true; render(); });
+element("closeAccount").addEventListener("click", () => { accountScreenOpen = false; render(); });
+element("managePlan").addEventListener("click", () => void (async () => {
+  const data = await responseJson(await bearerFetch("/v1/billing/portal", { method: "POST", body: "{}" }));
+  const portalUrl = new URL(requiredString(data.portalUrl, "portalUrl"));
+  if (portalUrl.protocol !== "https:") throw new Error("billing portal URL is unsafe");
+  location.assign(portalUrl.toString());
+})().catch((error) => log(`Billing portal failed: ${String(error)}`)));
+element("startReplacePeer").addEventListener("click", () => void (async () => {
+  if (identity) await responseJson(await bearerFetch(`/v1/devices/${identity.deviceId}/revoke`, { method: "POST", body: "{}" }));
+  await clearLocalDevice();
+  accountScreenOpen = false;
+  await refreshAccount();
+  await ensureBrowserRegistration(false);
+  render();
+})().catch((error) => log(`Peer replacement failed: ${String(error)}`)));
 
 window.addEventListener("online", () => {
   void connectSignal();
   if (peerConnection && peerConnection.connectionState !== "connected") void requestRelayRestart("network_online");
+});
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && firebaseUser) {
+    void refreshAccount().catch((error) => log(`Account refresh failed: ${String(error)}`));
+  }
 });
 window.addEventListener("beforeunload", () => {
   deliberatelyDisconnected = true;
@@ -879,4 +1331,21 @@ window.addEventListener("beforeunload", () => {
 });
 
 render();
-void keysReady.then(() => connectSignal()).catch((error) => log(`Signaling unavailable: ${String(error)}`));
+void initializeHostedCheckout().catch((error) => log(`Checkout initialization failed: ${String(error)}`));
+if (androidBillingReturn && !checkoutPageActive) window.setTimeout(() => { location.href = "callrelay://billing/complete"; }, 250);
+void getRedirectResult(firebaseAuth).catch((error) => log(`Google redirect failed: ${String(error)}`));
+onAuthStateChanged(firebaseAuth, (user) => {
+  if (!user) {
+    if (accountRefreshTimer !== undefined) window.clearInterval(accountRefreshTimer);
+    accountRefreshTimer = undefined;
+    firebaseUser = null;
+    account = undefined;
+    render();
+    return;
+  }
+  void bootstrapAuthenticatedUser(user).catch((error) => {
+    log(`Session setup failed: ${String(error)}`);
+    render();
+  });
+});
+if ("serviceWorker" in navigator) void navigator.serviceWorker.register("/sw.js").catch((error) => log(`Offline shell unavailable: ${String(error)}`));

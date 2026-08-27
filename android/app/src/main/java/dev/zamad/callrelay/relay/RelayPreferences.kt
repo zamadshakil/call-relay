@@ -67,6 +67,18 @@ class RelayPreferences(context: Context) {
         get() = preferences.getString(KEY_PHONE_ACCOUNT, "") ?: ""
         set(value) = preferences.edit().putString(KEY_PHONE_ACCOUNT, value).apply()
 
+    var simProfileUploaded: Boolean
+        get() = preferences.getBoolean(KEY_SIM_PROFILE_UPLOADED, false)
+        set(value) = preferences.edit().putBoolean(KEY_SIM_PROFILE_UPLOADED, value).apply()
+
+    var accountEmail: String
+        get() = preferences.getString(KEY_ACCOUNT_EMAIL, "") ?: ""
+        set(value) = preferences.edit().putString(KEY_ACCOUNT_EMAIL, value).apply()
+
+    var entitlementActive: Boolean
+        get() = preferences.getBoolean(KEY_ENTITLEMENT_ACTIVE, true)
+        set(value) = preferences.edit().putBoolean(KEY_ENTITLEMENT_ACTIVE, value).apply()
+
     var captureGain: Float
         get() = preferences.getFloat(KEY_CAPTURE_GAIN, 1.0f)
         set(value) = preferences.edit().putFloat(KEY_CAPTURE_GAIN, value.coerceIn(0f, 4f)).apply()
@@ -114,6 +126,9 @@ class RelayPreferences(context: Context) {
         private const val KEY_PAIRING_SECRET = "pairing_secret"
         private const val KEY_PAIRING_CONFIRMED = "pairing_confirmed"
         private const val KEY_PHONE_ACCOUNT = "phone_account"
+        private const val KEY_SIM_PROFILE_UPLOADED = "sim_profile_uploaded"
+        private const val KEY_ACCOUNT_EMAIL = "account_email"
+        private const val KEY_ENTITLEMENT_ACTIVE = "entitlement_active"
         private const val KEY_CAPTURE_GAIN = "capture_gain"
         private const val KEY_PLAYBACK_GAIN = "playback_gain"
         private const val KEY_REMOTE_COMMANDS = "remote_commands"

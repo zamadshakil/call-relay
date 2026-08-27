@@ -1,0 +1,10 @@
+{
+  "name": "Call Relay",
+  "short_name": "Call Relay",
+  "description": "Use your Android SIM through your paired iPhone browser.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#06110f",
+  "theme_color": "#071a17",
+  "icons": [{ "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }]
+}

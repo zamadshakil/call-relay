@@ -12,7 +12,15 @@ pnpm test
 pnpm dev
 ```
 
-Required encrypted production secrets are `CF_TURN_KEY_ID`, `CF_TURN_API_TOKEN`, `SIGNAL_TICKET_SECRET`, `ENROLLMENT_INVITE`, `FCM_CLIENT_EMAIL`, and `FCM_PRIVATE_KEY`. `FCM_PROJECT_ID` is a non-secret Worker variable.
+Required encrypted production secrets are `CF_TURN_KEY_ID`, `CF_TURN_API_TOKEN`, `SIGNAL_TICKET_SECRET`, `FCM_CLIENT_EMAIL`, `FCM_PRIVATE_KEY`, `PADDLE_API_KEY`, `PADDLE_WEBHOOK_SECRET`, and `SIM_PROFILE_ENCRYPTION_KEY`. `ENROLLMENT_INVITE` remains only until legacy staging is disabled. Firebase project, Paddle environment, and monthly/annual price IDs are non-secret Worker variables; the public Firebase/Paddle browser tokens are Vite environment values.
+
+## Consumer APIs
+
+- `POST /v1/auth/session`, `GET /v1/me`
+- `GET /v1/billing/plans`, `POST /v1/billing/checkout`, `POST /v1/billing/portal`
+- `POST /v1/billing/webhooks/paddle`
+- `POST /v1/devices/register`, `PUT /v1/devices/{id}/sim-profile`, `POST /v1/devices/{id}/revoke`
+- `POST /v1/pairing-invitations`, `POST /v1/pairing-invitations/{id}/consume`, `GET /v1/pairings/current`
 
 ## Media and signaling API
 
@@ -25,4 +33,4 @@ The signaling Durable Object carries call snapshots, SDP offers/answers, ICE can
 
 `POST /v1/calls/{id}/token` is permanently disabled with `410 Gone`.
 
-See [DEPLOYMENT_GUIDE](../docs/DEPLOYMENT_GUIDE.md) for staging and cutover.
+See [ONBOARDING_V2_DEPLOYMENT](../docs/ONBOARDING_V2_DEPLOYMENT.md) for Firebase, Paddle, staging, and cutover.

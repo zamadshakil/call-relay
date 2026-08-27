@@ -14,6 +14,9 @@ export default defineConfig(async () => {
     SIGNAL_TICKET_SECRET: "integration-signal-ticket-secret-with-32-bytes",
     FCM_CLIENT_EMAIL: "test@example.invalid",
     FCM_PRIVATE_KEY: fcmPrivateKey,
+    PADDLE_API_KEY: "pdl_test_integration",
+    PADDLE_WEBHOOK_SECRET: "pdl_ntfset_integration",
+    SIM_PROFILE_ENCRYPTION_KEY: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
   };
   Object.assign(process.env, testSecrets);
 
@@ -26,6 +29,13 @@ export default defineConfig(async () => {
             TEST_MIGRATIONS: migrations,
             ...testSecrets,
             FCM_PROJECT_ID: "integration-project",
+            FIREBASE_PROJECT_ID: "integration-project",
+            ONBOARDING_V2_ENABLED: "false",
+            MIN_ANDROID_APP_VERSION: "2",
+            PUBLIC_APP_URL: "https://relay.test",
+            PADDLE_ENVIRONMENT: "sandbox",
+            PADDLE_MONTHLY_PRICE_ID: "pri_01h000000000000000000000000",
+            PADDLE_ANNUAL_PRICE_ID: "pri_01h111111111111111111111111",
           },
         },
       }),

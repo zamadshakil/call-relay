@@ -2,7 +2,7 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "call-relay",
   "main": "src/index.ts",
-  "compatibility_date": "2026-08-26",
+  "compatibility_date": "2026-08-27",
   "compatibility_flags": ["nodejs_compat"],
   "secrets": {
     "required": [
@@ -11,7 +11,10 @@
       "SIGNAL_TICKET_SECRET",
       "ENROLLMENT_INVITE",
       "FCM_CLIENT_EMAIL",
-      "FCM_PRIVATE_KEY"
+      "FCM_PRIVATE_KEY",
+      "PADDLE_API_KEY",
+      "PADDLE_WEBHOOK_SECRET",
+      "SIM_PROFILE_ENCRYPTION_KEY"
     ]
   },
   "observability": {
@@ -74,7 +77,14 @@
     "crons": ["* * * * *"]
   },
   "vars": {
-    "FCM_PROJECT_ID": "call-relay-3dec7"
+    "FCM_PROJECT_ID": "call-relay-3dec7",
+    "FIREBASE_PROJECT_ID": "call-relay-3dec7",
+    "ONBOARDING_V2_ENABLED": "false",
+    "MIN_ANDROID_APP_VERSION": "2",
+    "PUBLIC_APP_URL": "https://call-relay.zamadshakil.workers.dev",
+    "PADDLE_ENVIRONMENT": "production",
+    "PADDLE_MONTHLY_PRICE_ID": "replace-me",
+    "PADDLE_ANNUAL_PRICE_ID": "replace-me"
   },
   "env": {
     "staging": {
@@ -86,7 +96,10 @@
           "SIGNAL_TICKET_SECRET",
           "ENROLLMENT_INVITE",
           "FCM_CLIENT_EMAIL",
-          "FCM_PRIVATE_KEY"
+          "FCM_PRIVATE_KEY",
+          "PADDLE_API_KEY",
+          "PADDLE_WEBHOOK_SECRET",
+          "SIM_PROFILE_ENCRYPTION_KEY"
         ]
       },
       "d1_databases": [
@@ -123,7 +136,14 @@
         ]
       },
       "vars": {
-        "FCM_PROJECT_ID": "call-relay-3dec7"
+        "FCM_PROJECT_ID": "call-relay-3dec7",
+        "FIREBASE_PROJECT_ID": "call-relay-3dec7",
+        "ONBOARDING_V2_ENABLED": "false",
+        "MIN_ANDROID_APP_VERSION": "2",
+        "PUBLIC_APP_URL": "https://call-relay-staging.zamadshakil.workers.dev",
+        "PADDLE_ENVIRONMENT": "sandbox",
+        "PADDLE_MONTHLY_PRICE_ID": "replace-me",
+        "PADDLE_ANNUAL_PRICE_ID": "replace-me"
       }
     }
   }

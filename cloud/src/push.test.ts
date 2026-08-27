@@ -6,12 +6,15 @@ import type { Env } from "./types";
 describe("FCM delivery", () => {
   afterEach(() => vi.unstubAllGlobals());
 
-  it("targets the current Firebase Installation ID field", async () => {
-    const deviceId = `dev_${"a".repeat(32)}`;
+  it.each([
+    ["fid", "f"],
+    ["token", "t"],
+  ] as const)("targets Android using the stored FCM %s field", async (targetKind, idCharacter) => {
+    const deviceId = `dev_${idCharacter.repeat(32)}`;
     const now = Date.now();
     await env.CALL_RELAY_DB.prepare(
-      "INSERT INTO devices(id, platform, display_name, public_key_spki, fcm_token, created_at, last_seen_at) VALUES (?, 'android', 'test', 'test', ?, ?, ?)",
-    ).bind(deviceId, "test-installation-id", now, now).run();
+      "INSERT INTO devices(id, platform, display_name, public_key_spki, fcm_token, fcm_target_kind, created_at, last_seen_at) VALUES (?, 'android', 'test', 'test', ?, ?, ?, ?)",
+    ).bind(deviceId, "test-installation-id", targetKind, now, now).run();
 
     const requestUrls: string[] = [];
     let sentMessage: unknown;
@@ -28,11 +31,9 @@ describe("FCM delivery", () => {
     await deliverPush(env as unknown as Env, { targetDeviceId: deviceId, data: { type: "outgoing_call" } });
 
     expect(requestUrls).toHaveLength(2);
-    expect(sentMessage).toMatchObject({
-      message: {
-        fid: "test-installation-id",
-        data: { type: "outgoing_call" },
-      },
-    });
+    expect(sentMessage).toMatchObject({ message: {
+      [targetKind]: "test-installation-id",
+      data: { type: "outgoing_call" },
+    } });
   });
 });

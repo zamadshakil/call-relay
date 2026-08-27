@@ -1,4 +1,14 @@
 import { authenticate } from "./auth";
+import { requireDeviceEntitlement } from "./entitlement";
+import { authSession, me, registerDevice, revokeDevice, updateSimProfile } from "./onboarding";
+import { billingPlans, createCheckout, createPortal, paddleWebhook } from "./paddle";
+import {
+  confirmPairingV2,
+  consumePairingInvitation,
+  createPairingInvitation,
+  currentPairingForAccount,
+  pendingPairingForDevice,
+} from "./pairing-v2";
 import { HttpError, fromBase64Url, json, readBodyBytes, readJson, requireString, timingSafeEqualText } from "./http";
 import { dispatchOutboxItem, drainOutbox } from "./outbox";
 import { PairingSignal } from "./pairing-signal";
@@ -21,13 +31,15 @@ const EVENT_TYPES = new Set<EventType>([
 ]);
 const MODE_EVENTS = new Set<EventType>(["full_duplex", "listen", "talk"]);
 const MEDIA_EVENTS = new Set<EventType>(["media_connecting", "media_connected", "media_path_changed", "media_restarting", "media_summary"]);
-const MIN_ANDROID_APP_VERSION = 2;
+const LEGACY_MIN_ANDROID_APP_VERSION = 2;
 
-function assertSupportedAndroidVersion(request: Request): void {
+function assertSupportedAndroidVersion(request: Request, env: Env): void {
   const value = request.headers.get("x-relay-app-version") ?? "";
   const match = /^android-webrtc-(\d+)$/u.exec(value);
-  if (!match || Number(match[1]) < MIN_ANDROID_APP_VERSION) {
-    throw new HttpError(426, `Android app version android-webrtc-${MIN_ANDROID_APP_VERSION} or newer is required`);
+  const configured = Number(env.MIN_ANDROID_APP_VERSION);
+  const minimum = Number.isSafeInteger(configured) && configured >= LEGACY_MIN_ANDROID_APP_VERSION ? configured : LEGACY_MIN_ANDROID_APP_VERSION;
+  if (!match || Number(match[1]) < minimum) {
+    throw new HttpError(426, `Android app version android-webrtc-${minimum} or newer is required`);
   }
 }
 
@@ -97,7 +109,7 @@ async function enroll(request: Request, env: Env): Promise<Response> {
   const body = await readJson<JsonObject>(request);
   const platform = requireString(body.platform, "platform") as Platform;
   if (!["android", "browser", "ios"].includes(platform)) throw new HttpError(400, "platform is invalid");
-  if (platform === "android") assertSupportedAndroidVersion(request);
+  if (platform === "android") assertSupportedAndroidVersion(request, env);
   const displayName = requireString(body.displayName, "displayName", 80).trim();
   if (!displayName) throw new HttpError(400, "displayName is invalid");
   const publicKeySpki = requireString(body.publicKeySpki, "publicKeySpki", 512);
@@ -163,6 +175,8 @@ async function confirmPairing(request: Request, env: Env, device: DeviceRow, pai
   const pairing = await env.CALL_RELAY_DB.prepare("SELECT * FROM pairings WHERE id = ? AND revoked_at IS NULL")
     .bind(pairingId).first<PairingRow>();
   if (!pairing || (pairing.device_a_id !== device.id && pairing.device_b_id !== device.id)) throw new HttpError(404, "pairing not found");
+  if (pairing.protocol_version === 2) return confirmPairingV2(request, env, device, pairing);
+  if (env.ONBOARDING_V2_ENABLED === "true") throw new HttpError(410, "legacy secret pairing has been removed");
   if (pairing.created_by_device_id === device.id) throw new HttpError(403, "the creator cannot confirm its own pairing");
   const body = await readJson<JsonObject>(request);
   const commitment = requireString(body.secretCommitment, "secretCommitment", 64);
@@ -439,7 +453,8 @@ async function openSignalSocket(request: Request, env: Env, pairingId: string): 
   const pairing = await getPairing(env, pairingId);
   if (pairing.confirmed_at === null) throw new HttpError(409, "pairing is not confirmed");
   const device = await env.CALL_RELAY_DB.prepare(
-    "SELECT id, platform, display_name, public_key_spki, fcm_token, revoked_at FROM devices WHERE id = ? AND revoked_at IS NULL",
+    `SELECT id, platform, display_name, public_key_spki, fcm_token, fcm_target_kind, revoked_at, user_id,
+      agreement_public_key_raw, app_version FROM devices WHERE id = ? AND revoked_at IS NULL`,
   ).bind(ticket.deviceId).first<DeviceRow>();
   if (!device || signalRole(pairing, device) !== ticket.role) throw new HttpError(403, "signaling ticket identity is invalid");
   const headers = new Headers(request.headers);
@@ -453,10 +468,27 @@ async function openSignalSocket(request: Request, env: Env, pairingId: string): 
 
 async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const url = new URL(request.url);
-  if (request.method === "POST" && url.pathname === "/v1/devices/enroll") return enroll(request, env);
+  if (request.method === "POST" && url.pathname === "/v1/billing/webhooks/paddle") return paddleWebhook(request, env, ctx);
+  if (request.method === "POST" && url.pathname === "/v1/auth/session") return authSession(request, env);
+  if (request.method === "GET" && url.pathname === "/v1/me") return me(request, env);
+  if (request.method === "GET" && url.pathname === "/v1/billing/plans") return billingPlans(request, env);
+  if (request.method === "POST" && url.pathname === "/v1/billing/checkout") return createCheckout(request, env);
+  if (request.method === "POST" && url.pathname === "/v1/billing/portal") return createPortal(request, env);
+  if (request.method === "POST" && url.pathname === "/v1/devices/register") return registerDevice(request, env);
+  if (request.method === "GET" && url.pathname === "/v1/pairings/current") return currentPairingForAccount(request, env);
+  const consumeInvitationMatch = /^\/v1\/pairing-invitations\/(inv_[a-f0-9]{32})\/consume$/u.exec(url.pathname);
+  if (request.method === "POST" && consumeInvitationMatch) {
+    return consumePairingInvitation(request, env, ctx, consumeInvitationMatch[1] ?? "");
+  }
+  const revokeDeviceMatch = /^\/v1\/devices\/(dev_[a-f0-9]{32})\/revoke$/u.exec(url.pathname);
+  if (request.method === "POST" && revokeDeviceMatch) return revokeDevice(request, env, revokeDeviceMatch[1] ?? "");
+  if (request.method === "POST" && url.pathname === "/v1/devices/enroll") {
+    if (env.ONBOARDING_V2_ENABLED === "true") return json({ error: "manual enrollment has been removed; sign in with Google" }, { status: 410 });
+    return enroll(request, env);
+  }
   const body = request.method === "GET" || request.method === "HEAD" ? new Uint8Array() : await readBodyBytes(request.clone());
   const device = await authenticate(request, env, body);
-  if (device.platform === "android") assertSupportedAndroidVersion(request);
+  if (device.platform === "android") assertSupportedAndroidVersion(request, env);
   if (request.method === "GET" && url.pathname === "/v1/calls/current") {
     const call = await env.CALL_RELAY_DB.prepare(
       "SELECT * FROM call_sessions WHERE (android_device_id = ? OR peer_device_id = ?) AND state NOT IN ('ended', 'failed') ORDER BY created_at DESC LIMIT 1",
@@ -466,18 +498,48 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
   if (request.method === "POST" && url.pathname === "/v1/devices/push-token") {
     if (device.platform !== "android") throw new HttpError(403, "push tokens are only accepted for Android");
     const tokenBody = await readJson<JsonObject>(request);
-    const fcmToken = requireString(tokenBody.fcmToken, "fcmToken", 4096);
-    await env.CALL_RELAY_DB.prepare("UPDATE devices SET fcm_token = ?, last_seen_at = ? WHERE id = ?")
-      .bind(fcmToken, Date.now(), device.id).run();
+    const fcmTarget = requireString(tokenBody.fcmInstallationId ?? tokenBody.fcmToken, "fcmInstallationId", 4096);
+    const targetKind = typeof tokenBody.fcmInstallationId === "string" ? "fid" : "token";
+    await env.CALL_RELAY_DB.prepare("UPDATE devices SET fcm_token = ?, fcm_target_kind = ?, last_seen_at = ? WHERE id = ?")
+      .bind(fcmTarget, targetKind, Date.now(), device.id).run();
     return json({ updated: true });
   }
-  if (request.method === "POST" && url.pathname === "/v1/pairings") return pair(request, env, device);
+  const simProfileMatch = /^\/v1\/devices\/(dev_[a-f0-9]{32})\/sim-profile$/u.exec(url.pathname);
+  if (request.method === "PUT" && simProfileMatch) {
+    if (simProfileMatch[1] !== device.id) throw new HttpError(403, "a device may update only its own SIM profile");
+    await requireDeviceEntitlement(env, device);
+    return updateSimProfile(request, env, device);
+  }
+  if (request.method === "POST" && url.pathname === "/v1/pairing-invitations") {
+    await requireDeviceEntitlement(env, device);
+    return createPairingInvitation(request, env, device);
+  }
+  if (request.method === "GET" && url.pathname === "/v1/pairings/current-device") {
+    await requireDeviceEntitlement(env, device);
+    return pendingPairingForDevice(env, device);
+  }
+  if (request.method === "POST" && url.pathname === "/v1/pairings") {
+    if (env.ONBOARDING_V2_ENABLED === "true") throw new HttpError(410, "legacy secret pairing has been removed");
+    return pair(request, env, device);
+  }
   const pairingMatch = /^\/v1\/pairings\/(pair_[a-f0-9]{32})\/confirm$/u.exec(url.pathname);
-  if (request.method === "POST" && pairingMatch) return confirmPairing(request, env, device, pairingMatch[1] ?? "");
+  if (request.method === "POST" && pairingMatch) {
+    if (env.ONBOARDING_V2_ENABLED === "true") await requireDeviceEntitlement(env, device);
+    return confirmPairing(request, env, device, pairingMatch[1] ?? "");
+  }
   const signalTicketMatch = /^\/v1\/pairings\/(pair_[a-f0-9]{32})\/signal-ticket$/u.exec(url.pathname);
-  if (request.method === "POST" && signalTicketMatch) return issueSignalTicket(env, device, signalTicketMatch[1] ?? "");
-  if (request.method === "POST" && url.pathname === "/v1/calls/incoming") return createCall(request, env, ctx, device, "incoming");
-  if (request.method === "POST" && url.pathname === "/v1/calls/outgoing") return createCall(request, env, ctx, device, "outgoing");
+  if (request.method === "POST" && signalTicketMatch) {
+    await requireDeviceEntitlement(env, device);
+    return issueSignalTicket(env, device, signalTicketMatch[1] ?? "");
+  }
+  if (request.method === "POST" && url.pathname === "/v1/calls/incoming") {
+    await requireDeviceEntitlement(env, device);
+    return createCall(request, env, ctx, device, "incoming");
+  }
+  if (request.method === "POST" && url.pathname === "/v1/calls/outgoing") {
+    await requireDeviceEntitlement(env, device);
+    return createCall(request, env, ctx, device, "outgoing");
+  }
   const match = /^\/v1\/calls\/(call_[a-f0-9]{32})(?:\/(token|media-config|events))?$/u.exec(url.pathname);
   if (!match) throw new HttpError(404, "endpoint not found");
   const call = await getCall(env, match[1] ?? "");
@@ -486,15 +548,18 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
     return json({ call });
   }
   if (request.method === "POST" && match[2] === "token") return json({ error: "participant media tokens were removed; update the client" }, { status: 410 });
-  if (request.method === "POST" && match[2] === "media-config") return callMediaConfig(env, call, device);
+  if (request.method === "POST" && match[2] === "media-config") {
+    await requireDeviceEntitlement(env, device);
+    return callMediaConfig(env, call, device);
+  }
   if (request.method === "POST" && match[2] === "events") return appendEvent(request, env, ctx, call, device);
   throw new HttpError(405, "method not allowed");
 }
 
 function secureAssetResponse(response: Response): Response {
   const headers = new Headers(response.headers);
-  headers.set("content-security-policy", "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self' https: wss:; media-src 'self' blob:; worker-src 'self' blob:; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'");
-  headers.set("permissions-policy", "camera=(), microphone=(self), geolocation=()");
+  headers.set("content-security-policy", "default-src 'self'; script-src 'self' https://cdn.paddle.com; style-src 'self' 'unsafe-inline' https://cdn.paddle.com; connect-src 'self' https: wss:; media-src 'self' blob:; worker-src 'self' blob:; img-src 'self' data: https:; frame-src 'self' https://accounts.google.com https://*.firebaseapp.com https://*.paddle.com https://*.paddle.dev; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self' https://accounts.google.com");
+  headers.set("permissions-policy", "camera=(self), microphone=(self), geolocation=()");
   headers.set("referrer-policy", "no-referrer");
   headers.set("x-frame-options", "DENY");
   headers.set("x-content-type-options", "nosniff");
@@ -557,11 +622,14 @@ export default {
     await revokeDueTurnCredentials(env);
     const purgeBefore = now - 24 * 60 * 60 * 1000;
     const nonceBefore = now - 10 * 60 * 1000;
+    const billingEventBefore = now - 180 * 24 * 60 * 60 * 1000;
     await env.CALL_RELAY_DB.batch([
       env.CALL_RELAY_DB.prepare("DELETE FROM request_nonces WHERE created_at < ?").bind(nonceBefore),
       env.CALL_RELAY_DB.prepare("DELETE FROM push_outbox WHERE created_at < ?").bind(purgeBefore),
       env.CALL_RELAY_DB.prepare("DELETE FROM call_events WHERE call_id IN (SELECT id FROM call_sessions WHERE updated_at < ?)").bind(purgeBefore),
       env.CALL_RELAY_DB.prepare("DELETE FROM call_sessions WHERE updated_at < ?").bind(purgeBefore),
+      env.CALL_RELAY_DB.prepare("DELETE FROM pairing_invitations WHERE pairing_id IS NULL AND expires_at < ?").bind(purgeBefore),
+      env.CALL_RELAY_DB.prepare("DELETE FROM billing_webhook_events WHERE processed_at < ?").bind(billingEventBefore),
     ]);
   },
 } satisfies ExportedHandler<Env, PushJob>;

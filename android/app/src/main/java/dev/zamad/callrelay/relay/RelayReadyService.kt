@@ -286,6 +286,10 @@ class RelayReadyService : Service() {
             runCatching { api.event(callId, "media_summary", payload = summary) }
             runCatching { api.event(callId, "end") }
         }
+        if (!preferences.entitlementActive) {
+            disarm()
+            return
+        }
         updateNotification("Ready for one paired peer")
     }
 

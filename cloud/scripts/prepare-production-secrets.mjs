@@ -39,23 +39,30 @@ async function savedOrGenerated(path, label) {
 
 const firebasePath = resolve(required(option("--firebase"), "--firebase path"));
 const turnPath = resolve(required(option("--turn"), "--turn path"));
+const paddlePath = resolve(required(option("--paddle"), "--paddle path"));
 const outputPath = resolve(option("--output") ?? ".secrets.production.json");
 const invitePath = resolve(option("--invite-output") ?? ".enrollment-invite.txt");
 const signalPath = resolve(option("--signal-secret-output") ?? ".signal-ticket-secret.txt");
+const simKeyPath = resolve(option("--sim-secret-output") ?? ".sim-profile-encryption-key.txt");
+const includeEnrollmentInvite = !process.argv.includes("--omit-enrollment-invite");
 const firebase = JSON.parse(await readFile(firebasePath, "utf8"));
 const turn = parseValues(await readFile(turnPath, "utf8"));
+const paddle = parseValues(await readFile(paddlePath, "utf8"));
 
 const secrets = {
   CF_TURN_KEY_ID: required(turn.get("CF_TURN_KEY_ID"), "CF_TURN_KEY_ID"),
   CF_TURN_API_TOKEN: required(turn.get("CF_TURN_API_TOKEN"), "CF_TURN_API_TOKEN"),
   SIGNAL_TICKET_SECRET: await savedOrGenerated(signalPath, "signaling ticket secret"),
-  ENROLLMENT_INVITE: await savedOrGenerated(invitePath, "enrollment invite"),
+  ...(includeEnrollmentInvite ? { ENROLLMENT_INVITE: await savedOrGenerated(invitePath, "enrollment invite") } : {}),
   FCM_CLIENT_EMAIL: required(firebase.client_email, "Firebase client_email"),
   FCM_PRIVATE_KEY: required(firebase.private_key, "Firebase private_key"),
+  PADDLE_API_KEY: required(paddle.get("PADDLE_API_KEY"), "PADDLE_API_KEY"),
+  PADDLE_WEBHOOK_SECRET: required(paddle.get("PADDLE_WEBHOOK_SECRET"), "PADDLE_WEBHOOK_SECRET"),
+  SIM_PROFILE_ENCRYPTION_KEY: await savedOrGenerated(simKeyPath, "SIM profile encryption key"),
 };
 
 await writePrivate(outputPath, `${JSON.stringify(secrets, null, 2)}\n`);
 process.stdout.write(
   `Prepared ${outputPath} with ${Object.keys(secrets).length} secret names; no values were printed.\n` +
-  `Saved reusable enrollment and signaling secrets in ignored local files. FCM_PROJECT_ID=${required(firebase.project_id, "Firebase project_id")}.\n`,
+  `Saved reusable ${includeEnrollmentInvite ? "enrollment, " : ""}signaling, and SIM encryption secrets in ignored local files. FCM_PROJECT_ID=${required(firebase.project_id, "Firebase project_id")}.\n`,
 );

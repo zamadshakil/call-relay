@@ -6,6 +6,16 @@ declare namespace Cloudflare {
     SIGNAL_TICKET_SECRET: string;
     FCM_CLIENT_EMAIL: string;
     FCM_PRIVATE_KEY: string;
+    FIREBASE_PROJECT_ID: string;
+    ONBOARDING_V2_ENABLED: string;
+    MIN_ANDROID_APP_VERSION: string;
+    PUBLIC_APP_URL: string;
+    PADDLE_ENVIRONMENT: string;
+    PADDLE_MONTHLY_PRICE_ID: string;
+    PADDLE_ANNUAL_PRICE_ID: string;
+    PADDLE_API_KEY: string;
+    PADDLE_WEBHOOK_SECRET: string;
+    SIM_PROFILE_ENCRYPTION_KEY: string;
     TEST_MIGRATIONS: D1Migration[];
   }
 }

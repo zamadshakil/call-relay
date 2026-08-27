@@ -4,6 +4,9 @@ export type Platform = "android" | "browser" | "ios";
 export type Direction = "incoming" | "outgoing";
 export type RelayMode = "full_duplex" | "listen" | "talk";
 export type SignalRole = "android" | "peer";
+export type ApprovalStatus = "approved" | "unknown" | "suspended";
+export type SubscriptionStatus = "none" | "pending" | "active" | "past_due" | "paused" | "canceled" | "refunded" | "disputed";
+export type PlanCode = "monthly" | "annual";
 export type CallState =
   | "created"
   | "ringing_peer"
@@ -22,6 +25,16 @@ export type Env = Omit<Cloudflare.Env, "PUSH_QUEUE"> & {
   ENROLLMENT_INVITE: SecretValue;
   FCM_CLIENT_EMAIL?: SecretValue;
   FCM_PRIVATE_KEY?: SecretValue;
+  FIREBASE_PROJECT_ID: string;
+  ONBOARDING_V2_ENABLED: string;
+  MIN_ANDROID_APP_VERSION: string;
+  PUBLIC_APP_URL: string;
+  PADDLE_ENVIRONMENT: "sandbox" | "production";
+  PADDLE_MONTHLY_PRICE_ID: string;
+  PADDLE_ANNUAL_PRICE_ID: string;
+  PADDLE_API_KEY?: SecretValue;
+  PADDLE_WEBHOOK_SECRET?: SecretValue;
+  SIM_PROFILE_ENCRYPTION_KEY?: SecretValue;
 };
 
 export interface PushJob {
@@ -35,7 +48,41 @@ export interface DeviceRow {
   display_name: string;
   public_key_spki: string;
   fcm_token: string | null;
+  fcm_target_kind: "token" | "fid";
   revoked_at: number | null;
+  user_id: string | null;
+  agreement_public_key_raw: string | null;
+  app_version: number;
+}
+
+export interface FirebaseIdentity {
+  uid: string;
+  email: string;
+  emailVerified: true;
+  displayName: string | null;
+  photoUrl: string | null;
+  issuedAt: number;
+  authTime: number;
+}
+
+export interface AccountContext {
+  identity: FirebaseIdentity;
+  approvalStatus: ApprovalStatus;
+  subscription: SubscriptionRow | null;
+}
+
+export interface SubscriptionRow {
+  user_id: string;
+  paddle_customer_id: string | null;
+  paddle_subscription_id: string | null;
+  plan_code: PlanCode | null;
+  status: SubscriptionStatus;
+  current_period_ends_at: number | null;
+  cancel_at_period_end: number;
+  latest_transaction_id: string | null;
+  source_occurred_at: number;
+  created_at: number;
+  updated_at: number;
 }
 
 export interface CallRow {
@@ -88,6 +135,11 @@ export interface PairingRow {
   confirmed_by_device_id: string | null;
   confirmed_at: number | null;
   revoked_at: number | null;
+  protocol_version: 1 | 2;
+  user_id: string | null;
+  invitation_id: string | null;
+  peer_proof: string | null;
+  android_proof: string | null;
 }
 
 export interface PushOutboxRow {
