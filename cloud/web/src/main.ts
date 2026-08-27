@@ -570,6 +570,15 @@ async function ensureBrowserRegistration(replaceExisting = false): Promise<void>
   await refreshAccount();
 }
 
+async function ensureCurrentBrowserEnrollment(): Promise<AccountSnapshot> {
+  if (!firebaseUser || !account?.subscription.active) throw new Error("finish sign-in and account approval first");
+  await refreshAccount();
+  await ensureBrowserRegistration(false);
+  if (!identity || !signingKey || !agreementKey) throw new Error("browser enrollment could not be restored");
+  if (!account) throw new Error("account state could not be restored");
+  return account;
+}
+
 async function bootstrapAuthenticatedUser(user: User): Promise<void> {
   firebaseUser = user;
   startupError = undefined;
@@ -744,7 +753,8 @@ function qrParameters(text: string): { invitationId: string; challenge: Uint8Arr
 }
 
 async function consumePairingQr(text: string): Promise<void> {
-  if (!identity || !firebaseUser || !account?.subscription.active) throw new Error("finish sign-in and account approval first");
+  const currentAccount = await ensureCurrentBrowserEnrollment();
+  if (!identity) throw new Error("browser enrollment could not be restored");
   const { invitationId, challenge, androidPublicKey } = qrParameters(text);
   scannerControls?.stop();
   scannerControls = undefined;
@@ -761,7 +771,7 @@ async function consumePairingQr(text: string): Promise<void> {
     body: JSON.stringify({ peerDeviceId: identity.deviceId, challengeHash, peerPublicKeyRaw, commitment, proof }),
   }));
   const pairingId = requiredString(response.pairingId, "pairingId");
-  const android = account.devices.find((device) => device.platform === "android");
+  const android = currentAccount.devices.find((device) => device.platform === "android");
   if (!android) throw new Error("the Android relay is not registered");
   pairingKey = await crypto.subtle.importKey("raw", secret.buffer as ArrayBuffer, "HKDF", false, ["deriveKey"]);
   pairingProofKey = await importPairingProofKey(secret);
@@ -816,6 +826,7 @@ function startPairingPolling(): void {
 }
 
 async function startScanner(): Promise<void> {
+  await ensureCurrentBrowserEnrollment();
   if (!identity) throw new Error("browser enrollment is not ready");
   scannerControls?.stop();
   element("scannerStatus").textContent = "Point the camera at the Android QR";
@@ -834,7 +845,7 @@ async function startScanner(): Promise<void> {
 }
 
 async function resumePairingFromUrl(): Promise<void> {
-  if (location.pathname === "/pair" && location.hash.length > 1 && account?.subscription.active && identity) {
+  if (location.pathname === "/pair" && location.hash.length > 1 && account?.subscription.active) {
     await consumePairingQr(location.href);
     return;
   }
