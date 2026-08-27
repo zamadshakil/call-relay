@@ -40,12 +40,13 @@ async function waitForOperation(name, authorization) {
 const serviceAccountPath = resolve(required(option("--service-account"), "--service-account path"));
 const androidOutput = resolve(option("--android-output") ?? "../android/app/google-services.json");
 const webOutput = resolve(option("--web-output") ?? ".env.staging");
-const webAuthDomain = option("--auth-domain") ?? "call-relay-staging.zamadshakil.workers.dev";
+const webAuthDomainOverride = option("--auth-domain");
 const packageName = option("--package") ?? "dev.zamad.callrelay";
 const sha1 = required(option("--sha1"), "--sha1");
 const sha256 = required(option("--sha256"), "--sha256");
 const serviceAccount = JSON.parse(await readFile(serviceAccountPath, "utf8"));
 const projectId = required(serviceAccount.project_id, "Firebase project_id");
+const webAuthDomain = webAuthDomainOverride ?? `${projectId}.firebaseapp.com`;
 const clientEmail = required(serviceAccount.client_email, "Firebase client_email");
 const tokenUri = required(serviceAccount.token_uri, "Firebase token_uri");
 const privateKey = await importPKCS8(required(serviceAccount.private_key, "Firebase private_key"), "RS256");

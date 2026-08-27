@@ -23,7 +23,7 @@ In Firebase project `call-relay-3dec7`:
 
    ```dotenv
    VITE_FIREBASE_API_KEY=...
-   VITE_FIREBASE_AUTH_DOMAIN=call-relay-staging.zamadshakil.workers.dev
+   VITE_FIREBASE_AUTH_DOMAIN=call-relay-3dec7.firebaseapp.com
    VITE_FIREBASE_PROJECT_ID=call-relay-3dec7
    VITE_FIREBASE_WEB_APP_ID=...
    VITE_FIREBASE_MESSAGING_SENDER_ID=90866288123
@@ -31,7 +31,7 @@ In Firebase project `call-relay-3dec7`:
    VITE_PADDLE_ENVIRONMENT=sandbox
    ```
 
-6. In **Google Cloud Console → Google Auth Platform → Clients**, open the Web OAuth client used by Firebase Google sign-in and add these exact values:
+6. The Firebase-hosted auth domain above works with the handler URI Firebase registers automatically. To later enable the same-origin Worker auth proxy for stricter Safari redirect compatibility, first open **Google Cloud Console → Google Auth Platform → Clients**, open the Web OAuth client used by Firebase Google sign-in, and add these exact values:
 
    Authorized JavaScript origins:
 
@@ -47,7 +47,7 @@ In Firebase project `call-relay-3dec7`:
    https://call-relay.zamadshakil.workers.dev/__/auth/handler
    ```
 
-   Keep the existing Firebase Hosting handler URI. The Worker transparently proxies `/__/auth/*` to `call-relay-3dec7.firebaseapp.com`; the same-origin `authDomain` is required for redirect sign-in on browsers that block third-party storage, including current Safari and Chrome.
+   Keep the existing Firebase Hosting handler URI. Only after saving those entries, change `VITE_FIREBASE_AUTH_DOMAIN` to `call-relay-staging.zamadshakil.workers.dev`. The Worker then transparently proxies `/__/auth/*` to `call-relay-3dec7.firebaseapp.com`. Until the OAuth entry exists, keep the Firebase-hosted domain or Google will reject sign-in with `redirect_uri_mismatch`.
 7. In Firebase Authentication settings, keep both Worker hostnames in **Authorized domains**.
 
 The Worker verifies Firebase JWT signature, algorithm, issuer, audience, expiry, UID, `email_verified`, disabled status, and revocation time. The Firebase service-account JSON remains local and ignored by Git.
