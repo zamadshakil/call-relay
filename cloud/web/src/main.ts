@@ -127,6 +127,7 @@ let pairingKey: CryptoKey | undefined;
 let pairingProofKey: CryptoKey | undefined;
 let firebaseUser: User | null = null;
 let account: AccountSnapshot | undefined;
+let startupError: string | undefined;
 let scannerControls: IScannerControls | undefined;
 let pendingPairing: PendingPairingMaterial | undefined = loadPendingPairing();
 let accountScreenOpen = false;
@@ -295,6 +296,14 @@ function render(): void {
     return;
   }
   if (!firebaseUser) return showScreen("signInScreen");
+  if (startupError) {
+    showScreen("approvalScreen");
+    element("approvalTitle").textContent = "Could not restore this browser session";
+    element("approvalMessage").textContent = startupError;
+    element<HTMLButtonElement>("sessionRetry").hidden = false;
+    element<HTMLAnchorElement>("approvalContact").hidden = true;
+    return;
+  }
   if (!account) return showScreen("loadingScreen");
   if (account.account.approvalStatus !== "approved") {
     showScreen("approvalScreen");
@@ -303,6 +312,8 @@ function render(): void {
     element("approvalMessage").textContent = suspended
       ? "Calling and device access are disabled. Contact support if you believe this is a mistake."
       : "Call Relay is currently invite-only. Ask support to approve this Google account.";
+    element<HTMLButtonElement>("sessionRetry").hidden = true;
+    element<HTMLAnchorElement>("approvalContact").hidden = false;
     return;
   }
   if (!account.subscription.active) {
@@ -408,7 +419,13 @@ function parseAccountSnapshot(value: JsonObject): AccountSnapshot {
 
 async function refreshAccount(checkRevocation = false): Promise<AccountSnapshot> {
   const path = checkRevocation ? "/v1/auth/session" : "/v1/me";
-  const snapshot = parseAccountSnapshot(await responseJson(await bearerFetch(path, { method: checkRevocation ? "POST" : "GET" })));
+  const init: RequestInit = { method: checkRevocation ? "POST" : "GET" };
+  let response = await bearerFetch(path, init);
+  if (checkRevocation && response.status === 401 && firebaseUser) {
+    await firebaseUser.getIdToken(true);
+    response = await bearerFetch(path, init);
+  }
+  const snapshot = parseAccountSnapshot(await responseJson(response));
   account = snapshot;
   render();
   return snapshot;
@@ -465,8 +482,13 @@ async function ensureBrowserRegistration(replaceExisting = false): Promise<void>
 
 async function bootstrapAuthenticatedUser(user: User): Promise<void> {
   firebaseUser = user;
+  startupError = undefined;
   showScreen("loadingScreen");
-  const snapshot = await refreshAccount(true);
+  const snapshot = await withTimeout(
+    refreshAccount(true),
+    15_000,
+    "The secure-session request timed out. Check the connection and retry, or use another Google account.",
+  );
   if (snapshot.account.approvalStatus === "approved" && snapshot.subscription.active) {
     await ensureBrowserRegistration(false).catch((error) => {
       log(String(error));
@@ -481,6 +503,27 @@ async function bootstrapAuthenticatedUser(user: User): Promise<void> {
     await loadPlans().catch((error) => log(`Pricing unavailable: ${String(error)}`));
   }
   startAccountRefresh();
+}
+
+async function withTimeout<T>(promise: Promise<T>, milliseconds: number, message: string): Promise<T> {
+  let timeout: number | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timeout = window.setTimeout(() => reject(new Error(message)), milliseconds);
+      }),
+    ]);
+  } finally {
+    if (timeout !== undefined) window.clearTimeout(timeout);
+  }
+}
+
+function showStartupError(error: unknown): void {
+  const message = error instanceof Error ? error.message : String(error);
+  startupError = message || "The secure session could not be restored. Retry or use another Google account.";
+  log(`Session setup failed: ${message}`);
+  render();
 }
 
 let plansLoading = false;
@@ -1301,6 +1344,12 @@ async function performSignOut(revoke = true): Promise<void> {
 }
 
 element("approvalSignOut").addEventListener("click", () => void performSignOut(false));
+element("sessionRetry").addEventListener("click", () => {
+  if (!firebaseUser) return render();
+  startupError = undefined;
+  showScreen("loadingScreen");
+  void bootstrapAuthenticatedUser(firebaseUser).catch(showStartupError);
+});
 element("signOut").addEventListener("click", () => void performSignOut(true));
 element("scanQr").addEventListener("click", () => void startScanner().catch((error) => {
   element("scannerStatus").textContent = error instanceof Error ? error.message : String(error);
@@ -1353,12 +1402,10 @@ onAuthStateChanged(firebaseAuth, (user) => {
     accountRefreshTimer = undefined;
     firebaseUser = null;
     account = undefined;
+    startupError = undefined;
     render();
     return;
   }
-  void bootstrapAuthenticatedUser(user).catch((error) => {
-    log(`Session setup failed: ${String(error)}`);
-    render();
-  });
+  void bootstrapAuthenticatedUser(user).catch(showStartupError);
 });
 if ("serviceWorker" in navigator) void navigator.serviceWorker.register("/sw.js").catch((error) => log(`Offline shell unavailable: ${String(error)}`));

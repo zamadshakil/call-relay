@@ -1,4 +1,4 @@
-const CACHE = "call-relay-shell-v2";
+const CACHE = "call-relay-shell-v3";
 self.addEventListener("install", (event) => {
   event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(["/", "/manifest.webmanifest", "/icon.svg"])));
   self.skipWaiting();
