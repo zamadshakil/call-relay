@@ -28,7 +28,12 @@ describe("FCM delivery", () => {
       return Response.json({ name: "projects/integration-project/messages/test" });
     });
 
-    await deliverPush(env as unknown as Env, { targetDeviceId: deviceId, data: { type: "outgoing_call" } });
+    await deliverPush(env as unknown as Env, {
+      outboxId: `push_${"a".repeat(32)}`,
+      channel: "android_fcm",
+      targetDeviceId: deviceId,
+      data: { type: "outgoing_call" },
+    });
 
     expect(requestUrls).toHaveLength(2);
     expect(sentMessage).toMatchObject({ message: {

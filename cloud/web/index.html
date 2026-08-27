@@ -68,12 +68,14 @@
           <div><span class="label">ANDROID RELAY</span><strong id="androidName">Android relay</strong><span id="presence">Android offline</span></div>
           <div class="route"><span id="signal">Connecting…</span><span id="media">No active call</span></div>
         </article>
+        <button id="enableNotifications" class="secondary">Enable incoming call notifications</button>
+        <p id="notificationStatus" class="privacy">Keep this PWA open, or enable notifications for background incoming calls.</p>
         <article class="call-card">
           <label for="phoneNumber">Call from Android SIM</label><input id="phoneNumber" inputmode="tel" autocomplete="tel" placeholder="+92 300 1234567" />
           <button id="dial" class="primary call-button">Call</button>
           <div id="incomingBanner" class="incoming" hidden><strong>Incoming SIM call</strong><span id="incomingState">Waiting for you</span></div>
           <div class="controls">
-            <button data-event="accept" class="success">Accept</button><button data-event="reject" class="danger">Reject</button><button data-event="end" class="danger">End</button>
+            <button id="acceptCall" data-event="accept" class="success">Accept</button><button data-event="reject" class="danger">Reject</button><button data-event="end" class="danger">End</button>
             <button id="mute" class="secondary">Mute my mic</button><button id="unmute" class="secondary">Unmute my mic</button>
           </div>
           <details><summary>More call controls</summary>

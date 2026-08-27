@@ -65,6 +65,9 @@ interface CallView {
   relay_mode: "full_duplex" | "listen" | "talk";
   version: number;
   created_at: number;
+  peer_accepted_at?: number | null;
+  telecom_answer_requested_at?: number | null;
+  sim_active_at?: number | null;
 }
 
 interface IceServerConfig {
@@ -160,6 +163,9 @@ let signalSequence = 0;
 let reconnectTimer: number | undefined;
 let reconnectAttempts = 0;
 let deliberatelyDisconnected = false;
+let signalHeartbeatTimer: number | undefined;
+let lastSignalPongAt = 0;
+let foregroundRecovery: Promise<void> | undefined;
 const signalKeyCache = new Map<string, CryptoKey>();
 const remoteSequences = new Map<string, number>();
 
@@ -177,6 +183,7 @@ let statsTimer: number | undefined;
 let forceRelayTimer: number | undefined;
 let setupFailureTimer: number | undefined;
 let disconnectRecoveryTimer: number | undefined;
+let offerRecoveryTimer: number | undefined;
 let pendingRemoteCandidates: RTCIceCandidateInit[] = [];
 let remoteIceComplete = false;
 let lastRoute = "";
@@ -427,6 +434,72 @@ async function responseJson(response: Response): Promise<JsonObject> {
   return data;
 }
 
+function pushSupported(): boolean {
+  return "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
+}
+
+function setNotificationStatus(message: string, enabled = false): void {
+  element("notificationStatus").textContent = message;
+  const button = element<HTMLButtonElement>("enableNotifications");
+  button.textContent = enabled ? "Incoming notifications enabled" : "Enable incoming call notifications";
+  button.disabled = enabled;
+}
+
+function serializedPushSubscription(subscription: PushSubscription): JsonObject {
+  const value = subscription.toJSON();
+  if (!value.endpoint || !value.keys?.p256dh || !value.keys.auth) throw new Error("browser returned an incomplete push subscription");
+  return {
+    endpoint: value.endpoint,
+    expirationTime: value.expirationTime ?? null,
+    keys: { p256dh: value.keys.p256dh, auth: value.keys.auth },
+  };
+}
+
+async function uploadPushSubscription(subscription: PushSubscription): Promise<void> {
+  if (!identity) return;
+  await responseJson(await signedFetch(`/v1/devices/${identity.deviceId}/web-push-subscription`, {
+    method: "PUT",
+    body: JSON.stringify(serializedPushSubscription(subscription)),
+  }));
+  setNotificationStatus("Background incoming-call notifications are enabled on this device.", true);
+}
+
+async function syncExistingPushSubscription(): Promise<void> {
+  if (!pushSupported() || !identity || !account?.subscription.active) {
+    if (!pushSupported()) setNotificationStatus("Install this site to the iPhone Home Screen to enable background notifications.");
+    return;
+  }
+  const registration = await navigator.serviceWorker.ready;
+  const subscription = await registration.pushManager.getSubscription();
+  if (subscription) await uploadPushSubscription(subscription);
+  else if (Notification.permission === "denied") setNotificationStatus("Notifications are blocked in iPhone Settings.");
+}
+
+async function enableIncomingNotifications(): Promise<void> {
+  if (!pushSupported()) throw new Error("Install Call Relay to the iPhone Home Screen, then open it from the icon and try again");
+  if (!identity) throw new Error("pair this browser first");
+  const permission = await Notification.requestPermission();
+  if (permission !== "granted") throw new Error("notification permission was not granted");
+  const registration = await navigator.serviceWorker.ready;
+  const config = await responseJson(await signedFetch("/v1/push/config"));
+  const vapidPublicKey = requiredString(config.vapidPublicKey, "vapidPublicKey");
+  let subscription = await registration.pushManager.getSubscription();
+  if (!subscription) {
+    subscription = await registration.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: fromBase64Url(vapidPublicKey) as Uint8Array<ArrayBuffer>,
+    });
+  }
+  await uploadPushSubscription(subscription);
+}
+
+async function unsubscribeIncomingNotifications(): Promise<void> {
+  if (!pushSupported()) return;
+  const registration = await navigator.serviceWorker.ready;
+  const subscription = await registration.pushManager.getSubscription();
+  await subscription?.unsubscribe();
+}
+
 function parseAccountSnapshot(value: JsonObject): AccountSnapshot {
   if (typeof value.account !== "object" || value.account === null || Array.isArray(value.account)) throw new Error("server returned an invalid account");
   if (typeof value.subscription !== "object" || value.subscription === null || Array.isArray(value.subscription)) throw new Error("server returned an invalid subscription");
@@ -515,6 +588,7 @@ async function bootstrapAuthenticatedUser(user: User): Promise<void> {
   await resumePairingFromUrl();
   render();
   if (identity?.pairingId && pairingKey) await connectSignal();
+  await syncExistingPushSubscription().catch((error) => log(`Notification subscription sync failed: ${String(error)}`));
   if (location.pathname === "/billing/complete" && !snapshot.subscription.active) startPaymentPolling();
   if (snapshot.account.approvalStatus === "approved" && !snapshot.subscription.active && snapshot.subscription.status !== "pending") {
     await loadPlans().catch((error) => log(`Pricing unavailable: ${String(error)}`));
@@ -848,6 +922,7 @@ async function connectSignal(): Promise<void> {
   if (!identity?.pairingId || !pairingKey) return;
   if (signalSocket?.readyState === WebSocket.OPEN) return;
   if (signalConnection) return signalConnection;
+  if (signalSocket && signalSocket.readyState !== WebSocket.CLOSED) signalSocket.close(4000, "reconnecting");
   deliberatelyDisconnected = false;
   signalConnection = (async () => {
     const ticketResponse = await responseJson(await signedFetch(`/v1/pairings/${identity!.pairingId}/signal-ticket`, { method: "POST", body: "{}" }));
@@ -866,6 +941,7 @@ async function connectSignal(): Promise<void> {
         signalSocket = undefined;
         signalSessionId = "";
         element<HTMLOutputElement>("signal").value = "Disconnected";
+        stopSignalHeartbeat();
         if (!deliberatelyDisconnected) scheduleSignalReconnect();
       }
     };
@@ -874,6 +950,8 @@ async function connectSignal(): Promise<void> {
       socket.onopen = () => {
         window.clearTimeout(timeout);
         reconnectAttempts = 0;
+        lastSignalPongAt = Date.now();
+        startSignalHeartbeat();
         element<HTMLOutputElement>("signal").value = "Connected — authenticating session";
         resolve();
       };
@@ -905,6 +983,40 @@ async function ensureSignalConnected(): Promise<void> {
   });
 }
 
+function stopSignalHeartbeat(): void {
+  if (signalHeartbeatTimer !== undefined) window.clearInterval(signalHeartbeatTimer);
+  signalHeartbeatTimer = undefined;
+}
+
+function startSignalHeartbeat(): void {
+  stopSignalHeartbeat();
+  signalHeartbeatTimer = window.setInterval(() => {
+    const socket = signalSocket;
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    if (lastSignalPongAt > 0 && Date.now() - lastSignalPongAt > 45_000) {
+      socket.close(4002, "heartbeat timeout");
+      return;
+    }
+    socket.send("ping");
+  }, 20_000);
+}
+
+async function recoverForegroundSession(): Promise<void> {
+  if (foregroundRecovery) return foregroundRecovery;
+  foregroundRecovery = (async () => {
+    if (!firebaseUser || !identity?.pairingId || !pairingKey) return;
+    await refreshAccount();
+    await ensureSignalConnected();
+    await recoverCurrentCall();
+    await syncExistingPushSubscription();
+  })();
+  try {
+    await foregroundRecovery;
+  } finally {
+    foregroundRecovery = undefined;
+  }
+}
+
 function scheduleSignalReconnect(): void {
   if (reconnectTimer !== undefined || !identity?.pairingId) return;
   const delay = Math.min(10_000, 500 * 2 ** Math.min(reconnectAttempts++, 5));
@@ -918,6 +1030,10 @@ function scheduleSignalReconnect(): void {
 }
 
 async function handleSignalMessage(message: string): Promise<void> {
+  if (message === "pong") {
+    lastSignalPongAt = Date.now();
+    return;
+  }
   const value: unknown = JSON.parse(message);
   if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("invalid signaling message");
   const record = value as JsonObject;
@@ -947,6 +1063,11 @@ async function recoverCurrentCall(): Promise<void> {
     const data = await responseJson(await signedFetch("/v1/calls/current"));
     const call = callView(data.call);
     if (call) await applyCallSnapshot(call);
+    else if (currentCall) {
+      closeMedia();
+      currentCall = undefined;
+      element("incomingBanner").hidden = true;
+    }
   } catch (error) {
     log(`Call recovery failed: ${String(error)}`);
   }
@@ -959,18 +1080,51 @@ async function applyCallSnapshot(call: CallView): Promise<void> {
   currentCall = call;
   const incoming = element("incomingBanner");
   incoming.hidden = call.direction !== "incoming" || !["ringing_peer", "accepted", "active"].includes(call.state);
-  element("incomingState").textContent = call.state === "ringing_peer" ? "Waiting for you" : call.state === "accepted" ? "Connecting audio" : "Connected";
+  const accepting = element<HTMLButtonElement>("acceptCall");
+  if (call.state === "ringing_peer") {
+    element("incomingState").textContent = "Waiting for you";
+    accepting.disabled = false;
+    accepting.textContent = "Accept";
+  } else if (call.state === "accepted") {
+    element("incomingState").textContent = call.telecom_answer_requested_at ? "Answering Android SIM call" : "Connecting audio";
+    accepting.disabled = true;
+    accepting.textContent = call.telecom_answer_requested_at ? "Answering…" : "Preparing…";
+  } else {
+    element("incomingState").textContent = "Connected";
+    accepting.disabled = true;
+    accepting.textContent = "Active";
+  }
   if (changedCall) log(`${call.direction === "incoming" ? "Incoming" : "Outgoing"} call session: ${call.id}`);
   if (call.state === "ended" || call.state === "failed") {
     log(`Call ${call.state}`);
     closeMedia();
     currentCall = undefined;
     incoming.hidden = true;
+    accepting.disabled = false;
+    accepting.textContent = "Accept";
     return;
   }
   applyPeerMode(call.relay_mode);
+  if (call.direction === "incoming" && call.state === "ringing_peer" && changedCall) {
+    if (offerRecoveryTimer !== undefined) window.clearTimeout(offerRecoveryTimer);
+    offerRecoveryTimer = window.setTimeout(() => {
+      if (currentCall?.id === call.id && (!peerConnection || !peerConnection.remoteDescription)) {
+        void sendSignal("ice_restart_request", { reason: "incoming_offer_recovery", icePolicy: "relay" }, call.id)
+          .catch((error) => log(`Incoming media recovery failed: ${String(error)}`));
+      }
+    }, 1_500);
+  }
   if (call.direction === "outgoing" || call.state === "accepted" || call.state === "active") {
     await ensurePeerConnection(call.id);
+    if (changedCall) {
+      if (offerRecoveryTimer !== undefined) window.clearTimeout(offerRecoveryTimer);
+      offerRecoveryTimer = window.setTimeout(() => {
+        if (currentCall?.id === call.id && peerConnection && !peerConnection.remoteDescription) {
+          void sendSignal("ice_restart_request", { reason: "foreground_offer_recovery", icePolicy: "relay" }, call.id)
+            .catch((error) => log(`Foreground media recovery failed: ${String(error)}`));
+        }
+      }, 1_500);
+    }
   }
 }
 
@@ -1249,10 +1403,10 @@ function applyPeerMode(mode: CallView["relay_mode"]): void {
 
 function closeMedia(clearCallId = true): void {
   mediaGeneration += 1;
-  for (const timer of [candidateTimer, credentialRefreshTimer, statsTimer, forceRelayTimer, setupFailureTimer, disconnectRecoveryTimer]) {
+  for (const timer of [candidateTimer, credentialRefreshTimer, statsTimer, forceRelayTimer, setupFailureTimer, disconnectRecoveryTimer, offerRecoveryTimer]) {
     if (timer !== undefined) window.clearTimeout(timer);
   }
-  candidateTimer = credentialRefreshTimer = statsTimer = forceRelayTimer = setupFailureTimer = disconnectRecoveryTimer = undefined;
+  candidateTimer = credentialRefreshTimer = statsTimer = forceRelayTimer = setupFailureTimer = disconnectRecoveryTimer = offerRecoveryTimer = undefined;
   peerConnection?.close();
   peerConnection = undefined;
   localStream?.getTracks().forEach((track) => track.stop());
@@ -1306,6 +1460,10 @@ document.querySelectorAll<HTMLButtonElement>("[data-event]").forEach((button) =>
     const event = button.dataset.event;
     if (!event) throw new Error("button event is missing");
     if (event === "accept") {
+      button.disabled = true;
+      button.textContent = "Preparing…";
+      element("incomingState").textContent = "Preparing secure audio";
+      await element<HTMLAudioElement>("remoteAudio").play().catch(() => undefined);
       await ensureSignalConnected();
       await ensurePeerConnection(callId);
     }
@@ -1313,10 +1471,21 @@ document.querySelectorAll<HTMLButtonElement>("[data-event]").forEach((button) =>
       await sendEvent(callId, "media_summary", lastStatsSummary);
     }
     await sendEvent(callId, event);
+    if (event === "accept") {
+      button.textContent = "Waiting…";
+      element("incomingState").textContent = "Waiting for Android to answer";
+    }
     if (event === "end" || event === "reject") closeMedia();
     if (event === "full_duplex" || event === "listen" || event === "talk") applyPeerMode(event);
     log(`Sent ${event}`);
-  })().catch((error) => log(`ERROR: ${String(error)}`)));
+  })().catch((error) => {
+    if (button.dataset.event === "accept") {
+      button.disabled = false;
+      button.textContent = "Accept";
+      element("incomingState").textContent = "Could not answer — tap to retry";
+    }
+    log(`ERROR: ${String(error)}`);
+  }));
 });
 
 for (const [id, muted] of [["mute", true], ["unmute", false]] as const) {
@@ -1365,8 +1534,10 @@ async function performSignOut(revoke = true): Promise<void> {
   paymentTimer = pairingTimer = undefined;
   accountRefreshTimer = undefined;
   if (revoke && identity && firebaseUser) {
+    await responseJson(await signedFetch(`/v1/devices/${identity.deviceId}/web-push-subscription`, { method: "DELETE" })).catch(() => undefined);
     await responseJson(await bearerFetch(`/v1/devices/${identity.deviceId}/revoke`, { method: "POST", body: "{}" })).catch(() => undefined);
   }
+  await unsubscribeIncomingNotifications().catch(() => undefined);
   await clearLocalDevice();
   account = undefined;
   accountScreenOpen = false;
@@ -1391,6 +1562,10 @@ element("replacePeer").addEventListener("click", () => void ensureBrowserRegistr
   element<HTMLButtonElement>("replacePeer").hidden = true;
   render();
 }).catch((error) => log(`Peer replacement failed: ${String(error)}`)));
+element("enableNotifications").addEventListener("click", () => void enableIncomingNotifications().catch((error) => {
+  setNotificationStatus(error instanceof Error ? error.message : String(error));
+  log(`Notification setup failed: ${String(error)}`);
+}));
 element("refreshPayment").addEventListener("click", () => startPaymentPolling());
 element<HTMLAnchorElement>("returnToAndroid").hidden = !androidBillingReturn;
 element("accountMenu").addEventListener("click", () => { accountScreenOpen = true; render(); });
@@ -1411,16 +1586,19 @@ element("startReplacePeer").addEventListener("click", () => void (async () => {
 })().catch((error) => log(`Peer replacement failed: ${String(error)}`)));
 
 window.addEventListener("online", () => {
-  void connectSignal();
+  void recoverForegroundSession().catch((error) => log(`Online recovery failed: ${String(error)}`));
   if (peerConnection && peerConnection.connectionState !== "connected") void requestRelayRestart("network_online");
 });
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible" && firebaseUser) {
-    void refreshAccount().catch((error) => log(`Account refresh failed: ${String(error)}`));
+    void recoverForegroundSession().catch((error) => log(`Foreground recovery failed: ${String(error)}`));
   }
 });
+window.addEventListener("focus", () => void recoverForegroundSession().catch((error) => log(`Focus recovery failed: ${String(error)}`)));
+window.addEventListener("pageshow", () => void recoverForegroundSession().catch((error) => log(`Page recovery failed: ${String(error)}`)));
 window.addEventListener("beforeunload", () => {
   deliberatelyDisconnected = true;
+  stopSignalHeartbeat();
   signalSocket?.close(1000, "page closing");
   closeMedia();
 });

@@ -2,6 +2,7 @@ package dev.zamad.callrelay.push
 
 import android.annotation.SuppressLint
 import android.content.Intent
+import androidx.core.content.ContextCompat
 import com.google.firebase.messaging.FirebaseMessagingService
 import com.google.firebase.messaging.RemoteMessage
 import dev.zamad.callrelay.relay.RelayReadyService
@@ -24,6 +25,7 @@ class RelayMessagingService : FirebaseMessagingService() {
         if (data["type"] == "entitlement_changed") {
             preferences.entitlementActive = data["status"] == "active"
             if (!preferences.entitlementActive && RelayRuntime.snapshot().callId == null) {
+                preferences.relayReadyDesired = false
                 stopService(Intent(this, RelayReadyService::class.java))
             }
             sendBroadcast(Intent(ACTION_ENTITLEMENT_CHANGED).setPackage(packageName))
@@ -35,42 +37,41 @@ class RelayMessagingService : FirebaseMessagingService() {
         }
         val callId = data["callId"].orEmpty()
         val commandId = data["commandId"] ?: "${data["type"]}:${data["event"]}:$callId"
-        if (!preferences.claimRemoteCommand(commandId)) return
-        if (!RelayRuntime.snapshot().ready) {
-            if (callId.isNotBlank() && preferences.configured()) {
-                RelaySyncWorker.enqueueFailure(this, callId, "relay_not_ready")
-            }
-            return
-        }
-        val action = when (data["type"]) {
-            "outgoing_call" -> RelayReadyService.ACTION_OUTGOING
-            "call_event" -> when (data["event"]) {
-                "accept" -> RelayReadyService.ACTION_ACCEPT
-                "end", "reject", "failed" -> RelayReadyService.ACTION_END
-                "full_duplex", "listen", "talk" -> RelayReadyService.ACTION_SET_MODE
-                "dtmf" -> RelayReadyService.ACTION_DTMF
-                "mute" -> RelayReadyService.ACTION_MUTE
-                else -> return
-            }
-            else -> return
-        }
+        val type = data["type"].orEmpty()
+        val event = data["event"].orEmpty()
+        if (type != "outgoing_call" && type != "call_event") return
+        if (type == "call_event" && event !in SUPPORTED_CALL_EVENTS) return
+        val persisted = preferences.enqueueRemoteCommand(
+            RelayPreferences.RemoteCommand(
+                id = commandId,
+                type = type,
+                event = event,
+                callId = callId,
+                phoneNumber = data["phoneNumber"].orEmpty(),
+                digit = data["digit"].orEmpty(),
+                muted = data["muted"].orEmpty(),
+                callVersion = data["callVersion"]?.toLongOrNull() ?: 0L,
+                createdAt = System.currentTimeMillis(),
+            ),
+        )
+        if (!persisted) return
         runCatching {
-            startService(Intent(this, RelayReadyService::class.java)
-                .setAction(action)
-                .putExtra(RelayReadyService.EXTRA_CALL_ID, callId)
-                .putExtra(RelayReadyService.EXTRA_PHONE_NUMBER, data["phoneNumber"])
-                .putExtra(RelayReadyService.EXTRA_MODE, data["event"])
-                .putExtra(RelayReadyService.EXTRA_DTMF, data["digit"])
-                .putExtra(RelayReadyService.EXTRA_MUTED, data["muted"]))
+            ContextCompat.startForegroundService(
+                this,
+                Intent(this, RelayReadyService::class.java).setAction(RelayReadyService.ACTION_PROCESS_COMMANDS),
+            )
         }.onFailure {
-            if (callId.isNotBlank() && preferences.configured()) {
-                RelaySyncWorker.enqueueFailure(this, callId, "relay_dispatch_failed")
-            }
+            // The command remains durable and is drained when Relay Ready next starts.
+            sendBroadcast(Intent(ACTION_RELAY_WAKE_FAILED).setPackage(packageName))
         }
     }
 
     companion object {
         const val ACTION_PAIRING_CHANGED = "dev.zamad.callrelay.PAIRING_CHANGED"
         const val ACTION_ENTITLEMENT_CHANGED = "dev.zamad.callrelay.ENTITLEMENT_CHANGED"
+        const val ACTION_RELAY_WAKE_FAILED = "dev.zamad.callrelay.RELAY_WAKE_FAILED"
+        private val SUPPORTED_CALL_EVENTS = setOf(
+            "accept", "end", "reject", "failed", "full_duplex", "listen", "talk", "dtmf", "mute",
+        )
     }
 }

@@ -21,11 +21,13 @@
     "@paddle/paddle-js": "1.6.5",
     "@zxing/browser": "0.1.5",
     "firebase": "12.3.0",
-    "jose": "6.2.10"
+    "jose": "6.2.10",
+    "web-push": "3.6.7"
   },
   "devDependencies": {
     "@cloudflare/vitest-plugin": "1.1.0",
     "@types/node": "26.3.0",
+    "@types/web-push": "3.6.4",
     "typescript": "7.0.2",
     "vite": "8.2.2",
     "vitest": "4.1.11",

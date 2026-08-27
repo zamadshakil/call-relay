@@ -33,6 +33,15 @@ class RelayApiClient(
 
     data class CreatedCall(val callId: String, val state: String)
 
+    data class CallSnapshot(
+        val id: String,
+        val state: String,
+        val direction: String,
+        val phoneNumber: String?,
+        val relayMode: String,
+        val version: Long,
+    )
+
     data class PairingInvitation(val invitationId: String, val expiresAt: Long, val pairingUrlBase: String)
 
     data class PendingPairing(
@@ -73,6 +82,17 @@ class RelayApiClient(
             attempts = 3,
         )
         CreatedCall(response.getString("callId"), response.getString("state"))
+    }
+
+    suspend fun currentCall(): CallSnapshot? = withContext(Dispatchers.IO) {
+        val response = request("GET", "/v1/calls/current", "", attempts = 2)
+        if (response.isNull("call")) return@withContext null
+        parseCall(response.getJSONObject("call"))
+    }
+
+    suspend fun call(callId: String): CallSnapshot = withContext(Dispatchers.IO) {
+        val response = request("GET", "/v1/calls/$callId", "", attempts = 2)
+        parseCall(response.getJSONObject("call"))
     }
 
     suspend fun confirmPairing(pairingId: String, pairingSecret: String) = withContext(Dispatchers.IO) {
@@ -219,6 +239,15 @@ class RelayApiClient(
         throw lastFailure ?: IllegalStateException("Relay API request failed")
     }
 
+    private fun parseCall(call: JSONObject): CallSnapshot = CallSnapshot(
+        id = call.getString("id"),
+        state = call.getString("state"),
+        direction = call.getString("direction"),
+        phoneNumber = call.optString("phone_number").ifBlank { null },
+        relayMode = call.optString("relay_mode", "full_duplex"),
+        version = call.optLong("version", 0L),
+    )
+
     private fun requestOnce(
         method: String,
         path: String,
@@ -239,7 +268,7 @@ class RelayApiClient(
                 doInput = true
                 setRequestProperty("content-type", "application/json")
                 setRequestProperty("accept", "application/json")
-                setRequestProperty("x-relay-app-version", "android-webrtc-3")
+                setRequestProperty("x-relay-app-version", "android-webrtc-5")
                 extraHeaders.forEach(::setRequestProperty)
                 if (signed) {
                     check(preferences.deviceId.isNotBlank()) { "Android device is not enrolled" }

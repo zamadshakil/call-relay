@@ -2,11 +2,13 @@ import path from "node:path";
 import { generateKeyPairSync } from "node:crypto";
 import { cloudflareTest, readD1Migrations } from "@cloudflare/vitest-plugin";
 import { defineConfig } from "vitest/config";
+import webpush from "web-push";
 
 export default defineConfig(async () => {
   const migrations = await readD1Migrations(path.join(import.meta.dirname, "migrations"));
   const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
   const fcmPrivateKey = privateKey.export({ type: "pkcs8", format: "pem" });
+  const vapid = webpush.generateVAPIDKeys();
   const testSecrets = {
     ENROLLMENT_INVITE: "integration-test-invite",
     CF_TURN_KEY_ID: "integration-turn-key",
@@ -17,6 +19,8 @@ export default defineConfig(async () => {
     PADDLE_API_KEY: "pdl_test_integration",
     PADDLE_WEBHOOK_SECRET: "pdl_ntfset_integration",
     SIM_PROFILE_ENCRYPTION_KEY: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    PUSH_SUBSCRIPTION_ENCRYPTION_KEY: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    VAPID_PRIVATE_KEY: vapid.privateKey,
   };
   Object.assign(process.env, testSecrets);
 
@@ -37,6 +41,8 @@ export default defineConfig(async () => {
             PADDLE_ENVIRONMENT: "sandbox",
             PADDLE_MONTHLY_PRICE_ID: "pri_01h000000000000000000000000",
             PADDLE_ANNUAL_PRICE_ID: "pri_01h111111111111111111111111",
+            VAPID_PUBLIC_KEY: vapid.publicKey,
+            VAPID_SUBJECT: "mailto:test@example.invalid",
           },
         },
       }),

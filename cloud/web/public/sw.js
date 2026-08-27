@@ -1,4 +1,4 @@
-const CACHE = "call-relay-shell-v4";
+const CACHE = "call-relay-shell-v5";
 self.addEventListener("install", (event) => {
   event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(["/manifest.webmanifest", "/icon.svg"])));
   self.skipWaiting();
@@ -14,4 +14,40 @@ self.addEventListener("fetch", (event) => {
     return;
   }
   event.respondWith(fetch(event.request).catch(() => caches.match(event.request).then((response) => response ?? Response.error())));
+});
+
+self.addEventListener("push", (event) => {
+  let payload = {};
+  try {
+    payload = event.data ? event.data.json() : {};
+  } catch {
+    payload = {};
+  }
+  const title = typeof payload.title === "string" && payload.title ? payload.title : "Incoming Call Relay call";
+  const body = typeof payload.body === "string" ? payload.body : "Open Call Relay to answer from your Android SIM.";
+  const tag = typeof payload.tag === "string" ? payload.tag : "incoming-call";
+  const url = typeof payload.url === "string" && payload.url.startsWith("/") ? payload.url : "/";
+  event.waitUntil(self.registration.showNotification(title, {
+    body,
+    tag,
+    renotify: true,
+    requireInteraction: true,
+    icon: "/icon.svg",
+    badge: "/icon.svg",
+    data: { url },
+  }));
+});
+
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+  const path = typeof event.notification.data?.url === "string" ? event.notification.data.url : "/";
+  const target = new URL(path, self.location.origin).toString();
+  event.waitUntil(self.clients.matchAll({ type: "window", includeUncontrolled: true }).then(async (clients) => {
+    const existing = clients.find((client) => new URL(client.url).origin === self.location.origin);
+    if (existing) {
+      await existing.navigate(target);
+      return existing.focus();
+    }
+    return self.clients.openWindow(target);
+  }));
 });

@@ -19,16 +19,17 @@ import { createSignalTicket, SIGNALING_PROTOCOL, signalRole, signalTicketFromPro
 import { canTransition, isE164 } from "./state";
 import { createMediaConfig, revokeDueTurnCredentials, revokeTurnCredentialsForCall } from "./turn";
 import type { CallRow, CallState, DeviceRow, Env, PairingRow, Platform, PushJob, RelayMode } from "./types";
+import { deleteWebPushSubscription, saveWebPushSubscription, webPushConfig } from "./web-push";
 
 export { PairingSignal };
 
 type JsonObject = Record<string, unknown>;
 type EventType = "accept" | "reject" | "end" | "mute" | "dtmf" | "full_duplex" | "listen" | "talk" | "active" | "failed" |
-  "media_connecting" | "media_connected" | "media_path_changed" | "media_restarting" | "media_summary" | "media_heartbeat";
+  "answering_sim" | "media_connecting" | "media_connected" | "media_path_changed" | "media_restarting" | "media_summary" | "media_heartbeat";
 
 const EVENT_TYPES = new Set<EventType>([
   "accept", "reject", "end", "mute", "dtmf", "full_duplex", "listen", "talk", "active", "failed",
-  "media_connecting", "media_connected", "media_path_changed", "media_restarting", "media_summary", "media_heartbeat",
+  "answering_sim", "media_connecting", "media_connected", "media_path_changed", "media_restarting", "media_summary", "media_heartbeat",
 ]);
 const MODE_EVENTS = new Set<EventType>(["full_duplex", "listen", "talk"]);
 const MEDIA_EVENTS = new Set<EventType>(["media_connecting", "media_connected", "media_path_changed", "media_restarting", "media_summary"]);
@@ -63,7 +64,7 @@ function requireCommandId(value: unknown): string {
 }
 
 function pushPayload(targetDeviceId: string, data: Record<string, string>): string {
-  return JSON.stringify({ targetDeviceId, data } satisfies PushJob);
+  return JSON.stringify({ targetDeviceId, data });
 }
 
 async function getCall(env: Env, callId: string): Promise<CallRow> {
@@ -80,10 +81,21 @@ async function getPairing(env: Env, pairingId: string): Promise<PairingRow> {
   return pairing;
 }
 
-function broadcastCall(env: Env, ctx: ExecutionContext, call: CallRow): void {
-  ctx.waitUntil(env.PAIRING_SIGNAL.getByName(call.pairing_id).publishSnapshot(JSON.stringify(call)).catch((error: unknown) => {
-    console.error(JSON.stringify({ message: "call snapshot broadcast failed", callId: call.id, error: error instanceof Error ? error.message : String(error) }));
-  }));
+async function broadcastCall(env: Env, call: CallRow): Promise<void> {
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      // Recreate the stub on every attempt because a thrown DO RPC can poison a stub.
+      await env.PAIRING_SIGNAL.getByName(call.pairing_id).publishSnapshot(JSON.stringify(call));
+      return;
+    } catch (error) {
+      const durableError = error as Error & { retryable?: boolean; overloaded?: boolean };
+      if (durableError.overloaded || !durableError.retryable || attempt === 2) {
+        console.error(JSON.stringify({ message: "call snapshot broadcast failed", callId: call.id, error: durableError.message }));
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50 * (2 ** attempt)));
+    }
+  }
 }
 
 function assertCallMember(call: CallRow, deviceId: string): void {
@@ -208,7 +220,7 @@ async function expireStaleForAndroid(env: Env, ctx: ExecutionContext, androidDev
   ).bind(now, now, androidDeviceId, now - 120_000, now - 90_000, now - 30_000).run();
   for (const staleCall of stale.results) {
     const updated = await getCall(env, staleCall.id);
-    broadcastCall(env, ctx, updated);
+    await broadcastCall(env, updated);
     ctx.waitUntil(revokeTurnCredentialsForCall(env, staleCall.id));
   }
 }
@@ -245,13 +257,19 @@ async function createCall(request: Request, env: Env, ctx: ExecutionContext, dev
   const state: CallState = direction === "incoming" ? "ringing_peer" : "dialing_sim";
   const targetDeviceId = direction === "outgoing" ? androidDeviceId : peerDeviceId;
   const targetPlatform = targetDeviceId === device.id ? device.platform : peer.platform;
-  const outboxId = targetPlatform === "android" ? id("push") : null;
+  const pushChannel = targetPlatform === "android" ? "android_fcm" : targetPlatform === "browser" ? "web_push" : null;
+  const outboxId = pushChannel ? id("push") : null;
   const statements: D1PreparedStatement[] = [env.CALL_RELAY_DB.prepare(
     "INSERT INTO call_sessions(id, pairing_id, android_device_id, peer_device_id, direction, state, phone_number, created_at, updated_at, request_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
   ).bind(callId, pairingId, androidDeviceId, peerDeviceId, direction, state, phoneNumber, now, now, requestId)];
   if (outboxId) statements.push(env.CALL_RELAY_DB.prepare(
-    "INSERT INTO push_outbox(id, target_device_id, payload_json, created_at) VALUES (?, ?, ?, ?)",
-  ).bind(outboxId, targetDeviceId, pushPayload(targetDeviceId, { type: "outgoing_call", callId, phoneNumber: phoneNumber ?? "" }), now));
+    "INSERT INTO push_outbox(id, target_device_id, channel, payload_json, created_at) VALUES (?, ?, ?, ?, ?)",
+  ).bind(outboxId, targetDeviceId, pushChannel, pushPayload(targetDeviceId, {
+    type: direction === "incoming" ? "incoming_call" : "outgoing_call",
+    callId,
+    phoneNumber: direction === "outgoing" ? phoneNumber ?? "" : "",
+    callVersion: "0",
+  }), now));
   try {
     await env.CALL_RELAY_DB.batch(statements);
   } catch (error) {
@@ -268,7 +286,7 @@ async function createCall(request: Request, env: Env, ctx: ExecutionContext, dev
   if (outboxId) ctx.waitUntil(dispatchOutboxItem(env, outboxId).catch((error: unknown) => {
     console.error(JSON.stringify({ message: "initial call push enqueue failed", callId, error: error instanceof Error ? error.message : String(error) }));
   }));
-  broadcastCall(env, ctx, await getCall(env, callId));
+  await broadcastCall(env, await getCall(env, callId));
   return json({ callId, state }, { status: 201 });
 }
 
@@ -291,6 +309,12 @@ function authorizeEvent(call: CallRow, device: DeviceRow, eventType: EventType):
     const expectedState = call.direction === "incoming" ? "accepted" : "dialing_sim";
     if (!isAndroid || call.state !== expectedState) throw new HttpError(403, "only Android can report an expected SIM call active");
     return "active";
+  }
+  if (eventType === "answering_sim") {
+    if (!isAndroid || call.direction !== "incoming" || call.state !== "accepted") {
+      throw new HttpError(403, "only Android can report an accepted SIM call answer attempt");
+    }
+    return call.state;
   }
   if (eventType === "end") return isAndroid ? "ended" : "ending";
   if (eventType === "failed") return "failed";
@@ -405,17 +429,25 @@ async function appendEvent(request: Request, env: Env, ctx: ExecutionContext, ca
       `UPDATE call_sessions SET state = ?, relay_mode = ?, updated_at = ?, ended_at = COALESCE(?, ended_at),
        failure_code = COALESCE(?, failure_code), media_connected_at = COALESCE(?, media_connected_at),
        media_failure_code = COALESCE(?, media_failure_code), selected_candidate_type = COALESCE(?, selected_candidate_type),
-       ice_policy = COALESCE(?, ice_policy), version = version + 1, last_event_id = ?
+       ice_policy = COALESCE(?, ice_policy), peer_accepted_at = COALESCE(?, peer_accepted_at),
+       telecom_answer_requested_at = COALESCE(?, telecom_answer_requested_at), sim_active_at = COALESCE(?, sim_active_at),
+       version = version + 1, last_event_id = ?
        WHERE id = ? AND version = ? AND state = ?`,
-    ).bind(nextState, relayMode, now, terminal, failureCode, mediaConnectedAt, mediaFailureCode, candidateType, icePolicy, eventId, call.id, call.version, call.state),
+    ).bind(
+      nextState, relayMode, now, terminal, failureCode, mediaConnectedAt, mediaFailureCode, candidateType, icePolicy,
+      eventType === "accept" ? now : null,
+      eventType === "answering_sim" ? now : null,
+      eventType === "active" ? now : null,
+      eventId, call.id, call.version, call.state,
+    ),
     env.CALL_RELAY_DB.prepare(
       "INSERT INTO call_events(id, call_id, device_id, event_type, payload_json, created_at, command_id) SELECT ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM call_sessions WHERE id = ? AND last_event_id = ?)",
     ).bind(eventId, call.id, device.id, eventType, JSON.stringify(payload), now, commandId, call.id, eventId),
   ];
   if (outboxId && !MEDIA_EVENTS.has(eventType)) statements.push(env.CALL_RELAY_DB.prepare(
-    "INSERT INTO push_outbox(id, target_device_id, payload_json, created_at) SELECT ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM call_sessions WHERE id = ? AND last_event_id = ?)",
+    "INSERT INTO push_outbox(id, target_device_id, channel, payload_json, created_at) SELECT ?, ?, 'android_fcm', ?, ? WHERE EXISTS (SELECT 1 FROM call_sessions WHERE id = ? AND last_event_id = ?)",
   ).bind(outboxId, targetDeviceId, pushPayload(targetDeviceId, {
-    type: "call_event", callId: call.id, event: eventType, commandId,
+    type: "call_event", callId: call.id, event: eventType, commandId, callVersion: String(call.version + 1),
     ...(eventType === "dtmf" ? { digit: String(payload.digit) } : {}),
     ...(eventType === "mute" ? { muted: String(payload.muted) } : {}),
   }), now, call.id, eventId));
@@ -433,7 +465,7 @@ async function appendEvent(request: Request, env: Env, ctx: ExecutionContext, ca
     console.error(JSON.stringify({ message: "event push enqueue failed", callId: call.id, eventType, error: error instanceof Error ? error.message : String(error) }));
   }));
   const updatedCall = await getCall(env, call.id);
-  broadcastCall(env, ctx, updatedCall);
+  await broadcastCall(env, updatedCall);
   if (["ended", "failed"].includes(nextState)) {
     ctx.waitUntil(revokeTurnCredentialsForCall(env, call.id));
   }
@@ -508,6 +540,17 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
       "SELECT * FROM call_sessions WHERE (android_device_id = ? OR peer_device_id = ?) AND state NOT IN ('ended', 'failed') ORDER BY created_at DESC LIMIT 1",
     ).bind(device.id, device.id).first<CallRow>();
     return json({ call: call ?? null });
+  }
+  if (request.method === "GET" && url.pathname === "/v1/push/config") {
+    await requireDeviceEntitlement(env, device);
+    return webPushConfig(env);
+  }
+  const webPushMatch = /^\/v1\/devices\/(dev_[a-f0-9]{32})\/web-push-subscription$/u.exec(url.pathname);
+  if (webPushMatch) {
+    if (webPushMatch[1] !== device.id) throw new HttpError(403, "a device may update only its own push subscription");
+    await requireDeviceEntitlement(env, device);
+    if (request.method === "PUT") return saveWebPushSubscription(request, env, device);
+    if (request.method === "DELETE") return deleteWebPushSubscription(env, device);
   }
   if (request.method === "POST" && url.pathname === "/v1/devices/push-token") {
     if (device.platform !== "android") throw new HttpError(403, "push tokens are only accepted for Android");
@@ -620,9 +663,15 @@ export default {
   async queue(batch, env): Promise<void> {
     for (const message of batch.messages) {
       try {
-        await deliverPush(env, message.body);
+        const delivered = await deliverPush(env, message.body);
+        await env.CALL_RELAY_DB.prepare(
+          "UPDATE push_outbox SET provider_accepted_at = ?, provider_message_id = ?, last_error = NULL WHERE id = ?",
+        ).bind(delivered.accepted ? Date.now() : null, delivered.providerMessageId ?? null, message.body.outboxId).run();
         message.ack();
       } catch (error) {
+        await env.CALL_RELAY_DB.prepare(
+          "UPDATE push_outbox SET last_error = ? WHERE id = ?",
+        ).bind(error instanceof Error ? error.message.slice(0, 500) : "unknown provider failure", message.body.outboxId).run();
         console.error(JSON.stringify({ message: "push delivery failed", messageId: message.id, error: error instanceof Error ? error.message : String(error) }));
         message.retry();
       }

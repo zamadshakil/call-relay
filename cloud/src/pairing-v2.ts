@@ -1,7 +1,7 @@
 import { authenticateFirebase, requireEntitlement } from "./firebase-auth";
 import { fromBase64Url, HttpError, json, readJson, requireString, timingSafeEqualText } from "./http";
 import { dispatchOutboxItem } from "./outbox";
-import type { DeviceRow, Env, PairingRow, Platform, PushJob } from "./types";
+import type { DeviceRow, Env, PairingRow, Platform } from "./types";
 
 type JsonObject = Record<string, unknown>;
 
@@ -32,7 +32,7 @@ async function requireAgreementKey(value: unknown, name: string): Promise<string
 }
 
 function pushPayload(targetDeviceId: string, data: Record<string, string>): string {
-  return JSON.stringify({ targetDeviceId, data } satisfies PushJob);
+  return JSON.stringify({ targetDeviceId, data });
 }
 
 export async function createPairingInvitation(request: Request, env: Env, device: DeviceRow): Promise<Response> {

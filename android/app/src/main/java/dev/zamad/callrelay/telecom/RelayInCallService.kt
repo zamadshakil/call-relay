@@ -14,6 +14,7 @@ import android.telecom.CallEndpoint
 import android.telecom.CallEndpointException
 import android.telecom.InCallService
 import android.content.Intent
+import androidx.core.content.ContextCompat
 import dev.zamad.callrelay.MainActivity
 import dev.zamad.callrelay.R
 import dev.zamad.callrelay.relay.RelayReadyService
@@ -28,9 +29,11 @@ class RelayInCallService : InCallService() {
     private val availableEndpoints = mutableListOf<CallEndpoint>()
     private val callbacks = ConcurrentHashMap<Call, Call.Callback>()
     private val relayEligibleCalls = ConcurrentHashMap.newKeySet<Call>()
+    private lateinit var preferences: RelayPreferences
 
     override fun onCreate() {
         super.onCreate()
+        preferences = RelayPreferences(this)
         serviceInstance.set(this)
         getSystemService(NotificationManager::class.java).createNotificationChannel(
             NotificationChannel(CALL_CHANNEL_ID, "Cellular calls", NotificationManager.IMPORTANCE_HIGH),
@@ -44,26 +47,27 @@ class RelayInCallService : InCallService() {
 
     override fun onCallAdded(call: Call) {
         super.onCallAdded(call)
-        if (RelayRuntime.snapshot().ready && activeCalls.any { it.state != Call.STATE_DISCONNECTED }) {
+        if (relayDesired() && activeCalls.any { it.state != Call.STATE_DISCONNECTED }) {
             RelayRuntime.update { it.copy(error = "Call waiting and conference calls are blocked while Relay Ready is on") }
             call.disconnect()
             return
         }
-        if (RelayRuntime.snapshot().ready && isSelectedPhoneAccount(call)) relayEligibleCalls.add(call)
+        if (relayDesired() && isSelectedPhoneAccount(call)) relayEligibleCalls.add(call)
         val callback = object : Call.Callback() {
             override fun onStateChanged(changedCall: Call, state: Int) {
                 currentCall.set(changedCall)
                 callState.set(stateName(state))
                 RelayRuntime.update { it.copy(callState = stateName(state)) }
                 showCallNotification(changedCall)
-                if (RelayRuntime.snapshot().ready && changedCall in relayEligibleCalls && state == Call.STATE_ACTIVE) {
+                if (relayDesired() && changedCall in relayEligibleCalls && state == Call.STATE_ACTIVE) {
                     routeToSpeaker()
                     notifyRelay(RelayReadyService.ACTION_CALL_ACTIVE)
                 }
+                if (state == Call.STATE_DISCONNECTED) cleanupDisconnectedCall(changedCall)
             }
 
             override fun onDetailsChanged(changedCall: Call, details: Call.Details) {
-                if (RelayRuntime.snapshot().ready && isSelectedPhoneAccount(changedCall)) {
+                if (relayDesired() && isSelectedPhoneAccount(changedCall)) {
                     relayEligibleCalls.add(changedCall)
                 }
                 showCallNotification(changedCall)
@@ -77,7 +81,7 @@ class RelayInCallService : InCallService() {
         RelayRuntime.update { it.copy(callState = stateName(call.state)) }
         call.registerCallback(callback)
         showCallNotification(call)
-        if (RelayRuntime.snapshot().ready && call in relayEligibleCalls && call.state == Call.STATE_RINGING) {
+        if (relayDesired() && call in relayEligibleCalls && call.state == Call.STATE_RINGING) {
             notifyRelay(RelayReadyService.ACTION_INCOMING)
         }
     }
@@ -91,14 +95,28 @@ class RelayInCallService : InCallService() {
             callState.set(activeCalls.lastOrNull()?.let { stateName(it.state) } ?: "No call")
         }
         RelayRuntime.update { it.copy(callState = callState.get()) }
-        if (RelayRuntime.snapshot().ready && wasRelayEligible && relayEligibleCalls.isEmpty()) {
+        if (relayDesired() && wasRelayEligible && relayEligibleCalls.isEmpty()) {
             notifyRelay(RelayReadyService.ACTION_END)
         }
         super.onCallRemoved(call)
     }
 
     private fun notifyRelay(action: String) {
-        startService(Intent(this, RelayReadyService::class.java).setAction(action))
+        ContextCompat.startForegroundService(this, Intent(this, RelayReadyService::class.java).setAction(action))
+    }
+
+    private fun relayDesired(): Boolean = preferences.relayReadyDesired && preferences.configured() && preferences.entitlementActive
+
+    private fun cleanupDisconnectedCall(call: Call) {
+        val wasRelayEligible = relayEligibleCalls.remove(call)
+        activeCalls.remove(call)
+        if (currentCall.compareAndSet(call, activeCalls.lastOrNull { it.state != Call.STATE_DISCONNECTED })) {
+            callState.set(currentCall.get()?.let { stateName(it.state) } ?: "No call")
+        }
+        RelayRuntime.update { it.copy(callState = callState.get()) }
+        if (relayDesired() && wasRelayEligible && relayEligibleCalls.isEmpty()) {
+            notifyRelay(RelayReadyService.ACTION_END)
+        }
     }
 
     private fun showCallNotification(call: Call) {
@@ -138,7 +156,7 @@ class RelayInCallService : InCallService() {
     }
 
     private fun isSelectedPhoneAccount(call: Call): Boolean {
-        val selected = RelayPreferences(this).selectedPhoneAccount
+        val selected = preferences.selectedPhoneAccount
         if (selected.isBlank()) return true
         val account = call.details.accountHandle ?: return false
         return "${account.componentName.flattenToString()}|${account.id}" == selected
@@ -149,7 +167,7 @@ class RelayInCallService : InCallService() {
         super.onCallAudioStateChanged(audioState)
         audioRoute.set(routeName(audioState.route))
         if (
-            RelayRuntime.snapshot().ready && currentCallIsRelayEligible() &&
+            relayDesired() && currentCallIsRelayEligible() &&
             Build.VERSION.SDK_INT < 34 && audioState.route != CallAudioState.ROUTE_SPEAKER
         ) {
             setAudioRoute(CallAudioState.ROUTE_SPEAKER)
@@ -160,7 +178,7 @@ class RelayInCallService : InCallService() {
         super.onAvailableCallEndpointsChanged(endpoints)
         availableEndpoints.clear()
         availableEndpoints.addAll(endpoints)
-        if (RelayRuntime.snapshot().ready && currentCallIsRelayEligible()) routeToSpeaker()
+        if (relayDesired() && currentCallIsRelayEligible()) routeToSpeaker()
     }
 
     @android.annotation.TargetApi(34)

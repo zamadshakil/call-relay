@@ -12,7 +12,9 @@
       "ENROLLMENT_INVITE",
       "FCM_CLIENT_EMAIL",
       "FCM_PRIVATE_KEY",
-      "SIM_PROFILE_ENCRYPTION_KEY"
+      "SIM_PROFILE_ENCRYPTION_KEY",
+      "PUSH_SUBSCRIPTION_ENCRYPTION_KEY",
+      "VAPID_PRIVATE_KEY"
     ]
   },
   "observability": {
@@ -83,7 +85,9 @@
     "PUBLIC_APP_URL": "https://call-relay.zamadshakil.workers.dev",
     "PADDLE_ENVIRONMENT": "production",
     "PADDLE_MONTHLY_PRICE_ID": "replace-me",
-    "PADDLE_ANNUAL_PRICE_ID": "replace-me"
+    "PADDLE_ANNUAL_PRICE_ID": "replace-me",
+    "VAPID_PUBLIC_KEY": "BPRZIqJExD4TLLU19eLJnkrShU6bn9Yqz2GX3nFjKazVNzgd5V_0SBO6kdiMfJdRRfwaO_TsDDFkrC48iVof7vg",
+    "VAPID_SUBJECT": "mailto:support@callrelay.app"
   },
   "env": {
     "staging": {
@@ -95,7 +99,9 @@
           "SIGNAL_TICKET_SECRET",
           "FCM_CLIENT_EMAIL",
           "FCM_PRIVATE_KEY",
-          "SIM_PROFILE_ENCRYPTION_KEY"
+          "SIM_PROFILE_ENCRYPTION_KEY",
+          "PUSH_SUBSCRIPTION_ENCRYPTION_KEY",
+          "VAPID_PRIVATE_KEY"
         ]
       },
       "d1_databases": [
@@ -136,11 +142,13 @@
         "FIREBASE_PROJECT_ID": "call-relay-3dec7",
         "ACCESS_MODE": "approval_only",
         "ONBOARDING_V2_ENABLED": "true",
-        "MIN_ANDROID_APP_VERSION": "3",
+        "MIN_ANDROID_APP_VERSION": "5",
         "PUBLIC_APP_URL": "https://call-relay-staging.zamadshakil.workers.dev",
         "PADDLE_ENVIRONMENT": "sandbox",
         "PADDLE_MONTHLY_PRICE_ID": "replace-me",
-        "PADDLE_ANNUAL_PRICE_ID": "replace-me"
+        "PADDLE_ANNUAL_PRICE_ID": "replace-me",
+        "VAPID_PUBLIC_KEY": "BPRZIqJExD4TLLU19eLJnkrShU6bn9Yqz2GX3nFjKazVNzgd5V_0SBO6kdiMfJdRRfwaO_TsDDFkrC48iVof7vg",
+        "VAPID_SUBJECT": "mailto:support@callrelay.app"
       }
     }
   }

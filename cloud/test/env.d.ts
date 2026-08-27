@@ -17,6 +17,10 @@ declare namespace Cloudflare {
     PADDLE_API_KEY: string;
     PADDLE_WEBHOOK_SECRET: string;
     SIM_PROFILE_ENCRYPTION_KEY: string;
+    PUSH_SUBSCRIPTION_ENCRYPTION_KEY: string;
+    VAPID_PRIVATE_KEY: string;
+    VAPID_PUBLIC_KEY: string;
+    VAPID_SUBJECT: string;
     TEST_MIGRATIONS: D1Migration[];
   }
 }

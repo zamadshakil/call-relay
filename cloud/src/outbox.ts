@@ -15,12 +15,12 @@ function parsePushJob(row: PushOutboxRow): PushJob {
     if (typeof item !== "string") throw new HttpError(500, "invalid push outbox data");
     data[key] = item;
   }
-  return { targetDeviceId: record.targetDeviceId, data };
+  return { outboxId: row.id, channel: row.channel, targetDeviceId: record.targetDeviceId, data };
 }
 
 export async function dispatchOutboxItem(env: Env, outboxId: string): Promise<void> {
   const row = await env.CALL_RELAY_DB.prepare(
-    "SELECT id, target_device_id, payload_json, attempts FROM push_outbox WHERE id = ? AND queued_at IS NULL",
+    "SELECT id, target_device_id, channel, payload_json, attempts FROM push_outbox WHERE id = ? AND queued_at IS NULL",
   ).bind(outboxId).first<PushOutboxRow>();
   if (!row) return;
   try {

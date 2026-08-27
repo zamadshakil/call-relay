@@ -19,6 +19,8 @@ export type CallState =
   | "failed";
 
 export type Env = Omit<Cloudflare.Env, "PUSH_QUEUE"> & {
+  // Wrangler's generated Worker env currently omits the static-assets binding.
+  ASSETS: Fetcher;
   PUSH_QUEUE: Queue<PushJob>;
   CF_TURN_KEY_ID: SecretValue;
   CF_TURN_API_TOKEN: SecretValue;
@@ -37,9 +39,15 @@ export type Env = Omit<Cloudflare.Env, "PUSH_QUEUE"> & {
   PADDLE_API_KEY?: SecretValue;
   PADDLE_WEBHOOK_SECRET?: SecretValue;
   SIM_PROFILE_ENCRYPTION_KEY?: SecretValue;
+  PUSH_SUBSCRIPTION_ENCRYPTION_KEY?: SecretValue;
+  VAPID_PRIVATE_KEY?: SecretValue;
+  VAPID_PUBLIC_KEY: string;
+  VAPID_SUBJECT: string;
 };
 
 export interface PushJob {
+  outboxId: string;
+  channel: "android_fcm" | "web_push";
   targetDeviceId: string;
   data: Record<string, string>;
 }
@@ -108,6 +116,9 @@ export interface CallRow {
   media_connected_at: number | null;
   media_failure_code: string | null;
   selected_candidate_type: "host" | "srflx" | "relay" | null;
+  peer_accepted_at: number | null;
+  telecom_answer_requested_at: number | null;
+  sim_active_at: number | null;
 }
 
 export interface IceServerConfig {
@@ -147,6 +158,13 @@ export interface PairingRow {
 export interface PushOutboxRow {
   id: string;
   target_device_id: string;
+  channel: "android_fcm" | "web_push";
   payload_json: string;
   attempts: number;
+}
+
+export interface PushDeliveryResult {
+  accepted: boolean;
+  gone: boolean;
+  providerMessageId?: string;
 }

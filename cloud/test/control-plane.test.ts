@@ -66,7 +66,7 @@ async function enroll(platform: "android" | "browser", displayName: string): Pro
 async function signedRequest(
   device: TestDevice,
   path: string,
-  method: "GET" | "POST",
+  method: "GET" | "POST" | "PUT" | "DELETE",
   body?: Record<string, unknown>,
   fixed?: { nonce: string; timestamp: string },
 ): Promise<Request> {
@@ -93,7 +93,7 @@ async function signedRequest(
 async function signedFetch(
   device: TestDevice,
   path: string,
-  method: "GET" | "POST",
+  method: "GET" | "POST" | "PUT" | "DELETE",
   body?: Record<string, unknown>,
 ): Promise<Response> {
   return invoke(await signedRequest(device, path, method, body));
@@ -145,6 +145,20 @@ describe("Worker control plane", () => {
   it("enforces pairing confirmation, roles, idempotency, state transitions, and Cloudflare-only media grants", async () => {
     const android = await enroll("android", "Relay Android");
     const browser = await enroll("browser", "Browser peer");
+    const pushConfig = await signedFetch(browser, "/v1/push/config", "GET");
+    expect(pushConfig.status).toBe(200);
+    expect((await json(pushConfig)).vapidPublicKey).toMatch(/^[A-Za-z0-9_-]{80,120}$/u);
+    const pushSubscription = await signedFetch(browser, `/v1/devices/${browser.deviceId}/web-push-subscription`, "PUT", {
+      endpoint: "https://web.push.apple.com/Q2FsbFJlbGF5VGVzdA",
+      expirationTime: null,
+      keys: { p256dh: "A".repeat(87), auth: "B".repeat(22) },
+    });
+    expect(pushSubscription.status).toBe(200);
+    const encryptedSubscription = await env.CALL_RELAY_DB.prepare(
+      "SELECT subscription_ciphertext, subscription_iv FROM web_push_subscriptions WHERE device_id = ?",
+    ).bind(browser.deviceId).first<{ subscription_ciphertext: string; subscription_iv: string }>();
+    expect(encryptedSubscription?.subscription_ciphertext).not.toContain("push.apple.com");
+    expect(encryptedSubscription?.subscription_iv).toMatch(/^[A-Za-z0-9_-]+$/u);
     const pairingSecret = crypto.getRandomValues(new Uint8Array(32));
     const commitment = base64Url(new Uint8Array(await crypto.subtle.digest("SHA-256", pairingSecret)));
 
@@ -246,6 +260,16 @@ describe("Worker control plane", () => {
     });
     expect(incomingCreated.status).toBe(201);
     const incomingCallId = String((await json(incomingCreated)).callId);
+    const browserNotification = await env.CALL_RELAY_DB.prepare(
+      "SELECT channel, payload_json, queued_at FROM push_outbox WHERE target_device_id = ? ORDER BY created_at DESC LIMIT 1",
+    ).bind(browser.deviceId).first<{ channel: string; payload_json: string; queued_at: number | null }>();
+    expect(browserNotification?.channel).toBe("web_push");
+    expect(browserNotification?.queued_at).toEqual(expect.any(Number));
+    expect(JSON.parse(browserNotification?.payload_json ?? "{}").data).toMatchObject({
+      type: "incoming_call",
+      callId: incomingCallId,
+      callVersion: "0",
+    });
 
     vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
       const request = new Request(input, init);
@@ -284,7 +308,17 @@ describe("Worker control plane", () => {
 
     const accepted = await event(browser, incomingCallId, "accept");
     expect((await json(accepted)).state).toBe("accepted");
+    expect((await event(browser, incomingCallId, "answering_sim")).status).toBe(403);
+    expect((await event(android, incomingCallId, "answering_sim")).status).toBe(200);
     expect((await json(await event(android, incomingCallId, "active"))).state).toBe("active");
+    const incomingMilestones = await env.CALL_RELAY_DB.prepare(
+      "SELECT peer_accepted_at, telecom_answer_requested_at, sim_active_at FROM call_sessions WHERE id = ?",
+    ).bind(incomingCallId).first<{ peer_accepted_at: number | null; telecom_answer_requested_at: number | null; sim_active_at: number | null }>();
+    expect(incomingMilestones).toMatchObject({
+      peer_accepted_at: expect.any(Number),
+      telecom_answer_requested_at: expect.any(Number),
+      sim_active_at: expect.any(Number),
+    });
     const summary = await event(android, incomingCallId, "media_summary", {
       setupDurationMs: 1250,
       candidateType: "relay",
