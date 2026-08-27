@@ -1,6 +1,7 @@
 import { authenticate } from "./auth";
 import { requireDeviceEntitlement } from "./entitlement";
 import { authSession, me, registerDevice, revokeDevice, updateSimProfile } from "./onboarding";
+import { isFirebaseAuthHelperPath, proxyFirebaseAuthHelper } from "./firebase-auth-proxy";
 import { billingPlans, createCheckout, createPortal, paddleWebhook } from "./paddle";
 import {
   confirmPairingV2,
@@ -593,6 +594,14 @@ function secureAssetResponse(request: Request, response: Response): Response {
 export default {
   async fetch(request, env, ctx): Promise<Response> {
     const url = new URL(request.url);
+    if (isFirebaseAuthHelperPath(url.pathname)) {
+      try {
+        return await proxyFirebaseAuthHelper(request, env.FIREBASE_PROJECT_ID);
+      } catch (error) {
+        console.error(JSON.stringify({ message: "Firebase auth helper proxy failed", error: error instanceof Error ? error.message : String(error) }));
+        return new Response("Authentication service unavailable", { status: 502, headers: { "cache-control": "no-store" } });
+      }
+    }
     if (url.pathname === "/health") {
       if (request.method !== "GET") return json({ error: "method not allowed" }, { status: 405 });
       return json({ ok: true, audioStored: false, mediaTransport: "webrtc_p2p" });

@@ -40,6 +40,7 @@ async function waitForOperation(name, authorization) {
 const serviceAccountPath = resolve(required(option("--service-account"), "--service-account path"));
 const androidOutput = resolve(option("--android-output") ?? "../android/app/google-services.json");
 const webOutput = resolve(option("--web-output") ?? ".env.staging");
+const webAuthDomain = option("--auth-domain") ?? "call-relay-staging.zamadshakil.workers.dev";
 const packageName = option("--package") ?? "dev.zamad.callrelay";
 const sha1 = required(option("--sha1"), "--sha1");
 const sha256 = required(option("--sha256"), "--sha256");
@@ -119,7 +120,7 @@ const { body: webConfig } = await jsonResponse(
 );
 const webEnv = [
   `VITE_FIREBASE_API_KEY=${required(webConfig.apiKey, "Firebase Web apiKey")}`,
-  `VITE_FIREBASE_AUTH_DOMAIN=${required(webConfig.authDomain, "Firebase Web authDomain")}`,
+  `VITE_FIREBASE_AUTH_DOMAIN=${required(webAuthDomain, "Firebase Web authDomain")}`,
   `VITE_FIREBASE_PROJECT_ID=${required(webConfig.projectId, "Firebase Web projectId")}`,
   `VITE_FIREBASE_WEB_APP_ID=${required(webConfig.appId, "Firebase Web appId")}`,
   `VITE_FIREBASE_MESSAGING_SENDER_ID=${required(webConfig.messagingSenderId, "Firebase Web messagingSenderId")}`,

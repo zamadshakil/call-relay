@@ -23,7 +23,7 @@ In Firebase project `call-relay-3dec7`:
 
    ```dotenv
    VITE_FIREBASE_API_KEY=...
-   VITE_FIREBASE_AUTH_DOMAIN=call-relay-3dec7.firebaseapp.com
+   VITE_FIREBASE_AUTH_DOMAIN=call-relay-staging.zamadshakil.workers.dev
    VITE_FIREBASE_PROJECT_ID=call-relay-3dec7
    VITE_FIREBASE_WEB_APP_ID=...
    VITE_FIREBASE_MESSAGING_SENDER_ID=90866288123
@@ -31,7 +31,24 @@ In Firebase project `call-relay-3dec7`:
    VITE_PADDLE_ENVIRONMENT=sandbox
    ```
 
-6. In Google Cloud Console, ensure the OAuth consent screen and authorized domain include `call-relay-staging.zamadshakil.workers.dev` and `call-relay.zamadshakil.workers.dev` where Firebase requires them.
+6. In **Google Cloud Console → Google Auth Platform → Clients**, open the Web OAuth client used by Firebase Google sign-in and add these exact values:
+
+   Authorized JavaScript origins:
+
+   ```text
+   https://call-relay-staging.zamadshakil.workers.dev
+   https://call-relay.zamadshakil.workers.dev
+   ```
+
+   Authorized redirect URIs:
+
+   ```text
+   https://call-relay-staging.zamadshakil.workers.dev/__/auth/handler
+   https://call-relay.zamadshakil.workers.dev/__/auth/handler
+   ```
+
+   Keep the existing Firebase Hosting handler URI. The Worker transparently proxies `/__/auth/*` to `call-relay-3dec7.firebaseapp.com`; the same-origin `authDomain` is required for redirect sign-in on browsers that block third-party storage, including current Safari and Chrome.
+7. In Firebase Authentication settings, keep both Worker hostnames in **Authorized domains**.
 
 The Worker verifies Firebase JWT signature, algorithm, issuer, audience, expiry, UID, `email_verified`, disabled status, and revocation time. The Firebase service-account JSON remains local and ignored by Git.
 
