@@ -5,7 +5,9 @@ import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.MediaRecorder
+import android.os.SystemClock
 import dev.zamad.callrelay.audio.CaptureSampleRateSelector
+import dev.zamad.callrelay.audio.DuplexEchoGuard
 import dev.zamad.callrelay.audio.PcmGainProcessor
 import dev.zamad.callrelay.network.PairingSignalClient
 import dev.zamad.callrelay.network.RelayApiClient
@@ -83,6 +85,7 @@ class WebRtcRelaySession(
     private val explicitlyMuted = AtomicBoolean(false)
     private val connected = AtomicBoolean(false)
     private val gainProcessor = PcmGainProcessor()
+    private val echoGuard = DuplexEchoGuard()
     private val pendingCandidates = mutableListOf<IceCandidate>()
     private var factory: PeerConnectionFactory? = null
     private var audioModule: JavaAudioDeviceModule? = null
@@ -182,6 +185,7 @@ class WebRtcRelaySession(
         refreshTimer = null
         statsTimer = null
         connected.set(false)
+        echoGuard.reset()
         remoteTrack = null
         peerConnection?.close()
         peerConnection?.dispose()
@@ -502,6 +506,8 @@ class WebRtcRelaySession(
 
     private fun applyAudioDirection() {
         localTrack?.setEnabled(mode.get() != RelayMode.TALK && !explicitlyMuted.get())
+        // Playback gain is applied exactly once by renderProcessor so the
+        // samples used by the echo guard match what reaches Android's speaker.
         remoteTrack?.setVolume(1.0)
     }
 
@@ -522,11 +528,13 @@ class WebRtcRelaySession(
         override fun initialize(sampleRateHz: Int, numChannels: Int) = Unit
         override fun reset(newRate: Int) = Unit
         override fun process(sampleRateHz: Int, numChannels: Int, buffer: ByteBuffer) {
+            val echoGuardActive = mode.get() == RelayMode.FULL_DUPLEX &&
+                echoGuard.shouldGateCapture(SystemClock.elapsedRealtime())
             val level = gainProcessor.processPcm16(
                 buffer,
                 buffer.capacity(),
                 preferences.captureGain,
-                mode.get() == RelayMode.TALK || explicitlyMuted.get(),
+                mode.get() == RelayMode.TALK || explicitlyMuted.get() || echoGuardActive,
             )
             RelayRuntime.update { it.copy(captureRms = level.rms, capturePeak = level.peak) }
         }
@@ -536,12 +544,15 @@ class WebRtcRelaySession(
         override fun initialize(sampleRateHz: Int, numChannels: Int) = Unit
         override fun reset(newRate: Int) = Unit
         override fun process(sampleRateHz: Int, numChannels: Int, buffer: ByteBuffer) {
-            gainProcessor.processPcm16(
+            val level = gainProcessor.processPcm16(
                 buffer,
                 buffer.capacity(),
                 preferences.playbackGain.toFloat(),
                 mode.get() == RelayMode.LISTEN,
             )
+            if (mode.get() != RelayMode.LISTEN) {
+                echoGuard.observePeerRender(level.rms, level.peak, SystemClock.elapsedRealtime())
+            }
         }
     }
 

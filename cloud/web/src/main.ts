@@ -165,6 +165,7 @@ const remoteSequences = new Map<string, number>();
 
 let peerConnection: RTCPeerConnection | undefined;
 let localStream: MediaStream | undefined;
+let localMicMuted = false;
 let mediaCallId = "";
 let mediaConfig: MediaConfig | undefined;
 let mediaGeneration = 0;
@@ -998,13 +999,26 @@ async function ensurePeerConnection(callId: string): Promise<RTCPeerConnection> 
   if (generation !== mediaGeneration) throw new Error("media setup was cancelled");
   mediaConfig = config;
   currentIcePolicy = "all";
+  const speechConstraints: MediaTrackConstraints = {
+    echoCancellation: true,
+    noiseSuppression: true,
+    autoGainControl: true,
+    channelCount: 1,
+  };
   const stream = await navigator.mediaDevices.getUserMedia({
-    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
+    audio: speechConstraints,
     video: false,
   });
   if (generation !== mediaGeneration) {
     stream.getTracks().forEach((track) => track.stop());
     throw new Error("media setup was cancelled");
+  }
+  for (const track of stream.getAudioTracks()) {
+    track.contentHint = "speech";
+    // WebKit has historically applied some capture constraints only when they
+    // are repeated on the live track. Failure is non-fatal because Safari may
+    // omit individual optional constraints while still providing processed audio.
+    await track.applyConstraints(speechConstraints).catch(() => undefined);
   }
   localStream = stream;
   const connection = new RTCPeerConnection({
@@ -1229,7 +1243,7 @@ async function refreshMediaConfig(): Promise<void> {
 }
 
 function applyPeerMode(mode: CallView["relay_mode"]): void {
-  localStream?.getAudioTracks().forEach((track) => { track.enabled = mode !== "listen"; });
+  localStream?.getAudioTracks().forEach((track) => { track.enabled = mode !== "listen" && !localMicMuted; });
   element<HTMLAudioElement>("remoteAudio").muted = mode === "talk";
 }
 
@@ -1251,6 +1265,7 @@ function closeMedia(clearCallId = true): void {
   currentIcePolicy = "all";
   lastRoute = "";
   relayRestartRequested = false;
+  localMicMuted = false;
   setupStartedAt = setupDurationMs = iceRestartCount = 0;
   lastStatsSummary = {};
   if (clearCallId) mediaCallId = "";
@@ -1308,8 +1323,9 @@ for (const [id, muted] of [["mute", true], ["unmute", false]] as const) {
   element(id).addEventListener("click", () => void (async () => {
     const callId = currentCall?.id ?? mediaCallId;
     if (!callId) throw new Error("there is no active call");
-    await sendEvent(callId, "mute", { muted });
-    log(muted ? "Android relay microphone muted" : "Android relay microphone unmuted");
+    localMicMuted = muted;
+    applyPeerMode(currentCall?.relay_mode ?? "full_duplex");
+    log(muted ? "iPhone microphone muted" : "iPhone microphone unmuted");
   })().catch((error) => log(`ERROR: ${String(error)}`)));
 }
 

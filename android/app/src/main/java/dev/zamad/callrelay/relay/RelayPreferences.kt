@@ -85,7 +85,7 @@ class RelayPreferences(context: Context) {
 
     var playbackGain: Double
         get() = java.lang.Double.longBitsToDouble(
-            preferences.getLong(KEY_PLAYBACK_GAIN, java.lang.Double.doubleToRawLongBits(1.0)),
+            preferences.getLong(KEY_PLAYBACK_GAIN, java.lang.Double.doubleToRawLongBits(DEFAULT_PLAYBACK_GAIN)),
         )
         set(value) = preferences.edit().putLong(
             KEY_PLAYBACK_GAIN,
@@ -132,6 +132,7 @@ class RelayPreferences(context: Context) {
         private const val KEY_CAPTURE_GAIN = "capture_gain"
         private const val KEY_PLAYBACK_GAIN = "playback_gain"
         private const val KEY_REMOTE_COMMANDS = "remote_commands"
+        private const val DEFAULT_PLAYBACK_GAIN = 1.35
         private val OFFICIAL_API_ORIGINS = setOf(
             "https://call-relay-staging.zamadshakil.workers.dev",
             "https://call-relay.zamadshakil.workers.dev",

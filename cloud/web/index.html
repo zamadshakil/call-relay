@@ -74,10 +74,11 @@
           <div id="incomingBanner" class="incoming" hidden><strong>Incoming SIM call</strong><span id="incomingState">Waiting for you</span></div>
           <div class="controls">
             <button data-event="accept" class="success">Accept</button><button data-event="reject" class="danger">Reject</button><button data-event="end" class="danger">End</button>
-            <button id="mute" class="secondary">Mute</button><button id="unmute" class="secondary">Unmute</button>
+            <button id="mute" class="secondary">Mute my mic</button><button id="unmute" class="secondary">Unmute my mic</button>
           </div>
           <details><summary>More call controls</summary>
-            <div class="controls"><button data-event="full_duplex" class="secondary">Full duplex</button><button data-event="listen" class="secondary">Listen only</button><button data-event="talk" class="secondary">Talk only</button></div>
+            <div class="controls"><button data-event="full_duplex" class="secondary">Echo-controlled</button><button data-event="listen" class="secondary">Listen only</button><button data-event="talk" class="secondary">Talk only</button></div>
+            <p class="privacy">Echo control briefly ducks the caller return while you speak.</p>
             <div class="dtmf-row"><input id="dtmf" maxlength="1" inputmode="tel" aria-label="DTMF digit" placeholder="0–9, * or #" /><button id="sendDtmf" class="secondary">Send tone</button></div>
           </details>
         </article>

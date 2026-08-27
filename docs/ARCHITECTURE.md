@@ -28,6 +28,8 @@ Each envelope binds protocol, call, sender, role, socket session, monotonic sequ
 - Listen: Android capture enabled; peer-to-Android playout muted.
 - Talk: Android capture muted; peer-to-Android playout enabled.
 
-The raw WebRTC audio device uses `VOICE_RECOGNITION`, 48 kHz output, a 48/16 kHz input fallback, media/speech attributes, `MODE_NORMAL`, software AEC, and no app-owned Telecom focus. Hardware AEC/NS are disabled. Capture/render processors apply gain, clipping protection, mute and meters while WebRTC receives the real reverse playout reference.
+The raw WebRTC audio device uses `VOICE_RECOGNITION`, 48 kHz output, a 48/16 kHz input fallback, media/speech attributes, `MODE_NORMAL`, software AEC, and no app-owned Telecom focus. Hardware AEC/NS are disabled. Capture/render processors apply gain, clipping protection, mute and meters while WebRTC receives the real reverse playout reference. Full-duplex mode also uses a render-aware echo guard: while the peer is speaking, only the WebRTC capture returned to that peer is briefly gated. This prevents the peer's speech from making an acoustic round trip back to itself, at the cost of suppressing simultaneous caller speech during that short interval.
+
+The Android speaker and cellular microphone cannot both be silent in this stock acoustic design. Muting either physical side breaks at least one relay direction because Android does not expose protected carrier-call PCM. A fully silent digital bridge requires a privileged/rooted Android audio integration, an HFP bridge, or a carrier/SIP media leg.
 
 No build or emulator can certify the acoustic path. A target handset must prove caller capture, peer-to-cellular uplink, double-talk, network recovery and 30-minute stability on a real SIM call.

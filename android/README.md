@@ -13,7 +13,9 @@ Implemented behavior:
 - `VOICE_RECOGNITION`, 48/16 kHz input selection, 48 kHz mono output, `MODE_NORMAL`, media/speech attributes, software AEC and disabled hardware AEC/NS.
 - Direct ICE first, forced Cloudflare TURN and ICE restart after eight seconds, failure at 20 seconds.
 - No SIM answer/dial before media connectivity; active media loss ends the SIM call after 15 seconds.
-- Full duplex, Listen, Talk, gain/mute/clipping meters, stats and TURN refresh.
+- Echo-controlled duplex, Listen, Talk, gain/mute/clipping meters, stats and TURN refresh.
+- Render-aware gating prevents peer speech from being acoustically returned to that peer. During overlapping speech this intentionally behaves as short voice-switched half duplex.
+- The Android speaker and cellular microphone must remain acoustically active; stock Android cannot provide a silent digital carrier-audio bridge.
 
 Build without Android Studio:
 
