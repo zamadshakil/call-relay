@@ -63,6 +63,7 @@ interface AccountSnapshot {
     sim: { carrierName: string; maskedNumber: string | null } | null;
   }>;
   pairing: Record<string, unknown> | null;
+  pairings?: Array<Record<string, unknown>>;
 }
 
 interface PendingPairingMaterial {
@@ -83,9 +84,20 @@ interface CallView {
   relay_mode: "full_duplex" | "listen" | "talk";
   version: number;
   created_at: number;
+  phone_number?: string | null;
   peer_accepted_at?: number | null;
   telecom_answer_requested_at?: number | null;
   sim_active_at?: number | null;
+  selected_pairing_id?: string | null;
+  selected_peer_device_id?: string | null;
+  recipient_status?: "ringing" | "selected" | "declined" | "answered_elsewhere" | "missed";
+}
+
+class RelayRequestError extends Error {
+  constructor(message: string, readonly status: number, readonly code?: string) {
+    super(message);
+    this.name = "RelayRequestError";
+  }
 }
 
 interface IceServerConfig {
@@ -124,6 +136,7 @@ const logElement = element<HTMLPreElement>("log");
 const log = (message: string): void => {
   logElement.textContent = `${new Date().toLocaleTimeString()}  ${message}\n${logElement.textContent ?? ""}`;
 };
+
 const hex = (bytes: Uint8Array): string => Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 const encodePayload = (value: JsonObject): string => base64Url(new TextEncoder().encode(JSON.stringify(value)));
 const decodePayload = (value: string): JsonObject => {
@@ -230,6 +243,18 @@ const incomingRecovery = new IncomingCallRecovery({
   },
   onPhase: (update) => renderIncomingPhase(update),
   onDeadline: (callId) => { void handleIncomingDeadline(callId); },
+});
+
+navigator.serviceWorker?.addEventListener("message", (event: MessageEvent<unknown>) => {
+  if (typeof event.data !== "object" || event.data === null) return;
+  const message = event.data as JsonObject;
+  const call = currentCall;
+  if (!call || message.type !== "call_cancelled" || message.callId !== call.id) return;
+  log("Incoming call was answered on another device");
+  incomingRecovery.reset(call.id);
+  currentCall = undefined;
+  closeMedia();
+  element("incomingBanner").hidden = true;
 });
 
 function loadIdentity(): StoredIdentity | undefined {
@@ -442,8 +467,9 @@ function render(): void {
     else showScreen("plansScreen");
     return;
   }
-  const pairingId = typeof account.pairing?.id === "string" ? account.pairing.id : undefined;
-  const pairingConfirmed = typeof account.pairing?.confirmed_at === "number";
+  const localPairing = accountPairingForDevice();
+  const pairingId = typeof localPairing?.id === "string" ? localPairing.id : undefined;
+  const pairingConfirmed = typeof localPairing?.confirmed_at === "number";
   if (!identity || !pairingId || !pairingConfirmed || !pairingKey) {
     showScreen("pairScreen");
     return;
@@ -476,7 +502,8 @@ function renderAccountDetails(): void {
       : "Approved account"],
     ["Android", android?.displayName ?? "Not registered"],
     ["SIM", android?.sim ? `${android.sim.carrierName}${android.sim.maskedNumber ? ` · ${android.sim.maskedNumber}` : ""}` : "Not configured"],
-    ["Peer", account.pairing ? "Paired" : "Not paired"],
+    ["Browser", accountPairingForDevice() ? "Paired" : "Not paired"],
+    ["Native iPhone", account.devices.some((device) => device.platform === "ios") ? "Registered" : "Not registered"],
   ];
   element("accountDetails").replaceChildren(...values.map(([label, value]) => {
     const row = document.createElement("div");
@@ -489,6 +516,13 @@ function renderAccountDetails(): void {
     return row;
   }));
   element<HTMLButtonElement>("managePlan").hidden = !account.subscription.billingRequired;
+}
+
+function accountPairingForDevice(): JsonObject | undefined {
+  if (!account || !identity) return undefined;
+  const candidates = account.pairings ?? (account.pairing ? [account.pairing] : []);
+  return candidates.find((pairing) => pairing.id === identity?.pairingId ||
+    pairing.device_a_id === identity?.deviceId || pairing.device_b_id === identity?.deviceId);
 }
 
 function apiUrl(path: string): string {
@@ -528,7 +562,11 @@ async function responseJson(response: Response): Promise<JsonObject> {
   const value: unknown = await response.json();
   if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("server returned invalid JSON");
   const data = value as JsonObject;
-  if (!response.ok) throw new Error(typeof data.error === "string" ? data.error : `request failed (${response.status})`);
+  if (!response.ok) throw new RelayRequestError(
+    typeof data.error === "string" ? data.error : `request failed (${response.status})`,
+    response.status,
+    typeof data.code === "string" ? data.code : undefined,
+  );
   return data;
 }
 
@@ -653,6 +691,7 @@ function pairingIdentityWasRevoked(code: number, reason: string): boolean {
 }
 
 async function clearLocalPairingState(reason: string): Promise<void> {
+  const clearedPairingId = identity?.pairingId;
   deliberatelyDisconnected = true;
   invalidateSignalSocket("pairing state reset");
   closeMedia();
@@ -671,7 +710,10 @@ async function clearLocalPairingState(reason: string): Promise<void> {
     delete identity.pairingId;
     saveIdentityWithoutRender();
   }
-  if (account) account = { ...account, pairing: null };
+  if (account) {
+    const remaining = account.pairings?.filter((pairing) => pairing.id !== clearedPairingId);
+    account = { ...account, pairing: remaining?.[0] ?? null, pairings: remaining };
+  }
   await Promise.all([deleteKey(pairingKeyName), deleteKey(pairingProofKeyName)]);
   log(`Pairing session cleared without signing out: ${reason}`);
   render();
@@ -680,7 +722,7 @@ async function clearLocalPairingState(reason: string): Promise<void> {
 async function ensureBrowserRegistration(replaceExisting = false): Promise<void> {
   await keysReady;
   if (!firebaseUser || !account?.subscription.active) return;
-  const serverOwnsLocalDevice = identity && account.devices.some((device) => device.id === identity?.deviceId && (device.platform === "browser" || device.platform === "ios"));
+  const serverOwnsLocalDevice = identity && account.devices.some((device) => device.id === identity?.deviceId && device.platform === "browser");
   if (serverOwnsLocalDevice && signingKey && agreementKey) return;
   if (identity || signingKey || agreementKey) await clearLocalDevice();
   const signing = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, false, ["sign", "verify"]);
@@ -700,7 +742,7 @@ async function ensureBrowserRegistration(replaceExisting = false): Promise<void>
   });
   if (response.status === 409 && !replaceExisting) {
     element<HTMLButtonElement>("replacePeer").hidden = false;
-    throw new Error("This account already has a peer. Choose Replace previously paired browser to continue.");
+    throw new Error("This account already has a browser peer. Choose Replace previously paired browser to continue.");
   }
   const data = await responseJson(response);
   signingKey = signing.privateKey;
@@ -934,8 +976,11 @@ function startPairingPolling(): void {
     attempts += 1;
     try {
       const data = await responseJson(await bearerFetch("/v1/pairings/current"));
-      if (typeof data.pairing !== "object" || data.pairing === null || Array.isArray(data.pairing)) return;
-      const pairing = data.pairing as JsonObject;
+      const candidates = Array.isArray(data.pairings) ? data.pairings : [data.pairing];
+      const pairingValue = candidates.find((value) => typeof value === "object" && value !== null && !Array.isArray(value)
+        && (value as JsonObject).id === pendingPairing?.pairingId);
+      if (typeof pairingValue !== "object" || pairingValue === null || Array.isArray(pairingValue)) return;
+      const pairing = pairingValue as JsonObject;
       if (typeof pairing.confirmed_at !== "number" || typeof pairing.android_proof !== "string") return;
       if (!pendingPairing || !pairingProofKey || pairing.id !== pendingPairing.pairingId) throw new Error("local pairing verification material is unavailable; replace the peer and scan again");
       const verified = await verifyAndroidProofWithKey(
@@ -1357,6 +1402,17 @@ async function applyCallSnapshot(call: CallView): Promise<void> {
   callSnapshotWatermarks.commit(call);
   currentCall = call;
   const incoming = element("incomingBanner");
+  if (["declined", "answered_elsewhere", "missed"].includes(call.recipient_status ?? "")) {
+    const label = call.recipient_status === "answered_elsewhere" ? "answered on another device" : call.recipient_status;
+    log(`Incoming call ${label}`);
+    closeMedia();
+    incomingRecovery.reset(call.id);
+    currentCall = undefined;
+    incoming.hidden = true;
+    return;
+  }
+  const incomingTitle = incoming.querySelector("strong");
+  if (incomingTitle) incomingTitle.textContent = call.phone_number || "Android cellular call";
   incoming.hidden = call.direction !== "incoming" || !["ringing_peer", "accepted", "active"].includes(call.state);
   const accepting = element<HTMLButtonElement>("acceptCall");
   if (call.state === "ringing_peer") {
@@ -1833,17 +1889,24 @@ document.querySelectorAll<HTMLButtonElement>("[data-event]").forEach((button) =>
       incomingRecovery.begin(callId, state !== "ringing_peer", true);
       await element<HTMLAudioElement>("remoteAudio").play().catch(() => undefined);
       await withTimeout(ensureSignalConnected(), 7_000, "Android signaling did not become ready");
-      const connection = await ensurePeerConnection(callId);
-      markIncomingConnectionPrepared(callId, connection);
       if (currentCall?.state === "ringing_peer") {
         try {
           await sendEvent(callId, "accept");
         } catch (error) {
           await recoverCurrentCall();
+          if (error instanceof RelayRequestError && error.code === "CALL_CLAIMED") {
+            log("Incoming call was answered on another device");
+            closeMedia();
+            return;
+          }
           if (currentCall?.id !== callId || !["accepted", "active"].includes(currentCall.state)) throw error;
           log("Incoming call was already accepted; continuing media recovery");
         }
       }
+      // Media authorization is deliberately granted only after this pairing
+      // wins the atomic call claim.
+      const connection = await ensurePeerConnection(callId);
+      markIncomingConnectionPrepared(callId, connection);
       incomingRecovery.markAccepted(callId);
       if (currentCall?.state === "active" && connection.connectionState === "connected") incomingRecovery.callActive(callId);
       incomingRecovery.requestMissingOffer("accept_ready", true);

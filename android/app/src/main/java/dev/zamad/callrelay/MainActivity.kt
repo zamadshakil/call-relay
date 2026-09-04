@@ -129,6 +129,7 @@ class MainActivity : ComponentActivity() {
                     brightenQr = ::setQrBrightness,
                     toggleRelay = viewModel::toggleRelay,
                     managePlan = { viewModel.managePlan(::openCustomTab) },
+                    addPeer = viewModel::addPeer,
                     replacePeer = viewModel::replacePeer,
                     signOut = viewModel::signOut,
                 ),

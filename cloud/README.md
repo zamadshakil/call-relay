@@ -20,7 +20,7 @@ Required encrypted production secrets in `approval_only` mode are `CF_TURN_KEY_I
 - `GET /v1/billing/plans`, `POST /v1/billing/checkout`, `POST /v1/billing/portal`
 - `POST /v1/billing/webhooks/paddle`
 - `POST /v1/devices/register`, `PUT /v1/devices/{id}/sim-profile`, `POST /v1/devices/{id}/revoke`
-- `POST /v1/pairing-invitations`, `POST /v1/pairing-invitations/{id}/consume`, `GET /v1/pairings/current`
+- `POST /v1/pairing-invitations`, `POST /v1/pairing-invitations/{id}/consume`, `GET /v1/pairings/current`, `GET /v1/pairings/current-device`
 
 ## Media and signaling API
 
@@ -30,6 +30,8 @@ Required encrypted production secrets in `approval_only` mode are `CF_TURN_KEY_I
 - `POST /v1/calls/{id}/events`
 
 The signaling Durable Object carries call snapshots, SDP offers/answers, ICE candidates and restart requests only. Audio travels directly or through Cloudflare TURN as encrypted DTLS-SRTP. TURN passwords, SDP, candidates, pairing secrets and audio are never written to D1 or logs.
+
+An account may have one Android relay, one browser peer, and one native iOS peer. Incoming snapshots are delivered to both peer pairing objects; D1 atomically selects the first peer that accepts and disables signaling for the losing pairing. The legacy singular `pairing` response remains alongside `pairings[]` for older clients.
 
 `POST /v1/calls/{id}/token` is permanently disabled with `410 Gone`.
 

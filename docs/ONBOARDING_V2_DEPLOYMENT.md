@@ -138,7 +138,7 @@ Expected consumer flow:
 Create production Paddle product/prices, API key, client token, and webhook independently from sandbox. Update production price IDs and `cloud\.env.production`, prepare production secrets with `--omit-enrollment-invite`, apply migrations `0005` and `0006`, and seed approved accounts. Migration `0006` preserves legacy registration-token pushes while new clients use Firebase Installation IDs. Then:
 
 1. Confirm there are no active calls.
-2. Set production `ONBOARDING_V2_ENABLED=true` and `MIN_ANDROID_APP_VERSION=3`, then remove `ENROLLMENT_INVITE` from the production required-secret declaration.
+2. Set production `ONBOARDING_V2_ENABLED=true` and `MIN_ANDROID_APP_VERSION=7`, then remove `ENROLLMENT_INVITE` from the production required-secret declaration.
 3. Run `pnpm preflight:production`, `pnpm check`, and `pnpm test`.
 4. Deploy Worker/PWA, install the release APK, and verify `/v1/devices/enroll` returns `410`.
 5. Delete the old production `ENROLLMENT_INVITE` secret after the v2 deployment is healthy. Keep it only in the isolated staging environment while the legacy staging APK is still supported.

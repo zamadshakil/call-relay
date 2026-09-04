@@ -220,11 +220,11 @@ describe("Worker control plane", () => {
     websocketResponse.webSocket?.close(1000, "test complete");
 
     const secondBrowser = await enroll("browser", "Second browser peer");
-    const conflictingPairing = await signedFetch(secondBrowser, "/v1/pairings", "POST", {
+    const additionalLegacyPairing = await signedFetch(secondBrowser, "/v1/pairings", "POST", {
       peerDeviceId: android.deviceId,
       secretCommitment: commitment,
     });
-    expect(conflictingPairing.status).toBe(409);
+    expect(additionalLegacyPairing.status).toBe(201);
 
     const requestId = crypto.randomUUID();
     const outgoingRequest = { pairingId, phoneNumber: "+923001234567", requestId };
@@ -301,6 +301,8 @@ describe("Worker control plane", () => {
         },
       }, { status: 201 });
     });
+    const accepted = await event(browser, incomingCallId, "accept");
+    expect((await json(accepted)).state).toBe("accepted");
     const mediaResponse = await signedFetch(browser, `/v1/calls/${incomingCallId}/media-config`, "POST", {});
     expect(mediaResponse.status).toBe(200);
     const media = await json(mediaResponse);
@@ -318,8 +320,8 @@ describe("Worker control plane", () => {
     const removedToken = await signedFetch(browser, `/v1/calls/${incomingCallId}/token`, "POST", {});
     expect(removedToken.status).toBe(410);
 
-    const accepted = await event(browser, incomingCallId, "accept");
-    expect((await json(accepted)).state).toBe("accepted");
+    const duplicateAccept = await event(browser, incomingCallId, "accept");
+    expect(await json(duplicateAccept)).toMatchObject({ state: "accepted", duplicate: true });
     const acceptedTimestamp = await env.CALL_RELAY_DB.prepare(
       "SELECT updated_at FROM call_sessions WHERE id = ?",
     ).bind(incomingCallId).first<{ updated_at: number }>();
@@ -443,6 +445,7 @@ describe("Worker control plane", () => {
       requestId: crypto.randomUUID(),
     });
     const callId = String((await json(callResponse)).callId);
+    expect((await event(browser, callId, "accept")).status).toBe(200);
 
     let revokeAttempts = 0;
     vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {

@@ -95,6 +95,7 @@ export async function createMediaConfig(env: Env, call: CallRow, device: DeviceR
   credentialsExpiresAt: number;
   protocolVersion: 1;
 }> {
+  const selectedPairingId = call.selected_pairing_id ?? call.pairing_id;
   const keyId = await secretValue(env.CF_TURN_KEY_ID, "CF_TURN_KEY_ID");
   const customIdentifier = (await sha256Hex(new TextEncoder().encode(`${call.id}:${device.id === call.android_device_id ? "android" : "peer"}`))).slice(0, 32);
   let response: Response | undefined;
@@ -138,17 +139,17 @@ export async function createMediaConfig(env: Env, call: CallRow, device: DeviceR
       `INSERT INTO turn_credentials(username, call_id, device_id, custom_identifier, created_at, expires_at)
        SELECT ?, ?, ?, ?, ?, ?
        FROM call_sessions cs
-       JOIN pairings p ON p.id = cs.pairing_id
+       JOIN pairings p ON p.id = COALESCE(cs.selected_pairing_id, cs.pairing_id)
        JOIN devices d ON d.id = ?
-       WHERE cs.id = ? AND cs.pairing_id = ?
-         AND (cs.android_device_id = ? OR cs.peer_device_id = ?)
+       WHERE cs.id = ? AND COALESCE(cs.selected_pairing_id, cs.pairing_id) = ?
+         AND (cs.android_device_id = ? OR COALESCE(cs.selected_peer_device_id, cs.peer_device_id) = ?)
          AND cs.state NOT IN ('ending', 'ended', 'failed')
          AND p.confirmed_at IS NOT NULL AND p.revoked_at IS NULL
          AND d.revoked_at IS NULL
        ON CONFLICT(username) DO NOTHING`,
     ).bind(
       username, call.id, device.id, customIdentifier, now, expiresAt,
-      device.id, call.id, call.pairing_id, device.id, device.id,
+      device.id, call.id, selectedPairingId, device.id, device.id,
     ),
     env.CALL_RELAY_DB.prepare(
       `UPDATE call_sessions AS cs
@@ -195,7 +196,7 @@ export async function createMediaConfig(env: Env, call: CallRow, device: DeviceR
               p.revoked_at AS pairing_revoked_at, d.id AS device_id,
               d.revoked_at AS device_revoked_at
        FROM call_sessions cs
-       LEFT JOIN pairings p ON p.id = cs.pairing_id
+       LEFT JOIN pairings p ON p.id = COALESCE(cs.selected_pairing_id, cs.pairing_id)
        LEFT JOIN devices d ON d.id = ?
        WHERE cs.id = ?`,
     ).bind(device.id, call.id).first<{
@@ -260,7 +261,7 @@ export async function revokeTurnCredentialsForPairing(env: Env, pairingId: strin
   const credentials = await env.CALL_RELAY_DB.prepare(
     `SELECT tc.* FROM turn_credentials tc
      JOIN call_sessions cs ON cs.id = tc.call_id
-     WHERE cs.pairing_id = ? AND tc.revoked_at IS NULL
+     WHERE COALESCE(cs.selected_pairing_id, cs.pairing_id) = ? AND tc.revoked_at IS NULL
      ORDER BY tc.created_at LIMIT 50`,
   ).bind(pairingId).all<TurnCredentialRow>();
   await Promise.allSettled(credentials.results.map((credential) => revokeOne(env, credential)));

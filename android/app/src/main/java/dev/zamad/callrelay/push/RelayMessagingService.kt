@@ -47,6 +47,7 @@ class RelayMessagingService : FirebaseMessagingService() {
                 type = type,
                 event = event,
                 callId = callId,
+                pairingId = data["pairingId"].orEmpty(),
                 phoneNumber = data["phoneNumber"].orEmpty(),
                 digit = data["digit"].orEmpty(),
                 muted = data["muted"].orEmpty(),

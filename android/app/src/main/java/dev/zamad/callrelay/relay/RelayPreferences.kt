@@ -16,6 +16,7 @@ class RelayPreferences(context: Context) {
             clearEnvironmentIdentity()
             preferences.edit().putString(KEY_API_BASE, BuildConfig.DEFAULT_API_BASE_URL).apply()
         }
+        migrateLegacyPairing()
     }
 
     var apiBaseUrl: String
@@ -48,6 +49,9 @@ class RelayPreferences(context: Context) {
 
     var pairingSecret: String
         get() {
+            pairingId.takeIf(String::isNotBlank)?.let { id ->
+                secureSecretStore.get(pairingSecretKey(id))?.let { return it }
+            }
             secureSecretStore.get()?.let { return it }
             val legacy = preferences.getString(KEY_PAIRING_SECRET, "").orEmpty()
             if (legacy.isNotBlank()) {
@@ -58,12 +62,21 @@ class RelayPreferences(context: Context) {
         }
         set(value) {
             secureSecretStore.put(value)
+            if (pairingId.isNotBlank()) {
+                secureSecretStore.put(pairingSecretKey(pairingId), value)
+                upsertPairing(PairingRecord(pairingId, value, pairingConfirmed))
+            }
             preferences.edit().remove(KEY_PAIRING_SECRET).apply()
         }
 
     var pairingConfirmed: Boolean
         get() = preferences.getBoolean(KEY_PAIRING_CONFIRMED, false)
-        set(value) = preferences.edit().putBoolean(KEY_PAIRING_CONFIRMED, value).apply()
+        set(value) {
+            preferences.edit().putBoolean(KEY_PAIRING_CONFIRMED, value).apply()
+            if (pairingId.isNotBlank() && pairingSecret.isNotBlank()) {
+                upsertPairing(PairingRecord(pairingId, pairingSecret, value))
+            }
+        }
 
     var selectedPhoneAccount: String
         get() = preferences.getString(KEY_PHONE_ACCOUNT, "") ?: ""
@@ -114,14 +127,79 @@ class RelayPreferences(context: Context) {
             java.lang.Double.doubleToRawLongBits(value.coerceIn(0.0, 4.0)),
         ).apply()
 
+    data class PairingRecord(
+        val id: String,
+        val secret: String,
+        val confirmed: Boolean,
+        val peerDeviceId: String = "",
+        val peerPlatform: String = "peer",
+    )
+
+    fun pairings(): List<PairingRecord> = synchronized(commandLock) {
+        val array = runCatching { JSONArray(preferences.getString(KEY_PAIRINGS, "[]").orEmpty()) }.getOrElse { JSONArray() }
+        buildList {
+            for (index in 0 until array.length()) {
+                val value = array.optJSONObject(index) ?: continue
+                val id = value.optString("id")
+                val secret = secureSecretStore.get(pairingSecretKey(id)).orEmpty()
+                if (id.isBlank() || secret.isBlank()) continue
+                add(PairingRecord(
+                    id = id,
+                    secret = secret,
+                    confirmed = value.optBoolean("confirmed"),
+                    peerDeviceId = value.optString("peerDeviceId"),
+                    peerPlatform = value.optString("peerPlatform", "peer"),
+                ))
+            }
+        }
+    }
+
+    fun confirmedPairings(): List<PairingRecord> = pairings().filter(PairingRecord::confirmed)
+
+    fun pairing(pairingId: String): PairingRecord? = pairings().firstOrNull { it.id == pairingId }
+
+    fun upsertPairing(record: PairingRecord) = synchronized(commandLock) {
+        if (record.id.isBlank() || record.secret.isBlank()) return@synchronized
+        secureSecretStore.put(pairingSecretKey(record.id), record.secret)
+        val records = pairings().filterNot { it.id == record.id } + record
+        savePairingMetadata(records)
+    }
+
+    fun removePairing(pairingId: String) = synchronized(commandLock) {
+        if (pairingId.isBlank()) return@synchronized
+        secureSecretStore.put(pairingSecretKey(pairingId), "")
+        val remaining = pairings().filterNot { it.id == pairingId }
+        savePairingMetadata(remaining)
+        if (this.pairingId == pairingId) {
+            val next = remaining.lastOrNull()
+            preferences.edit()
+                .putString(KEY_PAIRING_ID, next?.id.orEmpty())
+                .putBoolean(KEY_PAIRING_CONFIRMED, next?.confirmed == true)
+                .apply()
+            secureSecretStore.put(next?.secret.orEmpty())
+        }
+    }
+
+    /** Keeps old single-pair call sites pointed at a valid record during migration. */
+    fun activateLegacyPairing(pairingId: String): Boolean = synchronized(commandLock) {
+        val record = pairing(pairingId) ?: return@synchronized false
+        preferences.edit()
+            .putString(KEY_PAIRING_ID, record.id)
+            .putBoolean(KEY_PAIRING_CONFIRMED, record.confirmed)
+            .commit()
+        secureSecretStore.put(record.secret)
+        true
+    }
+
     fun configured(): Boolean = apiBaseUrl.startsWith("https://") &&
-        deviceId.isNotBlank() && pairingId.isNotBlank() && pairingSecret.isNotBlank() && pairingConfirmed
+        deviceId.isNotBlank() && confirmedPairings().isNotEmpty()
 
     data class RemoteCommand(
         val id: String,
         val type: String,
         val event: String,
         val callId: String,
+        val pairingId: String,
         val phoneNumber: String,
         val digit: String,
         val muted: String,
@@ -153,6 +231,7 @@ class RelayPreferences(context: Context) {
                         type = value.optString("type"),
                         event = value.optString("event"),
                         callId = value.optString("callId"),
+                        pairingId = value.optString("pairingId"),
                         phoneNumber = value.optString("phoneNumber"),
                         digit = value.optString("digit"),
                         muted = value.optString("muted"),
@@ -216,10 +295,12 @@ class RelayPreferences(context: Context) {
      * without unexpectedly signing the user out.
      */
     fun clearPairing() = synchronized(commandLock) {
+        pairings().forEach { secureSecretStore.put(pairingSecretKey(it.id), "") }
         preferences.edit()
             .remove(KEY_PAIRING_ID)
             .remove(KEY_PAIRING_SECRET)
             .remove(KEY_PAIRING_CONFIRMED)
+            .remove(KEY_PAIRINGS)
             .remove(KEY_PENDING_REMOTE_COMMANDS)
             .remove(KEY_PROCESSED_REMOTE_COMMANDS)
             .remove(KEY_ACTIVE_CALL_ID)
@@ -230,6 +311,38 @@ class RelayPreferences(context: Context) {
         secureSecretStore.put("")
         Unit
     }
+
+    private fun migrateLegacyPairing() = synchronized(commandLock) {
+        if (preferences.contains(KEY_PAIRINGS)) return@synchronized
+        val id = preferences.getString(KEY_PAIRING_ID, "").orEmpty()
+        val secret = secureSecretStore.get()
+            ?: preferences.getString(KEY_PAIRING_SECRET, "").orEmpty()
+        if (id.isBlank() || secret.isBlank()) {
+            preferences.edit().putString(KEY_PAIRINGS, "[]").apply()
+            return@synchronized
+        }
+        secureSecretStore.put(pairingSecretKey(id), secret)
+        savePairingMetadata(listOf(PairingRecord(
+            id = id,
+            secret = secret,
+            confirmed = preferences.getBoolean(KEY_PAIRING_CONFIRMED, false),
+        )))
+        preferences.edit().remove(KEY_PAIRING_SECRET).apply()
+    }
+
+    private fun savePairingMetadata(records: List<PairingRecord>) {
+        val array = JSONArray()
+        records.distinctBy(PairingRecord::id).forEach { record ->
+            array.put(JSONObject()
+                .put("id", record.id)
+                .put("confirmed", record.confirmed)
+                .put("peerDeviceId", record.peerDeviceId)
+                .put("peerPlatform", record.peerPlatform))
+        }
+        preferences.edit().putString(KEY_PAIRINGS, array.toString()).commit()
+    }
+
+    private fun pairingSecretKey(pairingId: String): String = "pairing_secret_v2_$pairingId"
 
     private fun processedCommandIds(): List<String> = preferences.getString(KEY_PROCESSED_REMOTE_COMMANDS, "")
         .orEmpty().lineSequence().filter(String::isNotBlank).toList()
@@ -246,6 +359,7 @@ class RelayPreferences(context: Context) {
                     .put("type", command.type)
                     .put("event", command.event)
                     .put("callId", command.callId)
+                    .put("pairingId", command.pairingId)
                     .put("phoneNumber", command.phoneNumber)
                     .put("digit", command.digit)
                     .put("muted", command.muted)
@@ -257,11 +371,13 @@ class RelayPreferences(context: Context) {
     }
 
     private fun clearEnvironmentIdentity() {
+        pairings().forEach { secureSecretStore.put(pairingSecretKey(it.id), "") }
         preferences.edit()
             .remove(KEY_DEVICE_ID)
             .remove(KEY_PAIRING_ID)
             .remove(KEY_PAIRING_SECRET)
             .remove(KEY_PAIRING_CONFIRMED)
+            .remove(KEY_PAIRINGS)
             .remove(KEY_PENDING_REMOTE_COMMANDS)
             .remove(KEY_PROCESSED_REMOTE_COMMANDS)
             .remove(KEY_ACTIVE_CALL_ID)
@@ -279,6 +395,7 @@ class RelayPreferences(context: Context) {
         private const val KEY_PAIRING_ID = "pairing_id"
         private const val KEY_PAIRING_SECRET = "pairing_secret"
         private const val KEY_PAIRING_CONFIRMED = "pairing_confirmed"
+        private const val KEY_PAIRINGS = "pairings_v2"
         private const val KEY_PHONE_ACCOUNT = "phone_account"
         private const val KEY_SIM_PROFILE_UPLOADED = "sim_profile_uploaded"
         private const val KEY_ACCOUNT_EMAIL = "account_email"

@@ -163,7 +163,7 @@ export async function confirmPairingV2(request: Request, env: Env, device: Devic
 
 export async function currentPairingForAccount(request: Request, env: Env): Promise<Response> {
   const account = await authenticateFirebase(request, env);
-  const row = await env.CALL_RELAY_DB.prepare(
+  const rows = await env.CALL_RELAY_DB.prepare(
     `SELECT p.id, p.protocol_version, p.confirmed_at, p.revoked_at, p.device_a_id, p.device_b_id,
       p.secret_commitment, p.peer_proof, p.android_proof, p.invitation_id,
       pi.peer_public_key_raw, pi.expires_at, pi.consumed_at,
@@ -173,19 +173,21 @@ export async function currentPairingForAccount(request: Request, env: Env): Prom
      JOIN devices da ON da.id = p.device_a_id
      JOIN devices db ON db.id = p.device_b_id
      LEFT JOIN pairing_invitations pi ON pi.id = p.invitation_id
-     WHERE p.user_id = ? AND p.revoked_at IS NULL ORDER BY p.created_at DESC LIMIT 1`,
-  ).bind(account.identity.uid).first<Record<string, unknown>>();
-  return json({ pairing: row ?? null });
+     WHERE p.user_id = ? AND p.revoked_at IS NULL ORDER BY p.created_at DESC`,
+  ).bind(account.identity.uid).all<Record<string, unknown>>();
+  return json({ pairing: rows.results[0] ?? null, pairings: rows.results });
 }
 
 export async function pendingPairingForDevice(env: Env, device: DeviceRow): Promise<Response> {
   if (!device.user_id) throw new HttpError(404, "pairing not found");
-  const row = await env.CALL_RELAY_DB.prepare(
+  const rows = await env.CALL_RELAY_DB.prepare(
     `SELECT p.id, p.protocol_version, p.confirmed_at, p.secret_commitment, p.peer_proof, p.android_proof,
-      p.invitation_id, pi.peer_device_id, pi.peer_public_key_raw, pi.expires_at
+      p.invitation_id, pi.peer_device_id, pi.peer_public_key_raw, pi.expires_at,
+      peer.platform AS peer_platform, peer.display_name AS peer_display_name
      FROM pairings p JOIN pairing_invitations pi ON pi.id = p.invitation_id
+     JOIN devices peer ON peer.id = CASE WHEN p.device_a_id = ? THEN p.device_b_id ELSE p.device_a_id END
      WHERE p.user_id = ? AND p.revoked_at IS NULL AND (p.device_a_id = ? OR p.device_b_id = ?)
-     ORDER BY p.created_at DESC LIMIT 1`,
-  ).bind(device.user_id, device.id, device.id).first<Record<string, unknown>>();
-  return json({ pairing: row ?? null });
+     ORDER BY p.created_at DESC`,
+  ).bind(device.id, device.user_id, device.id, device.id).all<Record<string, unknown>>();
+  return json({ pairing: rows.results[0] ?? null, pairings: rows.results });
 }

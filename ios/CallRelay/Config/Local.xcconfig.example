@@ -1,0 +1,5 @@
+// Copy this file to Local.xcconfig. Keep the real value out of git.
+// Find REVERSED_CLIENT_ID in GoogleService-Info.plist.
+GOOGLE_REVERSED_CLIENT_ID = com.googleusercontent.apps.000000000000-example
+// Optional local/staging override:
+// API_BASE_URL = https:/$()/call-relay-staging.example.workers.dev

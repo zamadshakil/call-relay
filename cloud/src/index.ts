@@ -20,7 +20,7 @@ import { createSignalTicket, SIGNALING_PROTOCOL, signalRole, signalTicketFromPro
 import { recordDeviceHeartbeat } from "./presence";
 import { canTransition, isE164 } from "./state";
 import { createMediaConfig, revokeDueTurnCredentials, revokeTurnCredentialsForCall } from "./turn";
-import type { CallRow, CallState, DeviceRow, Env, PairingRow, Platform, PushJob, RelayMode } from "./types";
+import type { CallRecipientRow, CallRow, CallState, DeviceRow, Env, PairingRow, Platform, PushJob, RelayMode } from "./types";
 import { deleteWebPushSubscription, saveWebPushSubscription, webPushConfig } from "./web-push";
 
 export { PairingSignal };
@@ -84,26 +84,71 @@ async function getPairing(env: Env, pairingId: string): Promise<PairingRow> {
   return pairing;
 }
 
+async function callRecipient(env: Env, callId: string, deviceId: string): Promise<CallRecipientRow | null> {
+  return env.CALL_RELAY_DB.prepare(
+    "SELECT * FROM call_recipients WHERE call_id = ? AND peer_device_id = ?",
+  ).bind(callId, deviceId).first<CallRecipientRow>();
+}
+
+async function callSnapshotForDevice(env: Env, call: CallRow, deviceId: string): Promise<Record<string, unknown>> {
+  if (deviceId === call.android_device_id) return { ...call };
+  const recipient = await callRecipient(env, call.id, deviceId);
+  if (!recipient) throw new HttpError(403, "device is not a member of this call");
+  return { ...call, recipient_status: recipient.status };
+}
+
 async function broadcastCall(env: Env, call: CallRow): Promise<void> {
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    try {
-      // Recreate the stub on every attempt because a thrown DO RPC can poison a stub.
-      await env.PAIRING_SIGNAL.getByName(call.pairing_id).publishSnapshot(JSON.stringify(call));
-      return;
-    } catch (error) {
-      const durableError = error as Error & { retryable?: boolean; overloaded?: boolean };
-      if (durableError.overloaded || !durableError.retryable || attempt === 2) {
-        console.error(JSON.stringify({ message: "call snapshot broadcast failed", callId: call.id, error: durableError.message }));
+  const recipients = await env.CALL_RELAY_DB.prepare(
+    "SELECT * FROM call_recipients WHERE call_id = ? ORDER BY created_at, pairing_id",
+  ).bind(call.id).all<CallRecipientRow>();
+  const targets = recipients.results.length > 0
+    ? recipients.results
+    : [{ call_id: call.id, pairing_id: call.pairing_id, peer_device_id: call.peer_device_id, status: "selected" as const, created_at: call.created_at, responded_at: null }];
+  await Promise.all(targets.map(async (recipient) => {
+    const snapshot = JSON.stringify({ ...call, recipient_status: recipient.status });
+    const signalingAllowed = (recipients.results.length > 0
+      ? call.selected_pairing_id === recipient.pairing_id
+      : (call.selected_pairing_id ?? call.pairing_id) === recipient.pairing_id)
+      && !["ending", "ended", "failed"].includes(call.state);
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        // Recreate the stub on every attempt because a thrown DO RPC can poison a stub.
+        await env.PAIRING_SIGNAL.getByName(recipient.pairing_id).publishSnapshot(snapshot, signalingAllowed);
         return;
+      } catch (error) {
+        const durableError = error as Error & { retryable?: boolean; overloaded?: boolean };
+        if (durableError.overloaded || !durableError.retryable || attempt === 2) {
+          console.error(JSON.stringify({
+            message: "call snapshot broadcast failed",
+            callId: call.id,
+            pairingId: recipient.pairing_id,
+            error: durableError.message,
+          }));
+          return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 50 * (2 ** attempt)));
       }
-      await new Promise((resolve) => setTimeout(resolve, 50 * (2 ** attempt)));
     }
+  }));
+}
+
+async function assertCallMember(env: Env, call: CallRow, deviceId: string): Promise<void> {
+  if (call.android_device_id !== deviceId && !await callRecipient(env, call.id, deviceId)) {
+    throw new HttpError(403, "device is not a member of this call");
   }
 }
 
-function assertCallMember(call: CallRow, deviceId: string): void {
-  if (call.android_device_id !== deviceId && call.peer_device_id !== deviceId) {
-    throw new HttpError(403, "device is not a member of this call");
+async function assertSelectedCallMember(env: Env, call: CallRow, deviceId: string): Promise<void> {
+  if (call.android_device_id === deviceId) return;
+  let selectedPeerDeviceId = call.selected_peer_device_id;
+  if (!selectedPeerDeviceId) {
+    const recipientBacked = await env.CALL_RELAY_DB.prepare(
+      "SELECT 1 AS present FROM call_recipients WHERE call_id = ? LIMIT 1",
+    ).bind(call.id).first<{ present: number }>();
+    if (!recipientBacked) selectedPeerDeviceId = call.peer_device_id;
+  }
+  if (call.android_device_id !== deviceId && selectedPeerDeviceId !== deviceId) {
+    throw new HttpError(403, "only the selected peer may control this call", "CALL_NOT_SELECTED");
   }
 }
 
@@ -163,11 +208,9 @@ async function pair(request: Request, env: Env, device: DeviceRow): Promise<Resp
   }
   const conflictingPairing = await env.CALL_RELAY_DB.prepare(
     `SELECT id FROM pairings
-     WHERE revoked_at IS NULL AND (
-       device_a_id IN (?, ?) OR device_b_id IN (?, ?)
-     ) LIMIT 1`,
-  ).bind(deviceA, deviceB, deviceA, deviceB).first<{ id: string }>();
-  if (conflictingPairing) throw new HttpError(409, "one of these devices already has a paired peer");
+     WHERE revoked_at IS NULL AND (device_a_id = ? OR device_b_id = ?) LIMIT 1`,
+  ).bind(device.id, device.id).first<{ id: string }>();
+  if (conflictingPairing) throw new HttpError(409, "this peer already has an active pairing");
   const pairingId = id("pair");
   try {
     await env.CALL_RELAY_DB.prepare(
@@ -175,12 +218,9 @@ async function pair(request: Request, env: Env, device: DeviceRow): Promise<Resp
     ).bind(pairingId, deviceA, deviceB, commitment, now, device.id).run();
   } catch (error) {
     const raceConflict = await env.CALL_RELAY_DB.prepare(
-      `SELECT id FROM pairings
-       WHERE revoked_at IS NULL AND (
-         device_a_id IN (?, ?) OR device_b_id IN (?, ?)
-       ) LIMIT 1`,
-    ).bind(deviceA, deviceB, deviceA, deviceB).first<{ id: string }>();
-    if (raceConflict) throw new HttpError(409, "one of these devices already has a paired peer");
+      "SELECT id FROM pairings WHERE revoked_at IS NULL AND (device_a_id = ? OR device_b_id = ?) LIMIT 1",
+    ).bind(device.id, device.id).first<{ id: string }>();
+    if (raceConflict) throw new HttpError(409, "this peer already has an active pairing");
     throw error;
   }
   return json({ pairingId, confirmed: false }, { status: 201 });
@@ -221,6 +261,13 @@ async function expireStaleForAndroid(env: Env, ctx: ExecutionContext, androidDev
        (state = 'ending' AND updated_at < ?)
      )`,
   ).bind(now, now, androidDeviceId, now - 120_000, now - 90_000, now - 30_000).run();
+  if (stale.results.length > 0) {
+    const placeholders = stale.results.map(() => "?").join(",");
+    await env.CALL_RELAY_DB.prepare(
+      `UPDATE call_recipients SET status = 'missed', responded_at = COALESCE(responded_at, ?)
+       WHERE call_id IN (${placeholders}) AND status = 'ringing'`,
+    ).bind(now, ...stale.results.map((call) => call.id)).run();
+  }
   for (const staleCall of stale.results) {
     const updated = await getCall(env, staleCall.id);
     await broadcastCall(env, updated);
@@ -230,27 +277,50 @@ async function expireStaleForAndroid(env: Env, ctx: ExecutionContext, androidDev
 
 async function createCall(request: Request, env: Env, ctx: ExecutionContext, device: DeviceRow, direction: "incoming" | "outgoing"): Promise<Response> {
   const body = await readJson<JsonObject>(request);
-  const pairingId = requireId(body.pairingId, "pairingId", "pair");
   const requestId = requireCommandId(body.requestId);
-  const pairing = await env.CALL_RELAY_DB.prepare(
-    "SELECT * FROM pairings WHERE id = ? AND revoked_at IS NULL AND confirmed_at IS NOT NULL",
-  ).bind(pairingId).first<PairingRow>();
-  if (!pairing || (pairing.device_a_id !== device.id && pairing.device_b_id !== device.id)) throw new HttpError(403, "confirmed pairing is unavailable");
-  const peerId = pairing.device_a_id === device.id ? pairing.device_b_id : pairing.device_a_id;
-  const peer = await env.CALL_RELAY_DB.prepare("SELECT id, platform FROM devices WHERE id = ? AND revoked_at IS NULL")
-    .bind(peerId).first<{ id: string; platform: Platform }>();
-  if (!peer) throw new HttpError(409, "paired peer is unavailable");
-  const androidDeviceId = device.platform === "android" ? device.id : peer.platform === "android" ? peer.id : "";
-  if (!androidDeviceId) throw new HttpError(409, "a pairing must contain one Android device");
-  const peerDeviceId = androidDeviceId === device.id ? peer.id : device.id;
-  if (direction === "incoming" && device.id !== androidDeviceId) throw new HttpError(403, "incoming calls originate on Android");
-  if (direction === "outgoing" && device.id === androidDeviceId) throw new HttpError(403, "outgoing requests originate on the peer");
+  const requestedPairingId = body.pairingId === undefined ? null : requireId(body.pairingId, "pairingId", "pair");
+  type EligiblePairing = { pairing_id: string; android_device_id: string; peer_device_id: string; peer_platform: Platform };
+  let eligiblePairings: EligiblePairing[];
+  if (direction === "incoming") {
+    if (device.platform !== "android") throw new HttpError(403, "incoming calls originate on Android");
+    const rows = await env.CALL_RELAY_DB.prepare(
+      `SELECT p.id AS pairing_id, ? AS android_device_id, peer.id AS peer_device_id, peer.platform AS peer_platform
+       FROM pairings p
+       JOIN devices peer ON peer.id = CASE WHEN p.device_a_id = ? THEN p.device_b_id ELSE p.device_a_id END
+       WHERE p.revoked_at IS NULL AND p.confirmed_at IS NOT NULL
+         AND (p.device_a_id = ? OR p.device_b_id = ?)
+         AND peer.revoked_at IS NULL AND peer.platform IN ('browser', 'ios')
+       ORDER BY CASE WHEN p.id = ? THEN 0 ELSE 1 END, p.created_at`,
+    ).bind(device.id, device.id, device.id, device.id, requestedPairingId ?? "").all<EligiblePairing>();
+    eligiblePairings = rows.results;
+    if (requestedPairingId && !eligiblePairings.some((pairing) => pairing.pairing_id === requestedPairingId)) {
+      throw new HttpError(403, "confirmed pairing is unavailable");
+    }
+  } else {
+    if (device.platform === "android") throw new HttpError(403, "outgoing requests originate on a peer");
+    if (!requestedPairingId) throw new HttpError(400, "pairingId is required for outgoing calls");
+    const pairing = await env.CALL_RELAY_DB.prepare(
+      `SELECT p.id AS pairing_id, android.id AS android_device_id, ? AS peer_device_id, ? AS peer_platform
+       FROM pairings p
+       JOIN devices android ON android.id = CASE WHEN p.device_a_id = ? THEN p.device_b_id ELSE p.device_a_id END
+       WHERE p.id = ? AND p.revoked_at IS NULL AND p.confirmed_at IS NOT NULL
+         AND (p.device_a_id = ? OR p.device_b_id = ?)
+         AND android.revoked_at IS NULL AND android.platform = 'android'`,
+    ).bind(device.id, device.platform, device.id, requestedPairingId, device.id, device.id).first<EligiblePairing>();
+    if (!pairing) throw new HttpError(403, "confirmed pairing is unavailable");
+    eligiblePairings = [pairing];
+  }
+  if (eligiblePairings.length === 0) throw new HttpError(409, "no confirmed peer pairing is available");
+  const primary = eligiblePairings[0]!;
+  const pairingId = primary.pairing_id;
+  const androidDeviceId = primary.android_device_id;
+  const peerDeviceId = primary.peer_device_id;
   const existingRequest = await env.CALL_RELAY_DB.prepare(
-    "SELECT id, state FROM call_sessions WHERE pairing_id = ? AND direction = ? AND request_id = ?",
-  ).bind(pairingId, direction, requestId).first<{ id: string; state: CallState }>();
+    "SELECT id, state FROM call_sessions WHERE android_device_id = ? AND direction = ? AND request_id = ?",
+  ).bind(androidDeviceId, direction, requestId).first<{ id: string; state: CallState }>();
   if (existingRequest) return json({ callId: existingRequest.id, state: existingRequest.state, duplicate: true });
   let phoneNumber: string | null = null;
-  if (direction === "outgoing") {
+  if (direction === "outgoing" || body.phoneNumber !== undefined) {
     phoneNumber = requireString(body.phoneNumber, "phoneNumber", 18);
     if (!isE164(phoneNumber)) throw new HttpError(400, "phoneNumber must be E.164");
   }
@@ -258,33 +328,59 @@ async function createCall(request: Request, env: Env, ctx: ExecutionContext, dev
   const now = Date.now();
   await expireStaleForAndroid(env, ctx, androidDeviceId, now);
   const state: CallState = direction === "incoming" ? "ringing_peer" : "dialing_sim";
-  const targetDeviceId = direction === "outgoing" ? androidDeviceId : peerDeviceId;
-  const targetPlatform = targetDeviceId === device.id ? device.platform : peer.platform;
-  const pushChannel = targetPlatform === "android" ? "android_fcm" : targetPlatform === "browser" ? "web_push" : null;
-  const outboxId = pushChannel ? id("push") : null;
+  const selectedPairingId = direction === "outgoing" ? pairingId : null;
+  const selectedPeerDeviceId = direction === "outgoing" ? peerDeviceId : null;
+  const outboxIds: string[] = [];
   const statements: D1PreparedStatement[] = [env.CALL_RELAY_DB.prepare(
-    `INSERT INTO call_sessions(id, pairing_id, android_device_id, peer_device_id, direction, state, phone_number, created_at, updated_at, request_id)
-     SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+    `INSERT INTO call_sessions(id, pairing_id, android_device_id, peer_device_id, direction, state, phone_number, created_at, updated_at, request_id,
+      selected_pairing_id, selected_peer_device_id)
+     SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
      WHERE EXISTS (
        SELECT 1 FROM pairings WHERE id = ? AND revoked_at IS NULL AND confirmed_at IS NOT NULL
      )`,
-  ).bind(callId, pairingId, androidDeviceId, peerDeviceId, direction, state, phoneNumber, now, now, requestId, pairingId)];
-  if (outboxId) statements.push(env.CALL_RELAY_DB.prepare(
-    `INSERT INTO push_outbox(id, target_device_id, channel, payload_json, created_at)
-     SELECT ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM call_sessions WHERE id = ?)`,
-  ).bind(outboxId, targetDeviceId, pushChannel, pushPayload(targetDeviceId, {
-    type: direction === "incoming" ? "incoming_call" : "outgoing_call",
-    callId,
-    phoneNumber: direction === "outgoing" ? phoneNumber ?? "" : "",
-    callVersion: "0",
-  }), now, callId));
+  ).bind(
+    callId, pairingId, androidDeviceId, peerDeviceId, direction, state, phoneNumber, now, now, requestId,
+    selectedPairingId, selectedPeerDeviceId, pairingId,
+  )];
+  for (const recipient of eligiblePairings) {
+    statements.push(env.CALL_RELAY_DB.prepare(
+      `INSERT INTO call_recipients(call_id, pairing_id, peer_device_id, status, created_at, responded_at)
+       SELECT ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM call_sessions WHERE id = ?)`,
+    ).bind(
+      callId,
+      recipient.pairing_id,
+      recipient.peer_device_id,
+      direction === "incoming" ? "ringing" : "selected",
+      now,
+      direction === "incoming" ? null : now,
+      callId,
+    ));
+  }
+  const pushTargets = direction === "outgoing"
+    ? [{ deviceId: androidDeviceId, channel: "android_fcm" as const }]
+    : eligiblePairings.filter((recipient) => recipient.peer_platform === "browser")
+      .map((recipient) => ({ deviceId: recipient.peer_device_id, channel: "web_push" as const }));
+  for (const target of pushTargets) {
+    const outboxId = id("push");
+    outboxIds.push(outboxId);
+    statements.push(env.CALL_RELAY_DB.prepare(
+      `INSERT INTO push_outbox(id, target_device_id, channel, payload_json, created_at)
+       SELECT ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM call_sessions WHERE id = ?)`,
+    ).bind(outboxId, target.deviceId, target.channel, pushPayload(target.deviceId, {
+      type: direction === "incoming" ? "incoming_call" : "outgoing_call",
+      callId,
+      phoneNumber: phoneNumber ?? "",
+      callVersion: "0",
+      ...(direction === "outgoing" ? { pairingId } : {}),
+    }), now, callId));
+  }
   let results: D1Result<unknown>[];
   try {
     results = await env.CALL_RELAY_DB.batch(statements);
   } catch (error) {
     const duplicate = await env.CALL_RELAY_DB.prepare(
-      "SELECT id, state FROM call_sessions WHERE pairing_id = ? AND direction = ? AND request_id = ?",
-    ).bind(pairingId, direction, requestId).first<{ id: string; state: CallState }>();
+      "SELECT id, state FROM call_sessions WHERE android_device_id = ? AND direction = ? AND request_id = ?",
+    ).bind(androidDeviceId, direction, requestId).first<{ id: string; state: CallState }>();
     if (duplicate) return json({ callId: duplicate.id, state: duplicate.state, duplicate: true });
     const openCall = await env.CALL_RELAY_DB.prepare(
       "SELECT id FROM call_sessions WHERE android_device_id = ? AND state NOT IN ('ended', 'failed') LIMIT 1",
@@ -300,18 +396,32 @@ async function createCall(request: Request, env: Env, ctx: ExecutionContext, dev
     }
     throw new HttpError(409, "pairing is not confirmed", "PAIRING_NOT_CONFIRMED");
   }
-  if (outboxId) ctx.waitUntil(dispatchOutboxItem(env, outboxId).catch((error: unknown) => {
-    console.error(JSON.stringify({ message: "initial call push enqueue failed", callId, error: error instanceof Error ? error.message : String(error) }));
-  }));
+  for (const outboxId of outboxIds) {
+    ctx.waitUntil(dispatchOutboxItem(env, outboxId).catch((error: unknown) => {
+      console.error(JSON.stringify({ message: "initial call push enqueue failed", callId, error: error instanceof Error ? error.message : String(error) }));
+    }));
+  }
   await broadcastCall(env, await getCall(env, callId));
   return json({ callId, state }, { status: 201 });
 }
 
 async function callMediaConfig(env: Env, call: CallRow, device: DeviceRow): Promise<Response> {
-  assertCallMember(call, device.id);
+  await assertSelectedCallMember(env, call, device.id);
   if (["ending", "ended", "failed"].includes(call.state)) throw new HttpError(409, "call is closing or closed");
+  let selectedPairingId = call.selected_pairing_id;
+  let selectedPeerDeviceId = call.selected_peer_device_id;
+  if (!selectedPairingId || !selectedPeerDeviceId) {
+    const recipientBacked = await env.CALL_RELAY_DB.prepare(
+      "SELECT 1 AS present FROM call_recipients WHERE call_id = ? LIMIT 1",
+    ).bind(call.id).first<{ present: number }>();
+    if (!recipientBacked) {
+      selectedPairingId = call.pairing_id;
+      selectedPeerDeviceId = call.peer_device_id;
+    }
+  }
+  if (!selectedPairingId || !selectedPeerDeviceId) throw new HttpError(409, "the call has not selected a peer", "CALL_NOT_SELECTED");
   const confirmed = await env.CALL_RELAY_DB.prepare("SELECT id FROM pairings WHERE id = ? AND confirmed_at IS NOT NULL AND revoked_at IS NULL")
-    .bind(call.pairing_id).first<{ id: string }>();
+    .bind(selectedPairingId).first<{ id: string }>();
   if (!confirmed) throw new HttpError(409, "pairing is not confirmed");
   return json(await createMediaConfig(env, call, device));
 }
@@ -319,8 +429,7 @@ async function callMediaConfig(env: Env, call: CallRow, device: DeviceRow): Prom
 function authorizeEvent(call: CallRow, device: DeviceRow, eventType: EventType): CallState {
   const isAndroid = device.id === call.android_device_id;
   if (eventType === "accept" || eventType === "reject") {
-    if (isAndroid || call.direction !== "incoming" || call.state !== "ringing_peer") throw new HttpError(403, `${eventType} is only valid for the peer on a ringing incoming call`);
-    return eventType === "accept" ? "accepted" : "ending";
+    throw new HttpError(500, `${eventType} must use recipient arbitration`);
   }
   if (eventType === "active") {
     const expectedState = call.direction === "incoming" ? "accepted" : "dialing_sim";
@@ -401,8 +510,164 @@ function sanitizeEventPayload(eventType: EventType, payload: Record<string, unkn
   return {};
 }
 
+async function appendRecipientDecision(
+  env: Env,
+  ctx: ExecutionContext,
+  call: CallRow,
+  device: DeviceRow,
+  eventType: "accept" | "reject",
+  commandId: string,
+): Promise<Response> {
+  if (device.id === call.android_device_id || call.direction !== "incoming") {
+    throw new HttpError(403, `${eventType} is only valid for a peer on an incoming call`);
+  }
+  const recipient = await callRecipient(env, call.id, device.id);
+  if (!recipient) throw new HttpError(403, "device is not a recipient of this call");
+  if (call.selected_peer_device_id) {
+    if (call.selected_peer_device_id === device.id) {
+      return json({ callId: call.id, state: call.state, relayMode: call.relay_mode, duplicate: true });
+    }
+    throw new HttpError(409, "another peer already answered this call", "CALL_CLAIMED");
+  }
+  if (call.state !== "ringing_peer" || recipient.status !== "ringing") {
+    if (recipient.status === "declined" && eventType === "reject") {
+      return json({ callId: call.id, state: call.state, relayMode: call.relay_mode, duplicate: true });
+    }
+    throw new HttpError(409, "the incoming call is no longer available", "CALL_UNAVAILABLE");
+  }
+
+  const now = Date.now();
+  const eventId = id("evt");
+  const outboxId = id("push");
+  let results: D1Result<unknown>[];
+  if (eventType === "accept") {
+    results = await env.CALL_RELAY_DB.batch([
+      env.CALL_RELAY_DB.prepare(
+        `UPDATE call_sessions
+         SET state = 'accepted', pairing_id = ?, peer_device_id = ?, selected_pairing_id = ?, selected_peer_device_id = ?,
+             peer_accepted_at = ?, updated_at = ?, version = version + 1, last_event_id = ?
+         WHERE id = ? AND state = 'ringing_peer' AND selected_peer_device_id IS NULL
+           AND EXISTS (
+             SELECT 1 FROM call_recipients
+             WHERE call_id = ? AND pairing_id = ? AND peer_device_id = ? AND status = 'ringing'
+           )`,
+      ).bind(
+        recipient.pairing_id, device.id, recipient.pairing_id, device.id, now, now, eventId,
+         call.id, call.id, recipient.pairing_id, device.id,
+      ),
+      env.CALL_RELAY_DB.prepare(
+        `UPDATE call_recipients SET status = 'selected', responded_at = ?, decision_command_id = ?
+         WHERE call_id = ? AND peer_device_id = ? AND status = 'ringing'
+           AND EXISTS (SELECT 1 FROM call_sessions WHERE id = ? AND last_event_id = ?)`,
+      ).bind(now, commandId, call.id, device.id, call.id, eventId),
+      env.CALL_RELAY_DB.prepare(
+        `UPDATE call_recipients SET status = 'answered_elsewhere', responded_at = ?
+         WHERE call_id = ? AND peer_device_id <> ? AND status = 'ringing'
+           AND EXISTS (SELECT 1 FROM call_sessions WHERE id = ? AND last_event_id = ?)`,
+      ).bind(now, call.id, device.id, call.id, eventId),
+      env.CALL_RELAY_DB.prepare(
+        `INSERT INTO call_events(id, call_id, device_id, event_type, payload_json, created_at, command_id)
+         SELECT ?, ?, ?, 'accept', '{}', ?, ?
+         WHERE EXISTS (SELECT 1 FROM call_sessions WHERE id = ? AND last_event_id = ?)`,
+      ).bind(eventId, call.id, device.id, now, commandId, call.id, eventId),
+      env.CALL_RELAY_DB.prepare(
+        `INSERT INTO push_outbox(id, target_device_id, channel, payload_json, created_at)
+         SELECT ?, ?, 'android_fcm', ?, ?
+         WHERE EXISTS (SELECT 1 FROM call_sessions WHERE id = ? AND last_event_id = ?)`,
+      ).bind(outboxId, call.android_device_id, pushPayload(call.android_device_id, {
+        type: "call_event",
+        callId: call.id,
+        event: "accept",
+        commandId,
+        callVersion: String(call.version + 1),
+        pairingId: recipient.pairing_id,
+      }), now, call.id, eventId),
+    ]);
+  } else {
+    results = await env.CALL_RELAY_DB.batch([
+      env.CALL_RELAY_DB.prepare(
+        `UPDATE call_recipients SET status = 'declined', responded_at = ?, decision_command_id = ?
+         WHERE call_id = ? AND peer_device_id = ? AND status = 'ringing'`,
+      ).bind(now, commandId, call.id, device.id),
+      env.CALL_RELAY_DB.prepare(
+        `UPDATE call_sessions
+         SET state = CASE WHEN EXISTS (
+               SELECT 1 FROM call_recipients WHERE call_id = ? AND status = 'ringing'
+             ) THEN state ELSE 'ending' END,
+             updated_at = ?, version = version + 1, last_event_id = ?
+         WHERE id = ? AND state = 'ringing_peer' AND selected_peer_device_id IS NULL
+           AND EXISTS (
+             SELECT 1 FROM call_recipients
+             WHERE call_id = ? AND peer_device_id = ? AND decision_command_id = ? AND status = 'declined'
+           )`,
+       ).bind(call.id, now, eventId, call.id, call.id, device.id, commandId),
+      env.CALL_RELAY_DB.prepare(
+        `INSERT INTO call_events(id, call_id, device_id, event_type, payload_json, created_at, command_id)
+         SELECT ?, ?, ?, 'reject', '{}', ?, ?
+         WHERE EXISTS (SELECT 1 FROM call_sessions WHERE id = ? AND last_event_id = ?)`,
+      ).bind(eventId, call.id, device.id, now, commandId, call.id, eventId),
+      env.CALL_RELAY_DB.prepare(
+        `INSERT INTO push_outbox(id, target_device_id, channel, payload_json, created_at)
+         SELECT ?, ?, 'android_fcm', ?, ?
+         WHERE EXISTS (SELECT 1 FROM call_sessions WHERE id = ? AND last_event_id = ? AND state = 'ending')`,
+      ).bind(outboxId, call.android_device_id, pushPayload(call.android_device_id, {
+        type: "call_event",
+        callId: call.id,
+        event: "reject",
+        commandId,
+        callVersion: String(call.version + 1),
+      }), now, call.id, eventId),
+    ]);
+  }
+
+  const callUpdate = results[eventType === "accept" ? 0 : 1];
+  if (callUpdate?.meta.changes !== 1) {
+    const current = await getCall(env, call.id);
+    const duplicate = await env.CALL_RELAY_DB.prepare(
+      "SELECT id FROM call_events WHERE call_id = ? AND command_id = ?",
+    ).bind(call.id, commandId).first<{ id: string }>();
+    if (duplicate) return json({ callId: current.id, state: current.state, relayMode: current.relay_mode, duplicate: true });
+    if (current.selected_peer_device_id && current.selected_peer_device_id !== device.id) {
+      throw new HttpError(409, "another peer already answered this call", "CALL_CLAIMED");
+    }
+    throw new HttpError(409, "call changed concurrently; retry the command", "CALL_CHANGED");
+  }
+
+  const updatedCall = await getCall(env, call.id);
+  if (eventType === "accept") {
+    const losingBrowsers = await env.CALL_RELAY_DB.prepare(
+      `SELECT cr.peer_device_id FROM call_recipients cr
+       JOIN devices d ON d.id = cr.peer_device_id
+       WHERE cr.call_id = ? AND cr.status = 'answered_elsewhere' AND d.platform = 'browser' AND d.revoked_at IS NULL`,
+    ).bind(call.id).all<{ peer_device_id: string }>();
+    for (const loser of losingBrowsers.results) {
+      const cancellationOutboxId = id("push");
+      await env.CALL_RELAY_DB.prepare(
+        `INSERT INTO push_outbox(id, target_device_id, channel, payload_json, created_at)
+         VALUES (?, ?, 'web_push', ?, ?)`,
+      ).bind(cancellationOutboxId, loser.peer_device_id, pushPayload(loser.peer_device_id, {
+        type: "call_cancelled",
+        event: "answered_elsewhere",
+        callId: call.id,
+        callVersion: String(updatedCall.version),
+      }), now).run();
+      ctx.waitUntil(dispatchOutboxItem(env, cancellationOutboxId).catch((error: unknown) => {
+        console.error(JSON.stringify({ message: "answered-elsewhere push enqueue failed", callId: call.id, error: error instanceof Error ? error.message : String(error) }));
+      }));
+    }
+  }
+  const shouldNotifyAndroid = eventType === "accept" || updatedCall.state === "ending";
+  if (shouldNotifyAndroid) {
+    ctx.waitUntil(dispatchOutboxItem(env, outboxId).catch((error: unknown) => {
+      console.error(JSON.stringify({ message: "recipient decision push enqueue failed", callId: call.id, eventType, error: error instanceof Error ? error.message : String(error) }));
+    }));
+  }
+  await broadcastCall(env, updatedCall);
+  return json({ callId: updatedCall.id, state: updatedCall.state, relayMode: updatedCall.relay_mode });
+}
+
 async function appendEvent(request: Request, env: Env, ctx: ExecutionContext, call: CallRow, device: DeviceRow): Promise<Response> {
-  assertCallMember(call, device.id);
+  await assertCallMember(env, call, device.id);
   const body = await readJson<JsonObject>(request);
   const eventTypeValue = requireString(body.type, "type", 64);
   if (!EVENT_TYPES.has(eventTypeValue as EventType)) throw new HttpError(400, "unsupported event type");
@@ -420,6 +685,10 @@ async function appendEvent(request: Request, env: Env, ctx: ExecutionContext, ca
     const current = await getCall(env, call.id);
     return json({ callId: current.id, state: current.state, relayMode: current.relay_mode, duplicate: true });
   }
+  if (eventType === "accept" || eventType === "reject") {
+    return appendRecipientDecision(env, ctx, call, device, eventType, commandId);
+  }
+  await assertSelectedCallMember(env, call, device.id);
   if (["ended", "failed"].includes(call.state)) throw new HttpError(409, "call is closed");
   if (eventType === "active" && call.state === "active") {
     if (device.id !== call.android_device_id) {
@@ -449,9 +718,11 @@ async function appendEvent(request: Request, env: Env, ctx: ExecutionContext, ca
   const now = Date.now();
   const terminal = ["ended", "failed"].includes(nextState) ? now : null;
   const eventId = id("evt");
-  const targetDeviceId = device.id === call.android_device_id ? call.peer_device_id : call.android_device_id;
-  const target = await env.CALL_RELAY_DB.prepare("SELECT platform FROM devices WHERE id = ? AND revoked_at IS NULL")
-    .bind(targetDeviceId).first<{ platform: Platform }>();
+  const targetDeviceId = device.id === call.android_device_id ? call.selected_peer_device_id : call.android_device_id;
+  const target = targetDeviceId
+    ? await env.CALL_RELAY_DB.prepare("SELECT platform FROM devices WHERE id = ? AND revoked_at IS NULL")
+      .bind(targetDeviceId).first<{ platform: Platform }>()
+    : null;
   const outboxId = target?.platform === "android" ? id("push") : null;
   const failureCode = eventType === "failed" ? requireString(body.code ?? "unknown", "code", 80) : null;
   if (failureCode !== null && !/^[a-z0-9_]{1,80}$/u.test(failureCode)) throw new HttpError(400, "failure code is invalid");
@@ -468,7 +739,7 @@ async function appendEvent(request: Request, env: Env, ctx: ExecutionContext, ca
        WHERE id = ? AND version = ? AND state = ?`,
     ).bind(
       nextState, relayMode, now, terminal, failureCode, mediaConnectedAt, mediaFailureCode, candidateType, icePolicy,
-      eventType === "accept" ? now : null,
+      null,
       eventType === "answering_sim" ? now : null,
       eventType === "active" ? now : null,
       eventId, call.id, call.version, call.state,
@@ -477,7 +748,7 @@ async function appendEvent(request: Request, env: Env, ctx: ExecutionContext, ca
       "INSERT INTO call_events(id, call_id, device_id, event_type, payload_json, created_at, command_id) SELECT ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM call_sessions WHERE id = ? AND last_event_id = ?)",
     ).bind(eventId, call.id, device.id, eventType, JSON.stringify(payload), now, commandId, call.id, eventId),
   ];
-  if (outboxId && !MEDIA_EVENTS.has(eventType)) statements.push(env.CALL_RELAY_DB.prepare(
+  if (outboxId && targetDeviceId && !MEDIA_EVENTS.has(eventType)) statements.push(env.CALL_RELAY_DB.prepare(
     "INSERT INTO push_outbox(id, target_device_id, channel, payload_json, created_at) SELECT ?, ?, 'android_fcm', ?, ? WHERE EXISTS (SELECT 1 FROM call_sessions WHERE id = ? AND last_event_id = ?)",
   ).bind(outboxId, targetDeviceId, pushPayload(targetDeviceId, {
     type: "call_event", callId: call.id, event: eventType, commandId, callVersion: String(call.version + 1),
@@ -498,6 +769,11 @@ async function appendEvent(request: Request, env: Env, ctx: ExecutionContext, ca
     console.error(JSON.stringify({ message: "event push enqueue failed", callId: call.id, eventType, error: error instanceof Error ? error.message : String(error) }));
   }));
   const updatedCall = await getCall(env, call.id);
+  if (["ended", "failed"].includes(updatedCall.state)) {
+    await env.CALL_RELAY_DB.prepare(
+      "UPDATE call_recipients SET status = 'missed', responded_at = COALESCE(responded_at, ?) WHERE call_id = ? AND status = 'ringing'",
+    ).bind(Date.now(), call.id).run();
+  }
   await broadcastCall(env, updatedCall);
   if (["ended", "failed"].includes(nextState)) {
     ctx.waitUntil(revokeTurnCredentialsForCall(env, call.id));
@@ -574,9 +850,13 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
   }
   if (request.method === "GET" && url.pathname === "/v1/calls/current") {
     const call = await env.CALL_RELAY_DB.prepare(
-      "SELECT * FROM call_sessions WHERE (android_device_id = ? OR peer_device_id = ?) AND state NOT IN ('ended', 'failed') ORDER BY created_at DESC LIMIT 1",
+      `SELECT * FROM call_sessions cs
+       WHERE (cs.android_device_id = ? OR EXISTS (
+         SELECT 1 FROM call_recipients cr WHERE cr.call_id = cs.id AND cr.peer_device_id = ?
+       )) AND cs.state NOT IN ('ended', 'failed')
+       ORDER BY cs.created_at DESC LIMIT 1`,
     ).bind(device.id, device.id).first<CallRow>();
-    return json({ call: call ?? null });
+    return json({ call: call ? await callSnapshotForDevice(env, call, device.id) : null });
   }
   if (request.method === "GET" && url.pathname === "/v1/push/config") {
     await requireDeviceEntitlement(env, device);
@@ -638,8 +918,8 @@ async function api(request: Request, env: Env, ctx: ExecutionContext): Promise<R
   if (!match) throw new HttpError(404, "endpoint not found");
   const call = await getCall(env, match[1] ?? "");
   if (request.method === "GET" && !match[2]) {
-    assertCallMember(call, device.id);
-    return json({ call });
+    await assertCallMember(env, call, device.id);
+    return json({ call: await callSnapshotForDevice(env, call, device.id) });
   }
   if (request.method === "POST" && match[2] === "token") return json({ error: "participant media tokens were removed; update the client" }, { status: 410 });
   if (request.method === "POST" && match[2] === "media-config") {
@@ -721,13 +1001,13 @@ export default {
     await drainPairingControlOutbox(env);
     const now = Date.now();
     const stale = await env.CALL_RELAY_DB.prepare(
-      `SELECT id, pairing_id FROM call_sessions
+      `SELECT id FROM call_sessions
        WHERE state NOT IN ('ended', 'failed') AND (
          (state IN ('created', 'ringing_peer', 'accepted', 'dialing_sim') AND updated_at < ?) OR
          (state = 'active' AND updated_at < ?) OR
          (state = 'ending' AND updated_at < ?)
        )`,
-    ).bind(now - 120_000, now - 90_000, now - 30_000).all<{ id: string; pairing_id: string }>();
+    ).bind(now - 120_000, now - 90_000, now - 30_000).all<{ id: string }>();
     await env.CALL_RELAY_DB.prepare(
       `UPDATE call_sessions SET state = 'failed', failure_code = 'session_timeout', ended_at = ?, updated_at = ?, version = version + 1
        WHERE state NOT IN ('ended', 'failed') AND (
@@ -736,9 +1016,16 @@ export default {
          (state = 'ending' AND updated_at < ?)
        )`,
     ).bind(now, now, now - 120_000, now - 90_000, now - 30_000).run();
+    if (stale.results.length > 0) {
+      const placeholders = stale.results.map(() => "?").join(",");
+      await env.CALL_RELAY_DB.prepare(
+        `UPDATE call_recipients SET status = 'missed', responded_at = COALESCE(responded_at, ?)
+         WHERE call_id IN (${placeholders}) AND status = 'ringing'`,
+      ).bind(now, ...stale.results.map((call) => call.id)).run();
+    }
     await Promise.all(stale.results.map(async (staleCall) => {
       const updated = await getCall(env, staleCall.id);
-      await env.PAIRING_SIGNAL.getByName(staleCall.pairing_id).publishSnapshot(JSON.stringify(updated));
+      await broadcastCall(env, updated);
       await revokeTurnCredentialsForCall(env, staleCall.id);
     }));
     await revokeDueTurnCredentials(env);

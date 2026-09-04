@@ -42,6 +42,8 @@ class RelayApiClient(
         val phoneNumber: String?,
         val relayMode: String,
         val version: Long,
+        val selectedPairingId: String?,
+        val selectedPeerDeviceId: String?,
     )
 
     data class PairingInvitation(val invitationId: String, val expiresAt: Long, val pairingUrlBase: String)
@@ -54,6 +56,7 @@ class RelayApiClient(
         val commitment: String,
         val peerProof: String,
         val confirmed: Boolean,
+        val peerPlatform: String,
     )
 
     suspend fun enroll(invite: String, displayName: String, fcmToken: String?): String = withContext(Dispatchers.IO) {
@@ -73,13 +76,16 @@ class RelayApiClient(
         response.getString("deviceId").also { preferences.deviceId = it }
     }
 
-    suspend fun createIncomingCall(requestId: String = UUID.randomUUID().toString()): CreatedCall = withContext(Dispatchers.IO) {
+    suspend fun createIncomingCall(
+        requestId: String = UUID.randomUUID().toString(),
+        phoneNumber: String? = null,
+    ): CreatedCall = withContext(Dispatchers.IO) {
         val response = request(
             method = "POST",
             path = "/v1/calls/incoming",
             body = JSONObject()
-                .put("pairingId", preferences.pairingId)
                 .put("requestId", requestId)
+                .apply { if (!phoneNumber.isNullOrBlank()) put("phoneNumber", phoneNumber) }
                 .toString(),
             attempts = 3,
         )
@@ -129,6 +135,7 @@ class RelayApiClient(
             commitment = pairing.getString("secret_commitment"),
             peerProof = pairing.getString("peer_proof"),
             confirmed = !pairing.isNull("confirmed_at"),
+            peerPlatform = pairing.optString("peer_platform", "peer"),
         )
     }
 
@@ -184,8 +191,8 @@ class RelayApiClient(
         MediaConfig(parsed, response.getLong("credentialsExpiresAt"))
     }
 
-    suspend fun signalTicket(): SignalTicket = withContext(Dispatchers.IO) {
-        val response = request("POST", "/v1/pairings/${preferences.pairingId}/signal-ticket", "{}", attempts = 2)
+    suspend fun signalTicket(pairingId: String = preferences.pairingId): SignalTicket = withContext(Dispatchers.IO) {
+        val response = request("POST", "/v1/pairings/$pairingId/signal-ticket", "{}", attempts = 2)
         SignalTicket(response.getString("ticket"), response.getString("protocol"), response.getLong("expiresAt"))
     }
 
@@ -276,10 +283,15 @@ class RelayApiClient(
         id = call.getString("id"),
         state = call.getString("state"),
         direction = call.getString("direction"),
-        phoneNumber = call.optString("phone_number").ifBlank { null },
+        phoneNumber = call.optNullableString("phone_number"),
         relayMode = call.optString("relay_mode", "full_duplex"),
         version = call.optLong("version", 0L),
+        selectedPairingId = call.optNullableString("selected_pairing_id"),
+        selectedPeerDeviceId = call.optNullableString("selected_peer_device_id"),
     )
+
+    private fun JSONObject.optNullableString(name: String): String? =
+        optString(name).takeIf { it.isNotBlank() && it != "null" }
 
     private fun requestOnce(
         method: String,

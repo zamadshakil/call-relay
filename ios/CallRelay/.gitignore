@@ -1,0 +1,6 @@
+CallRelay.xcodeproj/
+Config/Local.xcconfig
+CallRelay/Resources/GoogleService-Info.plist
+DerivedData/
+*.xcuserstate
+xcuserdata/

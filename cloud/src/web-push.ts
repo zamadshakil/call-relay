@@ -125,9 +125,13 @@ export async function deliverWebPush(
   if (!row) return { accepted: false, gone: false };
   const subscription = await decryptSubscription(env, targetDeviceId, row);
   const callId = data.callId ?? "";
+  const cancelled = data.type === "call_cancelled" || data.event === "answered_elsewhere";
+  const caller = /^\+[1-9][0-9]{7,14}$/u.test(data.phoneNumber ?? "") ? data.phoneNumber : "";
   const payload = JSON.stringify({
-    title: "Incoming Call Relay call",
-    body: "Open Call Relay to answer from your Android SIM.",
+    type: cancelled ? "call_cancelled" : "incoming_call",
+    callId,
+    title: cancelled ? "Call answered elsewhere" : caller || "Android cellular call",
+    body: cancelled ? "The call was answered on your other device." : "Open Call Relay to answer with Call Relay.",
     tag: callId ? `incoming-${callId}` : "incoming-call",
     url: callId ? `/?call=${encodeURIComponent(callId)}` : "/",
   });

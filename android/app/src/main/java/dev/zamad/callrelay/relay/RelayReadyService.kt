@@ -20,6 +20,7 @@ import android.telephony.TelephonyManager
 import dev.zamad.callrelay.MainActivity
 import dev.zamad.callrelay.R
 import dev.zamad.callrelay.network.PairingSignalClient
+import dev.zamad.callrelay.network.PairingSignalHub
 import dev.zamad.callrelay.network.RelayApiClient
 import dev.zamad.callrelay.telecom.NumberPolicy
 import dev.zamad.callrelay.telecom.RelayInCallService
@@ -40,7 +41,7 @@ class RelayReadyService : Service() {
     private lateinit var preferences: RelayPreferences
     private lateinit var api: RelayApiClient
     private lateinit var media: WebRtcRelaySession
-    private lateinit var signal: PairingSignalClient
+    private lateinit var signal: PairingSignalHub
     private lateinit var connectivity: ConnectivityManager
     private var watchdog: Job? = null
     private var setupJob: Job? = null
@@ -65,7 +66,7 @@ class RelayReadyService : Service() {
         super.onCreate()
         preferences = RelayPreferences(this)
         api = RelayApiClient(preferences)
-        signal = PairingSignalClient(preferences, api, signalListener)
+        signal = PairingSignalHub(preferences, api, signalListener)
         media = WebRtcRelaySession(this, preferences, api, signal, mediaListener)
         connectivity = getSystemService(ConnectivityManager::class.java)
         connectivity.registerDefaultNetworkCallback(networkCallback)
@@ -177,6 +178,7 @@ class RelayReadyService : Service() {
     private fun arm() {
         ensureForeground()
         if (serviceArmed) {
+            signal.refreshPairings()
             drainRemoteCommands()
             return
         }
@@ -206,9 +208,15 @@ class RelayReadyService : Service() {
     }
 
     private fun handlePairingRevoked(revokedPairingId: String, reason: String) {
-        // A delayed revocation from a replaced signaling socket must never
-        // erase a newer pairing that onboarding has already installed.
-        if (revokedPairingId.isNotBlank() && preferences.pairingId != revokedPairingId) return
+        if (revokedPairingId.isBlank() || preferences.pairing(revokedPairingId) == null) return
+        val revokedSelectedPairing = signal.selectedPairingId() == revokedPairingId
+        preferences.removePairing(revokedPairingId)
+        signal.refreshPairings()
+        if (preferences.configured() && (!revokedSelectedPairing || RelayRuntime.snapshot().callId == null)) {
+            RelayRuntime.update { it.copy(error = "$reason: one peer pairing was revoked") }
+            updateNotification("Ready for remaining paired peer")
+            return
+        }
         invalidateSetup()
         cancelIncomingAnswer()
         activeReportJob?.cancel()
@@ -220,14 +228,13 @@ class RelayReadyService : Service() {
         mediaLostAt = null
         media.disconnect()
         serviceArmed = false
-        preferences.clearPairing()
         signal.close()
         RelayRuntime.update {
             it.copy(
                 ready = false,
                 callId = null,
                 mediaState = "Pairing revoked",
-                error = "The paired browser was revoked ($reason). Open the app to pair again.",
+                error = "The final paired peer was revoked ($reason). Open the app to pair again.",
             )
         }
         stopForeground(STOP_FOREGROUND_REMOVE)
@@ -260,9 +267,7 @@ class RelayReadyService : Service() {
                 check(RelayInCallService.activeCallCount() == 1) { "The cellular call ended before relay setup" }
                 activeReportedCallId = null
                 preferences.beginActiveCall(call.callId, "incoming")
-                RelayRuntime.update { it.copy(callId = call.callId, mediaState = "Preparing direct-first WebRTC") }
-                connectMedia(call.callId)
-                checkSetupIsCurrent(generation)
+                RelayRuntime.update { it.copy(callId = call.callId, mediaState = "Waiting for browser or iPhone") }
             }.onFailure { failure ->
                 if (failure is CancellationException) {
                     // Service/process recreation is recoverable. Keep the persisted call so the
@@ -291,6 +296,12 @@ class RelayReadyService : Service() {
         setupJob = scope.launch {
             runCatching {
                 validateOutgoing(number)
+                checkSetupIsCurrent(generation)
+                val authoritativeCall = api.call(callId)
+                check(authoritativeCall.direction == "outgoing" && authoritativeCall.state !in setOf("ending", "ended", "failed")) {
+                    "The outgoing relay session is no longer current"
+                }
+                signal.selectPairing(authoritativeCall.selectedPairingId)
                 checkSetupIsCurrent(generation)
                 RelayRuntime.update { it.copy(callId = callId, mediaState = "Preparing direct-first WebRTC") }
                 connectMedia(callId)
@@ -361,6 +372,8 @@ class RelayReadyService : Service() {
                     return@launch
                 }
                 check(authoritativeCall.state == "accepted") { "The incoming relay session is not accepted" }
+                check(!authoritativeCall.selectedPairingId.isNullOrBlank()) { "The incoming relay session has no winning peer" }
+                signal.selectPairing(authoritativeCall.selectedPairingId)
                 if (!mediaExpected) connectMedia(activeCallId)
                 ensureIncomingAnswerCurrent(activeCallId, gateGeneration, answerSetupGeneration)
                 awaitPairedPeer(answerSetupGeneration)
@@ -546,7 +559,7 @@ class RelayReadyService : Service() {
             }
             return
         }
-        updateNotification("Ready for one paired peer")
+        updateNotification("Ready for paired browser or iPhone")
     }
 
     private suspend fun createIncomingCallAfterPriorTermination(): RelayApiClient.CreatedCall {
@@ -555,7 +568,7 @@ class RelayReadyService : Service() {
         var lastFailure: Throwable? = priorTermination?.failure
         repeat(2) { attempt ->
             try {
-                return api.createIncomingCall(requestId)
+                return api.createIncomingCall(requestId, RelayInCallService.incomingNumber())
             } catch (failure: Throwable) {
                 if (failure is CancellationException) throw failure
                 lastFailure = failure
@@ -668,6 +681,7 @@ class RelayReadyService : Service() {
                 }
                 adoptPersistedCall(serverCall.id, serverCall.direction)
                 checkSetupIsCurrent(generation)
+                signal.selectPairing(serverCall.selectedPairingId)
                 media.applyMode(RelayMode.fromWire(serverCall.relayMode))
                 val outgoingAction = PersistedCallRecoveryPolicy.outgoingAction(
                     direction = serverCall.direction,
@@ -697,7 +711,12 @@ class RelayReadyService : Service() {
                     PersistedCallRecoveryPolicy.OutgoingAction.KEEP_EXISTING_TELECOM_CALL,
                     PersistedCallRecoveryPolicy.OutgoingAction.NONE,
                     -> {
-                        if (!mediaExpected) connectMedia(serverCall.id)
+                        val mediaMayStart = serverCall.direction == "outgoing" ||
+                            serverCall.state in setOf("accepted", "answering_sim", "active")
+                        if (mediaMayStart && !mediaExpected) connectMedia(serverCall.id)
+                        if (!mediaMayStart) {
+                            RelayRuntime.update { it.copy(mediaState = "Waiting for browser or iPhone") }
+                        }
                         checkSetupIsCurrent(generation)
                         if (
                             serverCall.direction == "incoming" && serverCall.state == "accepted" &&
@@ -776,11 +795,13 @@ class RelayReadyService : Service() {
                 runCatching {
                     when (command.type) {
                         "outgoing_call" -> {
+                            signal.selectPairing(command.pairingId)
                             beginOutgoing(command.callId, command.phoneNumber)
                             finishRemoteCommand(command.id, completed = true)
                         }
                         "call_event" -> when (command.event) {
                             "accept" -> {
+                                signal.selectPairing(command.pairingId)
                                 adoptPersistedCall(command.callId, "incoming")
                                 acceptIncoming(command.callId, command.id, command.callVersion)
                             }
@@ -992,7 +1013,14 @@ class RelayReadyService : Service() {
                 }
                 if (call.direction == "incoming" && RelayRuntime.snapshot().callId == null && RelayInCallService.activeCallCount() == 1) {
                     adoptPersistedCall(call.id, call.direction)
-                    if (!mediaExpected) connectMedia(call.id)
+                    val mediaMayStart = !call.selectedPairingId.isNullOrBlank() &&
+                        call.state in setOf("accepted", "answering_sim", "active")
+                    if (mediaMayStart) {
+                        signal.selectPairing(call.selectedPairingId)
+                        if (!mediaExpected) connectMedia(call.id)
+                    } else {
+                        RelayRuntime.update { it.copy(mediaState = "Waiting for browser or iPhone") }
+                    }
                 }
                 if (
                     call.direction == "outgoing" && call.state == "dialing_sim" &&
@@ -1002,6 +1030,7 @@ class RelayReadyService : Service() {
                     return@launch
                 }
                 if (isCurrentCall(call.id)) {
+                    signal.selectPairing(call.selectedPairingId)
                     media.applyMode(RelayMode.fromWire(call.relayMode))
                     if (call.direction == "incoming" && call.state == "accepted" && !RelayInCallService.isActive()) acceptIncoming(call.id)
                 }

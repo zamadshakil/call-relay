@@ -40,6 +40,13 @@ enum class OnboardingStage { SPLASH, SIGN_IN, APPROVAL, PLANS, PAYMENT, SETUP, S
 
 data class BillingPlan(val code: String, val formattedPrice: String, val minorAmount: Long)
 
+data class PairedPeerUi(
+    val pairingId: String,
+    val deviceId: String,
+    val displayName: String,
+    val platform: String,
+)
+
 data class OnboardingUiState(
     val stage: OnboardingStage = OnboardingStage.SPLASH,
     val busy: Boolean = true,
@@ -55,6 +62,7 @@ data class OnboardingUiState(
     val pairingExpiresAt: Long? = null,
     val peerDeviceId: String? = null,
     val peerName: String? = null,
+    val pairedPeers: List<PairedPeerUi> = emptyList(),
     val maskedNumber: String? = null,
     val carrierName: String? = null,
     val setupIssue: String? = null,
@@ -195,24 +203,37 @@ class OnboardingViewModel(application: Application) : AndroidViewModel(applicati
         viewModelScope.launch { runBusy { openUrl(consumerApi.portal()) } }
     }
 
-    fun replacePeer() {
+    fun addPeer() {
+        if (_state.value.pairedPeers.size >= 2) {
+            _state.value = _state.value.copy(error = "This Android already has the supported browser and iPhone peer slots in use.")
+            return
+        }
+        pairingJob?.cancel()
+        secureStore.put(PENDING_INVITATION, "")
+        _state.value = _state.value.copy(
+            stage = OnboardingStage.PAIRING,
+            pairingUrl = null,
+            pairingExpiresAt = null,
+            error = null,
+        )
+        persistStage(OnboardingStage.PAIRING)
+        viewModelScope.launch { runBusy { createPairingInvitation() } }
+    }
+
+    fun replacePeer(peerDeviceId: String) {
         viewModelScope.launch {
             runBusy {
-                val peerDeviceId = _state.value.peerDeviceId
-                    ?: throw IllegalStateException("No paired iPhone browser is registered")
-                toggleRelay(false)
+                val peer = _state.value.pairedPeers.firstOrNull { it.deviceId == peerDeviceId }
+                    ?: throw IllegalStateException("That paired peer is no longer registered")
                 consumerApi.revoke(peerDeviceId)
                 pairingJob?.cancel()
                 secureStore.put(PENDING_INVITATION, "")
-                preferences.pairingId = ""
-                preferences.pairingSecret = ""
-                preferences.pairingConfirmed = false
+                preferences.removePairing(peer.pairingId)
                 _state.value = _state.value.copy(
                     stage = OnboardingStage.PAIRING,
                     pairingUrl = null,
                     pairingExpiresAt = null,
-                    peerDeviceId = null,
-                    peerName = null,
+                    pairedPeers = _state.value.pairedPeers.filterNot { it.deviceId == peerDeviceId },
                 )
                 persistStage(OnboardingStage.PAIRING)
                 createPairingInvitation()
@@ -224,10 +245,8 @@ class OnboardingViewModel(application: Application) : AndroidViewModel(applicati
         viewModelScope.launch {
             runCatching { if (preferences.deviceId.isNotBlank()) consumerApi.revoke(preferences.deviceId) }
             toggleRelay(false)
+            preferences.clearPairing()
             preferences.deviceId = ""
-            preferences.pairingId = ""
-            preferences.pairingSecret = ""
-            preferences.pairingConfirmed = false
             preferences.simProfileUploaded = false
             preferences.entitlementActive = false
             auth.signOut()
@@ -271,21 +290,28 @@ class OnboardingViewModel(application: Application) : AndroidViewModel(applicati
             }
             else -> {
                 if (!ensureDeviceRegistered()) return
-                val serverPairing = snapshot.optJSONObject("pairing")
-                val serverPairingId = serverPairing?.optString("id")?.ifBlank { null }
-                val serverPairingConfirmed = serverPairing != null && !serverPairing.isNull("confirmed_at")
-                val localPairingReady = serverPairingConfirmed &&
-                    preferences.pairingConfirmed &&
-                    preferences.pairingId == serverPairingId &&
-                    preferences.pairingSecret.isNotBlank()
-                if (!localPairingReady && serverPairing == null && preferences.pairingConfirmed) {
-                    preferences.pairingId = ""
-                    preferences.pairingSecret = ""
-                    preferences.pairingConfirmed = false
+                val serverPairings = serverPairings(snapshot)
+                val serverPairingIds = serverPairings.mapTo(mutableSetOf()) { it.getString("id") }
+                preferences.pairings().filterNot { it.id in serverPairingIds }.forEach { preferences.removePairing(it.id) }
+                val confirmedServerPairings = serverPairings.filterNot { it.isNull("confirmed_at") }
+                val localPairing = confirmedServerPairings.firstNotNullOfOrNull { pairing ->
+                    preferences.pairing(pairing.getString("id"))?.takeIf { it.confirmed && it.secret.isNotBlank() }
                 }
+                val localPairingReady = localPairing != null
+                localPairing?.let { preferences.activateLegacyPairing(it.id) }
+                val serverPairing = serverPairings.firstOrNull()
+                val serverPairingConfirmed = serverPairing != null && !serverPairing.isNull("confirmed_at")
+                val pendingServerPairing = serverPairings.firstOrNull { it.isNull("confirmed_at") }
                 when {
                     !prerequisitesComplete -> moveTo(OnboardingStage.SETUP)
                     !preferences.simProfileUploaded -> moveTo(OnboardingStage.SIM)
+                    pendingServerPairing != null -> {
+                        // Resume an add-peer handshake before falling back to an
+                        // already usable pairing after Android process death.
+                        moveTo(OnboardingStage.PAIRING)
+                        confirmPendingPairing()
+                        if (_state.value.stage != OnboardingStage.READY) createPairingInvitation()
+                    }
                     localPairingReady -> {
                         moveTo(OnboardingStage.READY)
                         toggleRelay(true)
@@ -333,6 +359,13 @@ class OnboardingViewModel(application: Application) : AndroidViewModel(applicati
                 peerName = device.optString("displayName").ifBlank { null }
             }
         }
+        val pairedPeers = serverPairings(snapshot)
+            .filterNot { it.isNull("confirmed_at") }
+            .mapNotNull(::peerFromPairing)
+        pairedPeers.lastOrNull()?.let { peer ->
+            peerDeviceId = peer.deviceId
+            peerName = peer.displayName
+        }
         _state.value = _state.value.copy(
             email = account.optString("email"),
             displayName = account.optString("displayName"),
@@ -345,7 +378,34 @@ class OnboardingViewModel(application: Application) : AndroidViewModel(applicati
             carrierName = carrier,
             peerDeviceId = peerDeviceId,
             peerName = peerName,
+            pairedPeers = pairedPeers,
         )
+    }
+
+    private fun serverPairings(snapshot: JSONObject): List<JSONObject> {
+        val values = snapshot.optJSONArray("pairings") ?: return snapshot.optJSONObject("pairing")?.let(::listOf).orEmpty()
+        return buildList {
+            for (index in 0 until values.length()) values.optJSONObject(index)?.let(::add)
+        }
+    }
+
+    private fun peerFromPairing(pairing: JSONObject): PairedPeerUi? {
+        val androidId = preferences.deviceId
+        val aId = pairing.optString("device_a_id")
+        val bId = pairing.optString("device_b_id")
+        val androidIsA = when {
+            aId == androidId -> true
+            bId == androidId -> false
+            pairing.optString("device_a_platform") == "android" -> true
+            pairing.optString("device_b_platform") == "android" -> false
+            else -> return null
+        }
+        val deviceId = if (androidIsA) bId else aId
+        if (deviceId.isBlank()) return null
+        val platform = pairing.optString(if (androidIsA) "device_b_platform" else "device_a_platform", "peer")
+        val name = pairing.optString(if (androidIsA) "device_b_name" else "device_a_name")
+            .ifBlank { if (platform == "ios") "iPhone" else "Browser" }
+        return PairedPeerUi(pairing.getString("id"), deviceId, name, platform)
     }
 
     private suspend fun loadPlans() {
@@ -479,8 +539,16 @@ class OnboardingViewModel(application: Application) : AndroidViewModel(applicati
             )
             relayApi.confirmPairingV2(pending.pairingId, commitment, proof)
             preferences.pairingId = pending.pairingId
-            preferences.pairingSecret = PairingCryptoV2.encode(secret)
+            val encodedSecret = PairingCryptoV2.encode(secret)
+            preferences.pairingSecret = encodedSecret
             preferences.pairingConfirmed = true
+            preferences.upsertPairing(RelayPreferences.PairingRecord(
+                id = pending.pairingId,
+                secret = encodedSecret,
+                confirmed = true,
+                peerDeviceId = pending.peerDeviceId,
+                peerPlatform = pending.peerPlatform,
+            ))
             secureStore.put(PENDING_INVITATION, "")
             moveTo(OnboardingStage.READY)
             toggleRelay(true)

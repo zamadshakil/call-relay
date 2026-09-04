@@ -7,14 +7,16 @@ Android Telecom owns normal SIM-call digital audio. Permissions, Accessibility, 
 ## Components
 
 1. Android owns the SIM call, validates dialing, gates answer/dial on WebRTC connectivity, and is always the SDP offerer.
-2. A Cloudflare Worker authenticates signed REST calls, brokers two-hour TURN credentials, writes authoritative call state to D1, and wakes Android through FCM.
-3. One SQLite Durable Object per pairing provides hibernating WebSocket signaling. It never carries audio.
+2. A Cloudflare Worker authenticates signed REST calls, atomically arbitrates the first peer to answer, brokers two-hour TURN credentials, writes authoritative call state to D1, and wakes Android through FCM.
+3. One SQLite Durable Object per pairing provides hibernating WebSocket signaling. Both browser and native iPhone receive call snapshots, but only the selected pairing may exchange media signaling.
 4. The browser uses native `RTCPeerConnection`, DTLS-SRTP audio, browser AEC, and signed/HMAC-authenticated signaling.
-5. The future iPhone app will use CallKit, PushKit, AVAudioSession, Keychain and raw WebRTC.
+5. The iOS 17+ app uses SwiftUI, CallKit, AVAudioSession, Contacts, SwiftData, Keychain/CryptoKit and pinned raw WebRTC. The free Personal Team build intentionally has no PushKit/APNs and rings only while its foreground WebSocket is alive.
 
 ## Media sequence
 
-Both clients obtain unique Cloudflare credentials. ICE starts with policy `all`; host/server-reflexive direct routes are preferred naturally. After eight seconds Android and the peer force `relay` and restart ICE. Setup fails at 20 seconds. An incoming SIM call is not answered, and an outgoing SIM call is not placed, until media is connected. Active media loss beyond 15 seconds ends the SIM call.
+The Android creates one recipient per active browser/iOS pairing. The first valid acceptance changes the call to `accepted`, selects that pairing and marks every other recipient `answered_elsewhere`; a simultaneous loser receives `CALL_CLAIMED`. Rejecting one recipient does not reject the SIM call while another recipient is still ringing.
+
+The selected pair obtains unique Cloudflare credentials. ICE starts with policy `all`; host/server-reflexive direct routes are preferred naturally. After eight seconds Android and the selected peer force `relay` and restart ICE. Setup fails at 20 seconds. An incoming SIM call is not answered, and an outgoing SIM call is not placed, until media is connected. Active media loss beyond 15 seconds ends the SIM call.
 
 WebRTC DTLS-SRTP encrypts audio end-to-end. TURN forwards encrypted packets. SDP and ICE are integrity-authenticated with a per-call key:
 

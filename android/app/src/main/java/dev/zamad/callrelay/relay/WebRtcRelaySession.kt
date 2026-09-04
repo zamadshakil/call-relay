@@ -4,8 +4,8 @@ import android.content.Context
 import android.os.SystemClock
 import dev.zamad.callrelay.audio.DuplexEchoGuard
 import dev.zamad.callrelay.audio.PcmGainProcessor
-import dev.zamad.callrelay.network.PairingSignalClient
 import dev.zamad.callrelay.network.RelayApiClient
+import dev.zamad.callrelay.network.SignalTransport
 import java.nio.ByteBuffer
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
@@ -47,7 +47,7 @@ class WebRtcRelaySession(
     context: Context,
     private val preferences: RelayPreferences,
     private val api: RelayApiClient,
-    private val signal: PairingSignalClient,
+    private val signal: SignalTransport,
     private val listener: Listener,
 ) {
     data class StatsSummary(

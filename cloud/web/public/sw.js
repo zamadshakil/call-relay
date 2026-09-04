@@ -1,4 +1,4 @@
-const CACHE = "call-relay-shell-v7";
+const CACHE = "call-relay-shell-v8";
 self.addEventListener("install", (event) => {
   event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(["/manifest.webmanifest", "/icon.svg"])));
   self.skipWaiting();
@@ -27,15 +27,24 @@ self.addEventListener("push", (event) => {
   const body = typeof payload.body === "string" ? payload.body : "Open Call Relay to answer from your Android SIM.";
   const tag = typeof payload.tag === "string" ? payload.tag : "incoming-call";
   const url = typeof payload.url === "string" && payload.url.startsWith("/") ? payload.url : "/";
-  event.waitUntil(self.registration.showNotification(title, {
-    body,
-    tag,
-    renotify: true,
-    requireInteraction: true,
-    icon: "/icon.svg",
-    badge: "/icon.svg",
-    data: { url },
-  }));
+  event.waitUntil((async () => {
+    if (payload.type === "call_cancelled") {
+      const notifications = await self.registration.getNotifications({ tag });
+      notifications.forEach((notification) => notification.close());
+      const clients = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+      clients.forEach((client) => client.postMessage({ type: "call_cancelled", callId: payload.callId }));
+    }
+    await self.registration.showNotification(title, {
+      body,
+      tag,
+      renotify: true,
+      requireInteraction: payload.type !== "call_cancelled",
+      silent: payload.type === "call_cancelled",
+      icon: "/icon.svg",
+      badge: "/icon.svg",
+      data: { url },
+    });
+  })());
 });
 
 self.addEventListener("notificationclick", (event) => {

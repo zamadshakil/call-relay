@@ -21,8 +21,8 @@ android {
         applicationId = "dev.zamad.callrelay"
         minSdk = 29
         targetSdk = 36
-        versionCode = 6
-        versionName = "0.6.0-incoming-recovery-alpha"
+        versionCode = 7
+        versionName = "0.7.0-multi-peer-alpha"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField("boolean", "FCM_CONFIGURED", googleServicesFile.exists().toString())
     }

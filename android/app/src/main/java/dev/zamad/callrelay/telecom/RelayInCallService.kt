@@ -13,8 +13,11 @@ import android.telecom.CallAudioState
 import android.telecom.CallEndpoint
 import android.telecom.CallEndpointException
 import android.telecom.InCallService
+import android.telephony.TelephonyManager
 import android.content.Intent
 import androidx.core.content.ContextCompat
+import com.google.i18n.phonenumbers.NumberParseException
+import com.google.i18n.phonenumbers.PhoneNumberUtil
 import dev.zamad.callrelay.MainActivity
 import dev.zamad.callrelay.R
 import dev.zamad.callrelay.relay.RelayReadyService
@@ -241,6 +244,14 @@ class RelayInCallService : InCallService() {
         }
         fun isActive(): Boolean = currentCall.get()?.state == Call.STATE_ACTIVE
 
+        /** Telecom omits or redacts this for private/unavailable caller IDs. */
+        fun incomingNumber(): String? {
+            val raw = currentCall.get()?.details?.handle?.schemeSpecificPart ?: return null
+            val telephony = serviceInstance.get()?.getSystemService(TelephonyManager::class.java)
+            val region = telephony?.networkCountryIso?.ifBlank { telephony.simCountryIso }
+            return normalizeIncomingPhoneNumber(raw, region)
+        }
+
         fun answer() {
             val call = currentCall.get() ?: return
             call.answer(call.details.videoState)
@@ -290,5 +301,19 @@ class RelayInCallService : InCallService() {
             CallEndpoint.TYPE_STREAMING -> "Streaming"
             else -> "Endpoint $type"
         }
+    }
+}
+
+internal fun normalizeIncomingPhoneNumber(raw: String?, countryIso: String?): String? {
+    val value = raw?.trim()?.takeIf(String::isNotBlank) ?: return null
+    if (value.any { it.isLetter() }) return null
+    val region = countryIso?.trim()?.uppercase()?.takeIf { it.length == 2 }
+    val phoneUtil = PhoneNumberUtil.getInstance()
+    return try {
+        val parsed = phoneUtil.parse(value, region ?: "ZZ")
+        parsed.takeIf(phoneUtil::isValidNumber)
+            ?.let { phoneUtil.format(it, PhoneNumberUtil.PhoneNumberFormat.E164) }
+    } catch (_: NumberParseException) {
+        null
     }
 }

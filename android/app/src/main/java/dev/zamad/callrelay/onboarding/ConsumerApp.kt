@@ -73,7 +73,8 @@ data class ConsumerCallbacks(
     val brightenQr: (Boolean) -> Unit,
     val toggleRelay: (Boolean) -> Unit,
     val managePlan: () -> Unit,
-    val replacePeer: () -> Unit,
+    val addPeer: () -> Unit,
+    val replacePeer: (String) -> Unit,
     val signOut: () -> Unit,
 )
 
@@ -312,9 +313,9 @@ private fun PairingScreen(
 @Composable
 private fun ReadyScreen(state: OnboardingUiState, callbacks: ConsumerCallbacks) = Page(
     "Relay Ready",
-    "This Android is paired and available for one iPhone browser peer.",
+    "This Android can stay paired with one browser and one native iPhone.",
 ) {
-    var confirmPeerReplacement by remember { mutableStateOf(false) }
+    var replacementPeer by remember { mutableStateOf<PairedPeerUi?>(null) }
     val runtime by produceState(RelayRuntime.snapshot()) {
         while (true) { value = RelayRuntime.snapshot(); delay(750) }
     }
@@ -337,31 +338,51 @@ private fun ReadyScreen(state: OnboardingUiState, callbacks: ConsumerCallbacks) 
         },
     )
     InfoCard("SIM", listOfNotNull(state.carrierName, state.maskedNumber).joinToString(" · ").ifBlank { "Configured" })
-    InfoCard("Paired peer", state.peerName ?: "iPhone browser")
+    InfoCard(
+        "Paired peers",
+        state.pairedPeers.joinToString(" · ") { peer ->
+            "${peer.displayName} (${if (peer.platform == "ios") "iPhone" else "browser"})"
+        }.ifBlank { "No browser or iPhone paired" },
+    )
     Button({ callbacks.toggleRelay(!runtime.ready) }, Modifier.fillMaxWidth()) { Text(if (runtime.ready) "Pause relay" else "Resume relay") }
     if (state.billingRequired) {
         OutlinedButton(callbacks.managePlan, Modifier.fillMaxWidth()) { Text("Manage plan") }
     }
     OutlinedButton(
-        onClick = { confirmPeerReplacement = true },
+        onClick = callbacks.addPeer,
         modifier = Modifier.fillMaxWidth(),
-        enabled = runtime.callId == null && !state.busy,
+        enabled = runtime.callId == null && !state.busy && state.pairedPeers.size < 2,
+    ) { Text("Add iPhone/browser peer") }
+    OutlinedButton(
+        onClick = { replacementPeer = state.pairedPeers.firstOrNull() },
+        modifier = Modifier.fillMaxWidth(),
+        enabled = runtime.callId == null && !state.busy && state.pairedPeers.isNotEmpty(),
     ) { Text("Replace paired peer") }
     OutlinedButton(callbacks.signOut, Modifier.fillMaxWidth()) { Text("Sign out and revoke this Android") }
     StatusMessages(state)
-    if (confirmPeerReplacement) {
+    replacementPeer?.let { selected ->
         AlertDialog(
-            onDismissRequest = { confirmPeerReplacement = false },
-            title = { Text("Replace the paired iPhone?") },
-            text = { Text("The existing browser will be revoked. You will scan a new secure QR on the replacement iPhone.") },
+            onDismissRequest = { replacementPeer = null },
+            title = { Text("Replace a paired peer?") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Choose the browser or iPhone to revoke, then scan a fresh secure QR.")
+                    state.pairedPeers.forEach { peer ->
+                        OutlinedButton(
+                            onClick = { replacementPeer = peer },
+                            modifier = Modifier.fillMaxWidth(),
+                        ) { Text(if (peer == selected) "✓ ${peer.displayName}" else peer.displayName) }
+                    }
+                }
+            },
             confirmButton = {
                 Button(onClick = {
-                    confirmPeerReplacement = false
-                    callbacks.replacePeer()
-                }) { Text("Replace peer") }
+                    replacementPeer = null
+                    callbacks.replacePeer(selected.deviceId)
+                }) { Text("Revoke and replace") }
             },
             dismissButton = {
-                OutlinedButton(onClick = { confirmPeerReplacement = false }) { Text("Cancel") }
+                OutlinedButton(onClick = { replacementPeer = null }) { Text("Cancel") }
             },
         )
     }

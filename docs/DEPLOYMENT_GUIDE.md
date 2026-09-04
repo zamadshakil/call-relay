@@ -34,7 +34,7 @@ pnpm exec wrangler queues create call-relay-staging-push-dlq
 
 Create a separate TURN key named `call-relay-staging` in Cloudflare Realtime. Save its key ID and scoped API token outside Git. Configure an environment-specific Worker name, D1 UUID, Queue names and FCM project. The Durable Object namespace is created from the checked-in `PAIRING_SIGNAL` binding/SQLite class during deployment.
 
-Apply migrations and verify `0004_cloudflare_webrtc.sql`:
+Apply all migrations and verify both the WebRTC schema and `0009_multi_peer.sql`:
 
 ```powershell
 pnpm exec wrangler d1 migrations list CALL_RELAY_DB --remote --env staging
@@ -117,6 +117,14 @@ Only after staging passes:
 
 There is no media-provider rollback in the application. Production faults are fixed on the Cloudflare/raw-WebRTC path. A Cloudflare outage prevents new calls and must surface as an explicit service-unavailable failure before SIM answer/dial.
 
-## 8. Native iPhone phase
+## 8. Native iPhone staging
 
-After Android/browser WebRTC passes, build Swift/SwiftUI with CallKit, PushKit/APNs, AVAudioSession, raw WebRTC and Keychain-backed identity/pairing keys. Safari remains foreground-only and cannot satisfy locked-screen production behavior.
+On the Mac, first check the physical iPhone's iOS version. Xcode 16.4 can build the checked-in iOS 17+ target; upgrade Xcode/macOS before device testing if the phone runs an OS that Xcode 16.4 cannot support.
+
+1. Copy the Firebase iOS configuration to the ignored `ios/CallRelay/CallRelay/Resources/GoogleService-Info.plist` location and add the matching reversed-client-ID URL scheme locally.
+2. Open/generate the `ios/CallRelay` project, select the free Personal Team, retain bundle ID `dev.zamad.callrelay.ios`, and connect the unlocked iPhone.
+3. Build and run on the phone. Free provisioning expires after seven days and does not provide APNs/PushKit, so keep Call Relay alive for native incoming ringing. Active CallKit calls can continue while the phone locks.
+4. Sign in with the same Google account, scan a new Android pairing QR, and confirm the Settings screen shows Android, browser, and iPhone status independently.
+5. Apply migration `0009_multi_peer.sql` in staging before installing the new Android/PWA/iOS clients.
+
+Qualify iPhone wins, browser wins, simultaneous acceptance, one offline peer, per-peer reject, lock during active audio, Wi-Fi/mobile transitions, forced TURN, receiver/speaker/Bluetooth, and five minutes of full-duplex audio before production. App Store distribution and reliable terminated-app incoming calls require the later paid Apple Developer Program phase.

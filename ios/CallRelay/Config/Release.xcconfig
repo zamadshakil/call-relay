@@ -1,0 +1,4 @@
+API_BASE_URL = https:/$()/call-relay.zamadshakil.workers.dev
+CALL_RELAY_ENVIRONMENT = Production
+GOOGLE_REVERSED_CLIENT_ID = com.googleusercontent.apps.REPLACE_WITH_FIREBASE_IOS_CLIENT
+#include? "Local.xcconfig"

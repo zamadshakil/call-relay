@@ -75,14 +75,15 @@ async function accountSnapshot(env: Env, account: AccountContext): Promise<Recor
     last_heartbeat_at: number | null;
     last_error_code: string | null;
   }>();
-  const pairing = await env.CALL_RELAY_DB.prepare(
+  const pairings = await env.CALL_RELAY_DB.prepare(
     `SELECT p.id, p.confirmed_at, p.protocol_version, p.device_a_id, p.device_b_id,
-      da.display_name AS device_a_name, db.display_name AS device_b_name
+      da.display_name AS device_a_name, da.platform AS device_a_platform,
+      db.display_name AS device_b_name, db.platform AS device_b_platform
      FROM pairings p
      JOIN devices da ON da.id = p.device_a_id
      JOIN devices db ON db.id = p.device_b_id
-     WHERE p.user_id = ? AND p.revoked_at IS NULL ORDER BY p.created_at DESC LIMIT 1`,
-  ).bind(account.identity.uid).first<Record<string, unknown>>();
+     WHERE p.user_id = ? AND p.revoked_at IS NULL ORDER BY p.created_at DESC`,
+  ).bind(account.identity.uid).all<Record<string, unknown>>();
   return {
     account: {
       uid: account.identity.uid,
@@ -115,7 +116,8 @@ async function accountSnapshot(env: Env, account: AccountContext): Promise<Recor
         maskedNumber: device.phone_number_last4 ? `••••${device.phone_number_last4}` : null,
       },
     })),
-    pairing: pairing ?? null,
+    pairing: pairings.results[0] ?? null,
+    pairings: pairings.results,
   };
 }
 
@@ -149,10 +151,9 @@ export async function registerDevice(request: Request, env: Env): Promise<Respon
   const fcmInstallationId = platform === "android" && typeof body.fcmInstallationId === "string" && body.fcmInstallationId.length <= 4096
     ? body.fcmInstallationId
     : null;
-  const rolePlatforms: Platform[] = platform === "android" ? ["android"] : ["browser", "ios"];
   const existing = await env.CALL_RELAY_DB.prepare(
-    `SELECT id, public_key_spki FROM devices WHERE user_id = ? AND platform IN (${rolePlatforms.map(() => "?").join(",")}) AND revoked_at IS NULL LIMIT 1`,
-  ).bind(account.identity.uid, ...rolePlatforms).first<{ id: string; public_key_spki: string }>();
+    "SELECT id, public_key_spki FROM devices WHERE user_id = ? AND platform = ? AND revoked_at IS NULL LIMIT 1",
+  ).bind(account.identity.uid, platform).first<{ id: string; public_key_spki: string }>();
   const now = Date.now();
   if (existing?.public_key_spki === publicKeySpki) {
     await env.CALL_RELAY_DB.prepare(

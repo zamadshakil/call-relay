@@ -24,11 +24,24 @@ export function pairingRevocationStatements(
       env.CALL_RELAY_DB.prepare("UPDATE pairings SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL")
         .bind(revokedAt, pairingId),
       env.CALL_RELAY_DB.prepare(
+        `UPDATE call_recipients SET status = 'missed', responded_at = COALESCE(responded_at, ?)
+         WHERE pairing_id = ? AND status = 'ringing'`,
+      ).bind(revokedAt, pairingId),
+      env.CALL_RELAY_DB.prepare(
         `UPDATE call_sessions
          SET state = 'failed', failure_code = 'pairing_revoked', media_failure_code = 'pairing_revoked',
              ended_at = COALESCE(ended_at, ?), updated_at = ?, version = version + 1
-         WHERE pairing_id = ? AND state NOT IN ('ended', 'failed')`,
-      ).bind(revokedAt, revokedAt, pairingId),
+         WHERE state NOT IN ('ended', 'failed') AND (
+           selected_pairing_id = ? OR (
+             selected_pairing_id IS NULL
+             AND EXISTS (SELECT 1 FROM call_recipients cr WHERE cr.call_id = call_sessions.id AND cr.pairing_id = ?)
+             AND NOT EXISTS (SELECT 1 FROM call_recipients cr WHERE cr.call_id = call_sessions.id AND cr.status = 'ringing')
+           ) OR (
+             selected_pairing_id IS NULL AND pairing_id = ?
+             AND NOT EXISTS (SELECT 1 FROM call_recipients cr WHERE cr.call_id = call_sessions.id)
+           )
+         )`,
+      ).bind(revokedAt, revokedAt, pairingId, pairingId, pairingId),
       env.CALL_RELAY_DB.prepare(
         `INSERT OR IGNORE INTO pairing_control_outbox(id, pairing_id, action, reason, created_at)
          SELECT ?, ?, 'revoke', ?, ? WHERE EXISTS (

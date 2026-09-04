@@ -19,6 +19,7 @@ export type CallState =
   | "ending"
   | "ended"
   | "failed";
+export type CallRecipientStatus = "ringing" | "selected" | "declined" | "answered_elsewhere" | "missed";
 
 export type Env = Omit<Cloudflare.Env, "PUSH_QUEUE"> & {
   // Wrangler's generated Worker env currently omits the static-assets binding.
@@ -121,6 +122,18 @@ export interface CallRow {
   peer_accepted_at: number | null;
   telecom_answer_requested_at: number | null;
   sim_active_at: number | null;
+  selected_pairing_id: string | null;
+  selected_peer_device_id: string | null;
+}
+
+export interface CallRecipientRow {
+  call_id: string;
+  pairing_id: string;
+  peer_device_id: string;
+  status: CallRecipientStatus;
+  created_at: number;
+  responded_at: number | null;
+  decision_command_id: string | null;
 }
 
 export interface IceServerConfig {

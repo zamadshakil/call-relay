@@ -25,7 +25,8 @@ class PairingSignalClient(
     private val preferences: RelayPreferences,
     private val api: RelayApiClient,
     private val listener: Listener,
-) {
+    private val pairing: RelayPreferences.PairingRecord? = null,
+) : SignalTransport {
     data class CallSnapshot(
         val id: String,
         val androidDeviceId: String,
@@ -36,6 +37,8 @@ class PairingSignalClient(
         val relayMode: String,
         val version: Int,
         val createdAt: Long,
+        val selectedPairingId: String?,
+        val selectedPeerDeviceId: String?,
     )
 
     interface Listener {
@@ -64,6 +67,9 @@ class PairingSignalClient(
     @Volatile private var revocationNotified = false
     private var connectJob: Job? = null
 
+    val pairingId: String get() = pairing?.id ?: preferences.pairingId
+    private val pairingSecret: String get() = pairing?.secret ?: preferences.pairingSecret
+
     fun start() {
         if (wanted) return
         wanted = true
@@ -82,7 +88,7 @@ class PairingSignalClient(
                         ) {
                             notifyPairingRevoked(
                                 connection = null,
-                                pairingId = preferences.pairingId,
+                                pairingId = pairingId,
                                 reason = failure.code ?: "PAIRING_REVOKED",
                             )
                         } else {
@@ -100,7 +106,7 @@ class PairingSignalClient(
         }
     }
 
-    suspend fun awaitConnected(timeoutMs: Long = 10_000L) {
+    override suspend fun awaitConnected(timeoutMs: Long) {
         start()
         val deadline = System.currentTimeMillis() + timeoutMs
         while (sessionId.isBlank()) {
@@ -111,7 +117,7 @@ class PairingSignalClient(
 
     fun isPeerOnline(): Boolean = peerOnline
 
-    fun send(type: String, callId: String, payload: JSONObject, negotiationId: String? = null) {
+    override fun send(type: String, callId: String, payload: JSONObject, negotiationId: String?) {
         require(negotiationId == null || NEGOTIATION_ID.matches(negotiationId)) { "Signal negotiation ID is invalid" }
         val connectedSocket = socket ?: error("Cloudflare signaling is disconnected")
         val connectedSession = sessionId.ifBlank { error("Cloudflare signaling is not authenticated") }
@@ -142,7 +148,7 @@ class PairingSignalClient(
             .put("timestamp", timestamp)
             .put("type", type)
             .put("payload", encodedPayload)
-            .put("mac", SignalAuthenticator.mac(preferences.pairingSecret, callId, canonical))
+            .put("mac", SignalAuthenticator.mac(pairingSecret, callId, canonical))
             .apply { if (negotiationId != null) put("negotiationId", negotiationId) }
         check(connectedSocket.send(envelope.toString())) { "Cloudflare signaling send failed" }
     }
@@ -172,19 +178,19 @@ class PairingSignalClient(
     }
 
     private suspend fun openSocket() {
-        check(preferences.configured()) { "Enroll and confirm pairing before signaling" }
-        val pairingId = preferences.pairingId
-        val ticket = api.signalTicket()
+        check(preferences.deviceId.isNotBlank() && pairingId.isNotBlank() && pairingSecret.isNotBlank()) { "Enroll and confirm pairing before signaling" }
+        val activePairingId = pairingId
+        val ticket = api.signalTicket(activePairingId)
         check(ticket.protocol == PROTOCOL) { "Worker returned an unsupported signaling protocol" }
         val webSocketUrl = preferences.apiBaseUrl
-            .replaceFirst("https://", "wss://") + "/v1/pairings/$pairingId/signal"
+            .replaceFirst("https://", "wss://") + "/v1/pairings/$activePairingId/signal"
         val request = Request.Builder()
             .url(webSocketUrl)
             .header("Sec-WebSocket-Protocol", "$PROTOCOL, cr-ticket.${ticket.ticket}")
             .build()
         listener.onSignalState("Connecting")
-        val createdSocket = client.newWebSocket(request, socketListener(pairingId))
-        connectionGuard.bind(createdSocket, pairingId)
+        val createdSocket = client.newWebSocket(request, socketListener(activePairingId))
+        connectionGuard.bind(createdSocket, activePairingId)
         socket = createdSocket
         val deadline = System.currentTimeMillis() + 10_000L
         while (wanted && sessionId.isBlank() && socket != null) {
@@ -226,7 +232,7 @@ class PairingSignalClient(
 
     private fun notifyPairingRevoked(connection: WebSocket?, pairingId: String, reason: String) {
         if (connection != null && connectionGuard.pairingIdIfCurrent(connection) != pairingId) return
-        if (connection == null && preferences.pairingId != pairingId) return
+        if (connection == null && this.pairingId != pairingId) return
         if (revocationNotified) return
         revocationNotified = true
         wanted = false
@@ -269,6 +275,8 @@ class PairingSignalClient(
                     relayMode = value.getString("relay_mode"),
                     version = value.getInt("version"),
                     createdAt = value.getLong("created_at"),
+                    selectedPairingId = value.optString("selected_pairing_id").takeIf { it.isNotBlank() && it != "null" },
+                    selectedPeerDeviceId = value.optString("selected_peer_device_id").takeIf { it.isNotBlank() && it != "null" },
                 )
                 check(call.androidDeviceId == preferences.deviceId) { "Call snapshot belongs to another Android" }
                 val existing = currentCall
@@ -299,11 +307,12 @@ class PairingSignalClient(
         val negotiationId = message.optString("negotiationId").ifBlank { null }
         check(negotiationId == null || NEGOTIATION_ID.matches(negotiationId)) { "Signal negotiation ID is invalid" }
         val call = currentCall
-        check(call != null && call.id == callId && sender == call.peerDeviceId && role == "peer") { "Signal sender is not the paired peer" }
+        val expectedPeer = call?.selectedPeerDeviceId ?: call?.peerDeviceId
+        check(call != null && call.id == callId && sender == expectedPeer && role == "peer") { "Signal sender is not the selected peer" }
         check(kotlin.math.abs(System.currentTimeMillis() - timestamp) <= 5 * 60_000L) { "Signal timestamp is stale" }
         check(sequence > (remoteSequences[remoteSession] ?: 0L)) { "Signal replay was rejected" }
         val canonical = canonicalSignalEnvelope(callId, sender, role, remoteSession, sequence, timestamp, type, payload, negotiationId)
-        check(SignalAuthenticator.verify(preferences.pairingSecret, callId, canonical, message.getString("mac"))) {
+        check(SignalAuthenticator.verify(pairingSecret, callId, canonical, message.getString("mac"))) {
             "Signal HMAC verification failed"
         }
         remoteSequences[remoteSession] = sequence

@@ -128,7 +128,7 @@ export class PairingSignal extends DurableObject<Env> {
     return new Response(null, { status: 101, webSocket: client, headers: { "sec-websocket-protocol": "call-relay.signal.v1" } });
   }
 
-  async publishSnapshot(snapshotJson: string): Promise<void> {
+  async publishSnapshot(snapshotJson: string, allowSignaling = true): Promise<void> {
     if (this.pairingMeta().revoked_at !== null) throw new Error("PAIRING_REVOKED");
     const call = JSON.parse(snapshotJson) as { id?: unknown; state?: unknown; version?: unknown; created_at?: unknown };
     if (
@@ -145,7 +145,7 @@ export class PairingSignal extends DurableObject<Env> {
       if (existing.id !== call.id && typeof existing.created_at === "number" && existing.created_at > call.created_at) return;
     }
     const terminal = call.state === "ended" || call.state === "failed";
-    const callId = !terminal ? call.id : null;
+    const callId = !terminal && allowSignaling ? call.id : null;
     const version = call.version;
     this.ctx.storage.sql.exec(
       `INSERT INTO pairing_state(singleton, active_call_id, call_version, snapshot_json) VALUES (1, ?, ?, ?)
