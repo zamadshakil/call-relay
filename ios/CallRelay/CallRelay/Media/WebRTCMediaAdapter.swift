@@ -86,11 +86,17 @@ final class WebRTCMediaAdapter: NSObject, MediaAdapter, @unchecked Sendable {
 
     func addRemoteCandidate(_ candidate: LocalICECandidate) throws {
         guard let peerConnection else { throw RelayError.media("WebRTC is not prepared.") }
-        peerConnection.add(RTCIceCandidate(
+        let rtcCandidate = RTCIceCandidate(
             sdp: candidate.candidate,
             sdpMLineIndex: candidate.sdpMLineIndex,
             sdpMid: candidate.sdpMid
-        ))
+        )
+        peerConnection.add(rtcCandidate) { [weak self] error in
+            guard let error else { return }
+            Task { @MainActor [weak self] in
+                self?.emit(.failed, detail: "ICE candidate was rejected: \(error.localizedDescription)")
+            }
+        }
     }
 
     func setMuted(_ muted: Bool) {
@@ -149,7 +155,7 @@ final class WebRTCMediaAdapter: NSObject, MediaAdapter, @unchecked Sendable {
     }
 
     private func setRemote(_ description: RTCSessionDescription, on peer: RTCPeerConnection) async throws {
-        try await withCheckedThrowingContinuation { continuation in
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             peer.setRemoteDescription(description) { error in
                 if let error { continuation.resume(throwing: error) }
                 else { continuation.resume(returning: ()) }
@@ -158,7 +164,7 @@ final class WebRTCMediaAdapter: NSObject, MediaAdapter, @unchecked Sendable {
     }
 
     private func setLocal(_ description: RTCSessionDescription, on peer: RTCPeerConnection) async throws {
-        try await withCheckedThrowingContinuation { continuation in
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             peer.setLocalDescription(description) { error in
                 if let error { continuation.resume(throwing: error) }
                 else { continuation.resume(returning: ()) }
