@@ -11,6 +11,8 @@ final class CallKitController: NSObject, ObservableObject {
     var onMute: ((CXSetMutedCallAction) -> Void)?
     var onDTMF: ((CXPlayDTMFCallAction) -> Void)?
     var onAudioActivated: ((Bool) -> Void)?
+    var onPrepareAudio: (() throws -> Void)?
+    var onAudioPreparationFailed: ((String) -> Void)?
     var onProviderReset: (() -> Void)?
 
     private let provider: CXProvider
@@ -158,12 +160,28 @@ extension CallKitController: CXProviderDelegate {
     }
 
     nonisolated func provider(_ provider: CXProvider, perform action: CXStartCallAction) {
-        action.fulfill()
+        Task { @MainActor in
+            do {
+                guard let onPrepareAudio else { action.fail(); return }
+                try onPrepareAudio()
+                action.fulfill()
+            } catch {
+                action.fail()
+                onAudioPreparationFailed?(error.localizedDescription)
+            }
+        }
     }
 
     nonisolated func provider(_ provider: CXProvider, perform action: CXAnswerCallAction) {
         Task { @MainActor in
-            if let onAnswer { onAnswer(action) } else { action.fail() }
+            do {
+                guard let onPrepareAudio, let onAnswer else { action.fail(); return }
+                try onPrepareAudio()
+                onAnswer(action)
+            } catch {
+                action.fail()
+                onAudioPreparationFailed?(error.localizedDescription)
+            }
         }
     }
 

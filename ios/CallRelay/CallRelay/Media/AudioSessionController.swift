@@ -30,19 +30,20 @@ final class AudioSessionController: ObservableObject {
         }
     }
 
-    func configure(active: Bool) throws {
-        _ = active
+    func configureForCall() throws {
+        rtcSession.useManualAudio = true
         rtcSession.lockForConfiguration()
         defer { rtcSession.unlockForConfiguration() }
         try rtcSession.setCategory(
             .playAndRecord,
             mode: .voiceChat,
-            options: [.allowBluetooth, .allowBluetoothA2DP]
+            options: [.allowBluetooth]
         )
         try rtcSession.setPreferredSampleRate(48_000)
         try rtcSession.setPreferredIOBufferDuration(0.01)
-        // CallKit owns AVAudioSession activation. We only configure its voice
-        // characteristics after CXProvider hands the session to us.
+        // Configure BEFORE fulfilling CXStartCallAction/CXAnswerCallAction.
+        // CallKit alone activates the session; didActivate then enables WebRTC.
+        // A2DP is playback-only; call audio uses a headset's HFP route.
         refreshRoutes()
     }
 
@@ -59,7 +60,7 @@ final class AudioSessionController: ObservableObject {
             try rtcSession.overrideOutputAudioPort(.speaker)
         case .bluetooth:
             guard let input = session.availableInputs?.first(where: {
-                $0.portType == .bluetoothHFP || $0.portType == .bluetoothLE || $0.portType == .bluetoothA2DP
+                $0.portType == .bluetoothHFP || $0.portType == .bluetoothLE
             }) else { throw RelayError.media("No Bluetooth audio device is connected.") }
             try rtcSession.overrideOutputAudioPort(.none)
             try rtcSession.setPreferredInput(input)

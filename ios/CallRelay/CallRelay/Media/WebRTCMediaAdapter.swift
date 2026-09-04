@@ -20,14 +20,11 @@ final class WebRTCMediaAdapter: NSObject, MediaAdapter, @unchecked Sendable {
     private var localAudioTrack: RTCAudioTrack?
     private var remoteAudioTrack: RTCAudioTrack?
     private var configuration: RTCConfiguration?
-    private var explicitlyMuted = false
-    private var audioActive = false
-    private var mode: RelayMode = .fullDuplex
+    private var audioState = CallAudioState()
     private var preparedAt: Date?
     private var connectedAt: Date?
 
     func prepare(configuration media: ICEConfiguration, relayOnly: Bool) throws {
-        let wasAudioActive = audioActive
         close()
         preparedAt = Date()
         connectedAt = nil
@@ -61,7 +58,7 @@ final class WebRTCMediaAdapter: NSObject, MediaAdapter, @unchecked Sendable {
         let track = Self.factory.audioTrack(with: source, trackId: "call-relay-audio")
         localAudioTrack = track
         peer.add(track, streamIds: ["call-relay-stream"])
-        if wasAudioActive { setAudioActive(true) }
+        audioState.mediaPrepared = true
         applyAudioDirection()
         emit(.connecting)
     }
@@ -69,6 +66,7 @@ final class WebRTCMediaAdapter: NSObject, MediaAdapter, @unchecked Sendable {
     func answer(offerSDP: String) async throws -> String {
         guard let peerConnection else { throw RelayError.media("WebRTC is not prepared.") }
         try await setRemote(RTCSessionDescription(type: .offer, sdp: offerSDP), on: peerConnection)
+        guard self.peerConnection === peerConnection else { throw CancellationError() }
         let constraints = RTCMediaConstraints(
             mandatoryConstraints: ["OfferToReceiveAudio": "true", "OfferToReceiveVideo": "false"],
             optionalConstraints: nil
@@ -80,7 +78,9 @@ final class WebRTCMediaAdapter: NSObject, MediaAdapter, @unchecked Sendable {
                 else { continuation.resume(throwing: RelayError.media("WebRTC did not create an answer.")) }
             }
         }
+        guard self.peerConnection === peerConnection else { throw CancellationError() }
         try await setLocal(answer, on: peerConnection)
+        guard self.peerConnection === peerConnection else { throw CancellationError() }
         return answer.sdp
     }
 
@@ -94,31 +94,31 @@ final class WebRTCMediaAdapter: NSObject, MediaAdapter, @unchecked Sendable {
         peerConnection.add(rtcCandidate) { [weak self] error in
             guard let error else { return }
             Task { @MainActor [weak self] in
-                self?.emit(.failed, detail: "ICE candidate was rejected: \(error.localizedDescription)")
+                guard let self, self.peerConnection === peerConnection else { return }
+                self.emit(.failed, detail: "ICE candidate was rejected: \(error.localizedDescription)")
             }
         }
     }
 
     func setMuted(_ muted: Bool) {
-        explicitlyMuted = muted
+        audioState.muted = muted
         applyAudioDirection()
     }
 
     func setMode(_ mode: RelayMode) {
-        self.mode = mode
+        audioState.mode = mode
         applyAudioDirection()
     }
 
     func setAudioActive(_ active: Bool) {
         let rtcAudio = RTCAudioSession.sharedInstance()
         rtcAudio.useManualAudio = true
-        if active, !audioActive {
+        if active, !audioState.callKitActive {
             rtcAudio.audioSessionDidActivate(AVAudioSession.sharedInstance())
-        } else if !active, audioActive {
+        } else if !active, audioState.callKitActive {
             rtcAudio.audioSessionDidDeactivate(AVAudioSession.sharedInstance())
         }
-        audioActive = active
-        rtcAudio.isAudioEnabled = active
+        audioState.callKitActive = active
         applyAudioDirection()
     }
 
@@ -137,6 +137,7 @@ final class WebRTCMediaAdapter: NSObject, MediaAdapter, @unchecked Sendable {
         let report: RTCStatisticsReport = await withCheckedContinuation { continuation in
             peerConnection.statistics { continuation.resume(returning: $0) }
         }
+        guard self.peerConnection === peerConnection else { return nil }
         return makeStatistics(from: report)
     }
 
@@ -150,7 +151,8 @@ final class WebRTCMediaAdapter: NSObject, MediaAdapter, @unchecked Sendable {
         configuration = nil
         preparedAt = nil
         connectedAt = nil
-        setAudioActive(false)
+        audioState.mediaPrepared = false
+        applyAudioDirection()
         emit(.idle)
     }
 
@@ -173,8 +175,9 @@ final class WebRTCMediaAdapter: NSObject, MediaAdapter, @unchecked Sendable {
     }
 
     private func applyAudioDirection() {
-        localAudioTrack?.isEnabled = audioActive && !explicitlyMuted && mode != .listen
-        remoteAudioTrack?.isEnabled = audioActive && mode != .talk
+        RTCAudioSession.sharedInstance().isAudioEnabled = audioState.audioEnabled
+        localAudioTrack?.isEnabled = audioState.sendingEnabled
+        remoteAudioTrack?.isEnabled = audioState.receivingEnabled
     }
 
     private func emit(_ state: MediaConnectionState, detail: String? = nil) {
@@ -189,6 +192,10 @@ final class WebRTCMediaAdapter: NSObject, MediaAdapter, @unchecked Sendable {
         var concealedSamples: Int64 = 0
         var bytesSent: Int64 = 0
         var bytesReceived: Int64 = 0
+        var microphoneLevel: Double?
+        var receivedLevel: Double?
+        var microphoneEnergy: Double?
+        var receivedEnergy: Double?
         var selectedLocalCandidateId: String?
 
         for statistic in report.statistics.values {
@@ -204,8 +211,13 @@ final class WebRTCMediaAdapter: NSObject, MediaAdapter, @unchecked Sendable {
                 packetsReceived = Self.integer(values["packetsReceived"])
                 concealedSamples = Self.integer(values["concealedSamples"])
                 bytesReceived = Self.integer(values["bytesReceived"])
+                receivedLevel = (values["audioLevel"] as? NSNumber)?.doubleValue
+                receivedEnergy = (values["totalAudioEnergy"] as? NSNumber)?.doubleValue
             } else if statistic.type == "outbound-rtp", values["kind"] as? String == "audio" {
                 bytesSent = Self.integer(values["bytesSent"])
+            } else if statistic.type == "media-source", values["kind"] as? String == "audio" {
+                microphoneLevel = (values["audioLevel"] as? NSNumber)?.doubleValue
+                microphoneEnergy = (values["totalAudioEnergy"] as? NSNumber)?.doubleValue
             }
         }
 
@@ -214,6 +226,8 @@ final class WebRTCMediaAdapter: NSObject, MediaAdapter, @unchecked Sendable {
         let transport = (localCandidate?.values["relayProtocol"] as? String)
             ?? (localCandidate?.values["protocol"] as? String)
             ?? "unknown"
+        let rtcAudio = RTCAudioSession.sharedInstance()
+        let audioSession = rtcAudio.session
         return MediaStatistics(
             setupDurationMs: max(0, (connectedAt ?? Date()).timeIntervalSince(preparedAt ?? Date()) * 1_000),
             candidateType: candidateType,
@@ -224,7 +238,20 @@ final class WebRTCMediaAdapter: NSObject, MediaAdapter, @unchecked Sendable {
             packetsReceived: max(0, packetsReceived),
             concealedSamples: max(0, concealedSamples),
             bytesSent: max(0, bytesSent),
-            bytesReceived: max(0, bytesReceived)
+            bytesReceived: max(0, bytesReceived),
+            audio: MediaAudioDiagnostics(
+                callKitActive: audioState.callKitActive,
+                audioUnitEnabled: rtcAudio.isAudioEnabled,
+                sendingEnabled: localAudioTrack?.isEnabled ?? false,
+                receivingEnabled: remoteAudioTrack?.isEnabled ?? false,
+                microphoneLevel: microphoneLevel,
+                receivedLevel: receivedLevel,
+                microphoneEnergy: microphoneEnergy,
+                receivedEnergy: receivedEnergy,
+                inputRoute: audioSession.currentRoute.inputs.map { $0.portType.rawValue }.joined(separator: ", "),
+                outputRoute: audioSession.currentRoute.outputs.map { $0.portType.rawValue }.joined(separator: ", "),
+                outputVolume: Double(audioSession.outputVolume)
+            )
         )
     }
 

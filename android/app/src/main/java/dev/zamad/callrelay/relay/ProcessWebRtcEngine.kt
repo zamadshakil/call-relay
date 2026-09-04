@@ -117,7 +117,7 @@ internal class AudioProcessorRouter : ExternalAudioProcessingFactory.AudioProces
         delegate.get()?.reset(newRate)
     }
 
-    override fun process(sampleRateHz: Int, numChannels: Int, buffer: ByteBuffer) {
-        delegate.get()?.process(sampleRateHz, numChannels, buffer)
+    override fun process(numBands: Int, numFrames: Int, buffer: ByteBuffer) {
+        delegate.get()?.process(numBands, numFrames, buffer)
     }
 }

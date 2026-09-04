@@ -2,6 +2,49 @@ import XCTest
 @testable import CallRelay
 
 final class ProtocolPolicyTests: XCTestCase {
+    func testCallKitActivationBeforeMediaPreparationSurvivesPeerReset() {
+        var audio = CallAudioState()
+        audio.callKitActive = true
+        XCTAssertFalse(audio.audioEnabled)
+        audio.mediaPrepared = true
+        XCTAssertTrue(audio.sendingEnabled)
+        XCTAssertTrue(audio.receivingEnabled)
+        audio.mediaPrepared = false
+        XCTAssertFalse(audio.audioEnabled)
+        XCTAssertTrue(audio.callKitActive)
+        audio.mediaPrepared = true
+        XCTAssertTrue(audio.audioEnabled)
+    }
+
+    func testMediaPreparedBeforeCallKitWaitsForActivationAndStopsOnDeactivation() {
+        var audio = CallAudioState()
+        audio.mediaPrepared = true
+        XCTAssertFalse(audio.sendingEnabled)
+        XCTAssertFalse(audio.receivingEnabled)
+        audio.callKitActive = true
+        XCTAssertTrue(audio.audioEnabled)
+        audio.callKitActive = false
+        XCTAssertFalse(audio.sendingEnabled)
+        XCTAssertFalse(audio.receivingEnabled)
+    }
+
+    func testAudioModesAndMutePreserveReceiveDirectionAcrossRecovery() {
+        var audio = CallAudioState(callKitActive: true, mediaPrepared: true)
+        audio.muted = true
+        XCTAssertFalse(audio.sendingEnabled)
+        XCTAssertTrue(audio.receivingEnabled)
+        audio.mediaPrepared = false
+        audio.mediaPrepared = true
+        XCTAssertFalse(audio.sendingEnabled)
+        audio.muted = false
+        audio.mode = .listen
+        XCTAssertFalse(audio.sendingEnabled)
+        XCTAssertTrue(audio.receivingEnabled)
+        audio.mode = .talk
+        XCTAssertTrue(audio.sendingEnabled)
+        XCTAssertFalse(audio.receivingEnabled)
+    }
+
     func testSequenceGateRejectsReplayAndSeparatesSessions() {
         var gate = SequenceGate()
         XCTAssertTrue(gate.accept(sessionId: "one", sequence: 1))

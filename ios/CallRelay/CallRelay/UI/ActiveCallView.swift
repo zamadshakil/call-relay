@@ -4,6 +4,7 @@ struct ActiveCallView: View {
     @ObservedObject var coordinator: CallCoordinator
     @ObservedObject var contacts: ContactsService
     @State private var choosingAudio = false
+    @State private var showingAudioDiagnostics = false
     @State private var errorMessage: String?
 
     var body: some View {
@@ -34,6 +35,10 @@ struct ActiveCallView: View {
                                 .foregroundStyle(.white.opacity(0.65))
                         }
                     }
+
+                    Button("Audio diagnostics") { showingAudioDiagnostics = true }
+                        .font(.caption)
+                        .foregroundStyle(.white.opacity(0.7))
 
                     HStack(spacing: 28) {
                         CallControlButton(title: "mute", symbol: coordinator.isMuted ? "mic.slash.fill" : "mic.fill", selected: coordinator.isMuted) {
@@ -74,6 +79,9 @@ struct ActiveCallView: View {
                 }
                 .foregroundStyle(.white)
             }
+        }
+        .sheet(isPresented: $showingAudioDiagnostics) {
+            CallAudioDiagnosticsView(coordinator: coordinator)
         }
         .confirmationDialog("Audio Route", isPresented: $choosingAudio, titleVisibility: .visible) {
             ForEach(AudioSessionController.Output.allCases) { output in
@@ -162,6 +170,52 @@ private struct InCallKeypad: View {
                     .foregroundStyle(.white)
             }
         }
+    }
+}
+
+private struct CallAudioDiagnosticsView: View {
+    @ObservedObject var coordinator: CallCoordinator
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            List {
+                LabeledContent("Connection", value: coordinator.mediaState.rawValue)
+                if let statistics = coordinator.mediaStatistics {
+                    LabeledContent("Sent / received bytes", value: "\(statistics.bytesSent) / \(statistics.bytesReceived)")
+                    if let audio = statistics.audio {
+                        LabeledContent("CallKit activated", value: audio.callKitActive ? "Yes" : "No")
+                        LabeledContent("WebRTC audio enabled", value: audio.audioUnitEnabled ? "Yes" : "No")
+                        LabeledContent("Send track", value: audio.sendingEnabled ? "Enabled" : "Muted / disabled")
+                        LabeledContent("Receive track", value: audio.receivingEnabled ? "Enabled" : "Absent / disabled")
+                        LabeledContent("Microphone level", value: level(audio.microphoneLevel))
+                        LabeledContent("Received audio level", value: level(audio.receivedLevel))
+                        LabeledContent("Microphone energy", value: number(audio.microphoneEnergy))
+                        LabeledContent("Received energy", value: number(audio.receivedEnergy))
+                        LabeledContent("Input", value: audio.inputRoute.isEmpty ? "None" : audio.inputRoute)
+                        LabeledContent("Output", value: audio.outputRoute.isEmpty ? "None" : audio.outputRoute)
+                        LabeledContent("Session output volume", value: String(format: "%.0f%%", audio.outputVolume * 100))
+                    }
+                } else {
+                    Text("Waiting for WebRTC statistics…")
+                }
+                Text("Updates every three seconds. Packet traffic alone does not prove audible speech. Levels and cumulative energy help identify silence; no call audio is recorded.")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
+            .navigationTitle("Audio diagnostics")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+        }
+    }
+
+    private func level(_ value: Double?) -> String {
+        guard let value, value.isFinite else { return "Unavailable" }
+        return String(format: "%.2f%%", value * 100)
+    }
+
+    private func number(_ value: Double?) -> String {
+        guard let value, value.isFinite else { return "Unavailable" }
+        return String(format: "%.5f", value)
     }
 }
 

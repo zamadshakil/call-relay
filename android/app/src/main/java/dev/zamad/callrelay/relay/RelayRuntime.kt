@@ -14,6 +14,7 @@ object RelayRuntime {
         val callId: String? = null,
         val captureRms: Double = 0.0,
         val capturePeak: Int = 0,
+        val audioDiagnostics: String? = null,
         val error: String? = null,
     )
 

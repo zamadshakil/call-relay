@@ -17,6 +17,19 @@ enum MediaQuality: String, Sendable {
     case poor = "Poor"
 }
 
+/// CallKit activation outlives a peer connection during recovery. Closing a
+/// peer must gate its audio, not invent a CallKit deactivation notification.
+struct CallAudioState: Equatable {
+    var callKitActive = false
+    var mediaPrepared = false
+    var muted = false
+    var mode: RelayMode = .fullDuplex
+
+    var audioEnabled: Bool { callKitActive && mediaPrepared }
+    var sendingEnabled: Bool { audioEnabled && !muted && mode != .listen }
+    var receivingEnabled: Bool { audioEnabled && mode != .talk }
+}
+
 struct MediaStatistics: Equatable, Sendable {
     let setupDurationMs: Double
     let candidateType: String
@@ -28,6 +41,9 @@ struct MediaStatistics: Equatable, Sendable {
     let concealedSamples: Int64
     let bytesSent: Int64
     let bytesReceived: Int64
+    // Local diagnostics only. Do not attach microphone/route details to the
+    // legacy server event schema, and never retain actual audio samples.
+    var audio: MediaAudioDiagnostics? = nil
 
     var eventPayload: [String: Any] {
         [
@@ -42,6 +58,20 @@ struct MediaStatistics: Equatable, Sendable {
             "bytesReceived": max(0, bytesReceived)
         ]
     }
+}
+
+struct MediaAudioDiagnostics: Equatable, Sendable {
+    let callKitActive: Bool
+    let audioUnitEnabled: Bool
+    let sendingEnabled: Bool
+    let receivingEnabled: Bool
+    let microphoneLevel: Double?
+    let receivedLevel: Double?
+    let microphoneEnergy: Double?
+    let receivedEnergy: Double?
+    let inputRoute: String
+    let outputRoute: String
+    let outputVolume: Double
 }
 
 struct LocalICECandidate: Sendable {

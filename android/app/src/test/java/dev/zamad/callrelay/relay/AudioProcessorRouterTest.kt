@@ -13,15 +13,17 @@ class AudioProcessorRouterTest {
         val processor = object : ExternalAudioProcessingFactory.AudioProcessing {
             override fun initialize(sampleRateHz: Int, numChannels: Int) = Unit
             override fun reset(newRate: Int) = Unit
-            override fun process(sampleRateHz: Int, numChannels: Int, buffer: ByteBuffer) {
+            override fun process(numBands: Int, numFrames: Int, buffer: ByteBuffer) {
+                assertEquals(3, numBands)
+                assertEquals(480, numFrames)
                 calls.incrementAndGet()
             }
         }
         val router = AudioProcessorRouter()
         router.attach(processor)
-        router.process(48_000, 1, ByteBuffer.allocateDirect(16))
+        router.process(3, 480, ByteBuffer.allocateDirect(480 * 4))
         router.detach()
-        router.process(48_000, 1, ByteBuffer.allocateDirect(16))
+        router.process(3, 480, ByteBuffer.allocateDirect(480 * 4))
         assertEquals(1, calls.get())
     }
 }

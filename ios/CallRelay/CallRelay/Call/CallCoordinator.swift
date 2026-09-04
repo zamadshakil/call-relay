@@ -40,7 +40,7 @@ final class CallCoordinator: ObservableObject {
     private var offerInFlight = false
     private var pendingOffers: [String: (payload: [String: Any], negotiationId: String?)] = [:]
     private var pendingCandidates: [String: [LocalICECandidate]] = [:]
-    private var callKitAudioActive = false
+    private var mediaGeneration = 0
     private var statsTask: Task<Void, Never>?
     private var previousStatistics: MediaStatistics?
     private var statsEmissionCounter = 0
@@ -112,7 +112,6 @@ final class CallCoordinator: ObservableObject {
                 try? await api.sendEvent(callId: failedId, type: "failed", code: "ios_outgoing_setup_failed")
                 callKit.reportEnded(callId: failedId, reason: .failed)
             }
-            callKitAudioActive = false
             resetMedia()
             currentCall = nil
         }
@@ -168,8 +167,12 @@ final class CallCoordinator: ObservableObject {
             }
         }
         media.onLocalCandidate = { [weak self] candidate in
-            Task { @MainActor in
-                guard let self, let call = self.currentCall else { return }
+            guard let self, let call = self.currentCall, self.mediaCallId == call.id else { return }
+            let generation = self.mediaGeneration
+            let negotiationId = self.currentNegotiationId
+            Task { @MainActor [weak self] in
+                guard let self, self.mediaGeneration == generation, self.currentCall?.id == call.id,
+                      self.currentNegotiationId == negotiationId else { return }
                 try? await self.signal.send(
                     type: "ice_candidates",
                     callId: call.id,
@@ -178,34 +181,51 @@ final class CallCoordinator: ObservableObject {
                         "sdpMid": candidate.sdpMid ?? "0",
                         "sdpMLineIndex": candidate.sdpMLineIndex
                     ]]],
-                    negotiationId: self.currentNegotiationId
+                    negotiationId: negotiationId
                 )
             }
         }
         media.onICEGatheringComplete = { [weak self] in
-            Task { @MainActor in
-                guard let self, let call = self.currentCall else { return }
+            guard let self, let call = self.currentCall, self.mediaCallId == call.id else { return }
+            let generation = self.mediaGeneration
+            let negotiationId = self.currentNegotiationId
+            Task { @MainActor [weak self] in
+                guard let self, self.mediaGeneration == generation, self.currentCall?.id == call.id,
+                      self.currentNegotiationId == negotiationId else { return }
                 try? await self.signal.send(
                     type: "ice_complete",
                     callId: call.id,
                     payload: [:],
-                    negotiationId: self.currentNegotiationId
+                    negotiationId: negotiationId
                 )
             }
         }
         media.onStateChange = { [weak self] state, detail in
-            Task { @MainActor in await self?.mediaChanged(state, detail: detail) }
+            guard let self, let callId = self.mediaCallId else { return }
+            let generation = self.mediaGeneration
+            Task { @MainActor [weak self] in
+                guard let self, self.mediaGeneration == generation,
+                      self.mediaCallId == callId, self.currentCall?.id == callId else { return }
+                await self.mediaChanged(state, detail: detail)
+            }
         }
         callKit.onAnswer = { [weak self] action in Task { @MainActor in await self?.answer(action) } }
         callKit.onEnd = { [weak self] action in Task { @MainActor in await self?.end(action) } }
         callKit.onMute = { [weak self] action in Task { @MainActor in await self?.mute(action) } }
         callKit.onDTMF = { [weak self] action in Task { @MainActor in await self?.dtmf(action) } }
+        callKit.onPrepareAudio = { [weak self] in
+            guard let self else { throw RelayError.media("The call coordinator is unavailable.") }
+            try self.audio.configureForCall()
+        }
+        callKit.onAudioPreparationFailed = { [weak self] message in
+            Task { @MainActor in await self?.failMedia("iPhone audio setup failed: \(message)") }
+        }
         callKit.onAudioActivated = { [weak self] active in
             guard let self else { return }
-            self.callKitAudioActive = active
-            do { try self.audio.configure(active: active) }
-            catch { self.errorMessage = error.localizedDescription }
+            // Only real CallKit callbacks change external activation. Media
+            // recovery/teardown must not synthesize these notifications.
             self.media.setAudioActive(active)
+            self.audio.refreshRoutes()
         }
         callKit.onProviderReset = { [weak self] in
             Task { @MainActor in
@@ -340,13 +360,17 @@ final class CallCoordinator: ObservableObject {
         pendingOffers = pendingOffers.filter { $0.key == call.id }
         pendingCandidates = pendingCandidates.filter { $0.key.hasPrefix("\(call.id)|") }
         mediaCallId = call.id
+        let generation = mediaGeneration
         mediaState = .preparing
         let configuration = try await api.mediaConfiguration(callId: call.id)
+        guard mediaGeneration == generation, mediaCallId == call.id,
+              currentCall?.id == call.id else { return }
         guard configuration.transport == "webrtc_p2p", configuration.offerer == "android", configuration.protocolVersion == 1 else {
             throw RelayError.media("The server returned an unsupported media configuration.")
         }
         try media.prepare(configuration: configuration, relayOnly: false)
-        media.setAudioActive(callKitAudioActive)
+        media.setMode(mode)
+        media.setMuted(isMuted)
         mediaPreparedCallId = call.id
         scheduleDeadlines(call: call, configuration: configuration)
         if let pending = pendingOffers.removeValue(forKey: call.id) {
@@ -361,18 +385,18 @@ final class CallCoordinator: ObservableObject {
     private func scheduleDeadlines(call: RelayCall, configuration: ICEConfiguration) {
         directDeadline = Task { [weak self] in
             try? await Task.sleep(for: .seconds(8))
-            guard let self, self.currentCall?.id == call.id, self.mediaState != .connected else { return }
+            guard !Task.isCancelled, let self, self.currentCall?.id == call.id, self.mediaState != .connected else { return }
             await self.switchToRelay(call: call, configuration: configuration, reason: "direct_timeout")
         }
         setupDeadline = Task { [weak self] in
             try? await Task.sleep(for: .seconds(20))
-            guard let self, self.currentCall?.id == call.id, self.mediaState != .connected else { return }
+            guard !Task.isCancelled, let self, self.currentCall?.id == call.id, self.mediaState != .connected else { return }
             await self.failMedia("Audio could not connect within 20 seconds.")
         }
         let refreshIn = max(30, TimeInterval(configuration.credentialsExpiresAt) / 1_000 - Date().timeIntervalSince1970 - 60)
         credentialRefresh = Task { [weak self] in
             try? await Task.sleep(for: .seconds(refreshIn))
-            guard let self, self.currentCall?.id == call.id else { return }
+            guard !Task.isCancelled, let self, self.currentCall?.id == call.id else { return }
             if let refreshed = try? await self.api.mediaConfiguration(callId: call.id), self.didForceRelay {
                 try? self.media.forceRelay(configuration: refreshed)
             }
@@ -519,11 +543,13 @@ final class CallCoordinator: ObservableObject {
             return
         }
         offerInFlight = true
+        let generation = mediaGeneration
         currentNegotiationId = negotiationId
         remoteDescriptionNegotiationId = nil
         do {
             let answer = try await media.answer(offerSDP: sdp)
-            guard currentCall?.id == callId, currentNegotiationId == negotiationId else { offerInFlight = false; return }
+            guard mediaGeneration == generation, currentCall?.id == callId,
+                  currentNegotiationId == negotiationId else { return }
             remoteDescriptionNegotiationId = negotiationId ?? "legacy"
             let key = candidateKey(callId: callId, negotiationId: negotiationId)
             for candidate in pendingCandidates.removeValue(forKey: key) ?? [] {
@@ -531,10 +557,12 @@ final class CallCoordinator: ObservableObject {
             }
             try await signal.send(type: "answer", callId: callId, payload: ["sdp": answer], negotiationId: negotiationId)
         } catch {
+            guard mediaGeneration == generation, currentCall?.id == callId else { return }
             offerInFlight = false
             await failMedia(error.localizedDescription)
             return
         }
+        guard mediaGeneration == generation, currentCall?.id == callId else { return }
         offerInFlight = false
         if let next = pendingOffers.removeValue(forKey: callId) {
             await processOffer(next.payload, callId: callId, negotiationId: next.negotiationId)
@@ -676,7 +704,6 @@ final class CallCoordinator: ObservableObject {
 
     private func finishLocalCall(reason: CXCallEndedReason, outcome: String? = nil) {
         guard let call = currentCall else {
-            callKitAudioActive = false
             resetMedia()
             return
         }
@@ -694,7 +721,6 @@ final class CallCoordinator: ObservableObject {
         callKit.reportEnded(callId: call.id, reason: reason)
         acceptedLocallyCallIds.remove(call.id)
         incomingAwaitingUserAnswer.remove(call.id)
-        callKitAudioActive = false
         resetMedia()
         currentCall = nil
         activeSince = nil
@@ -703,6 +729,8 @@ final class CallCoordinator: ObservableObject {
     }
 
     private func resetMedia(clearPendingSignals: Bool = true) {
+        mediaGeneration &+= 1
+        mediaCallId = nil
         directDeadline?.cancel()
         setupDeadline?.cancel()
         credentialRefresh?.cancel()
@@ -732,6 +760,9 @@ final class CallCoordinator: ObservableObject {
             pendingOffers.removeAll(keepingCapacity: true)
             pendingCandidates.removeAll(keepingCapacity: true)
         }
-        try? audio.configure(active: false)
+        if clearPendingSignals {
+            isMuted = false
+            media.setMuted(false)
+        }
     }
 }

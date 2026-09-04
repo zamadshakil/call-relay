@@ -323,6 +323,9 @@ private fun ReadyScreen(state: OnboardingUiState, callbacks: ConsumerCallbacks) 
         Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             Text(if (runtime.ready) "Relay is on" else "Relay is paused", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
             Text("Media: ${runtime.mediaState}")
+            if (runtime.callId != null) {
+                runtime.audioDiagnostics?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+            }
             Text("Carrier call: ${RelayInCallService.callState()}")
             Text("Route: ${RelayInCallService.audioRoute()}")
         }

@@ -26,7 +26,7 @@ class RawWebRtcNativeSmokeTest {
             val processor = object : ExternalAudioProcessingFactory.AudioProcessing {
                 override fun initialize(sampleRateHz: Int, numChannels: Int) = Unit
                 override fun reset(newRate: Int) = Unit
-                override fun process(sampleRateHz: Int, numChannels: Int, buffer: ByteBuffer) = Unit
+                override fun process(numBands: Int, numFrames: Int, buffer: ByteBuffer) = Unit
             }
             val lease = ProcessWebRtcEngine.attach(context, processor, processor)
             try {

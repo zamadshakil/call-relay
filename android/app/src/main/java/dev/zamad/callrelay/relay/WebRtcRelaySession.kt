@@ -2,8 +2,12 @@ package dev.zamad.callrelay.relay
 
 import android.content.Context
 import android.os.SystemClock
+import android.media.AudioManager
+import android.media.MediaRecorder
+import android.util.Log
+import dev.zamad.callrelay.audio.AudioFrameDiagnostics
 import dev.zamad.callrelay.audio.DuplexEchoGuard
-import dev.zamad.callrelay.audio.PcmGainProcessor
+import dev.zamad.callrelay.audio.FloatAudioGainProcessor
 import dev.zamad.callrelay.network.RelayApiClient
 import dev.zamad.callrelay.network.SignalTransport
 import java.nio.ByteBuffer
@@ -85,7 +89,8 @@ class WebRtcRelaySession(
     private val mode = AtomicReference(RelayMode.FULL_DUPLEX)
     private val explicitlyMuted = AtomicBoolean(false)
     private val connected = AtomicBoolean(false)
-    private val gainProcessor = PcmGainProcessor()
+    private val gainProcessor = FloatAudioGainProcessor()
+    private val audioDiagnostics = AudioFrameDiagnostics()
     private val echoGuard = DuplexEchoGuard()
     private val iceGenerationRouter = IceGenerationRouter()
     private val connectionGenerationGate = ConnectionGenerationGate<PeerConnection>()
@@ -253,6 +258,7 @@ class WebRtcRelaySession(
         source?.dispose()
         synchronized(pendingCandidates) { pendingCandidates.clear() }
         lifecycleState = MediaLifecycle.IDLE
+        audioDiagnostics.take()
         RelayRuntime.update { it.copy(mediaState = "Disconnected", captureRms = 0.0, capturePeak = 0) }
     }
 
@@ -660,6 +666,22 @@ class WebRtcRelaySession(
                 bytesReceived = received,
                 iceRestartCount = restartCount,
             )
+            val levels = audioDiagnostics.take()
+            val audioManager = appContext.getSystemService(AudioManager::class.java)
+            val captureSilenced = runCatching {
+                audioManager.activeRecordingConfigurations
+                    .filter { it.clientAudioSource == MediaRecorder.AudioSource.VOICE_RECOGNITION }
+                    .takeIf { it.isNotEmpty() }
+                    ?.all { it.isClientSilenced }
+            }.getOrNull()
+            Log.i("RelayAudio", "format=float32-s16 mode=${mode.get()} muted=${explicitlyMuted.get()} " +
+                "sent=$sent received=$received captureSilenced=$captureSilenced " +
+                "mediaVolume=${audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)} " +
+                "audioMode=${audioManager.mode} $levels")
+            RelayRuntime.update { it.copy(audioDiagnostics =
+                "Mic ${levels.captureInputRmsMax.toInt()} → send ${levels.captureOutputRmsMax.toInt()} · " +
+                    "play ${levels.renderRmsMax.toInt()} · gate ${levels.gatedFrames}/${levels.captureFrames}" +
+                    if (captureSilenced == true) " · Android has silenced capture" else "") }
             onComplete?.invoke(route)
         }
     }
@@ -703,15 +725,16 @@ class WebRtcRelaySession(
     private val captureProcessor = object : ExternalAudioProcessingFactory.AudioProcessing {
         override fun initialize(sampleRateHz: Int, numChannels: Int) = Unit
         override fun reset(newRate: Int) = Unit
-        override fun process(sampleRateHz: Int, numChannels: Int, buffer: ByteBuffer) {
+        override fun process(numBands: Int, numFrames: Int, buffer: ByteBuffer) {
             val echoGuardActive = mode.get() == RelayMode.FULL_DUPLEX &&
                 echoGuard.shouldGateCapture(SystemClock.elapsedRealtime())
-            val level = gainProcessor.processPcm16(
+            val level = gainProcessor.process(
                 buffer,
-                buffer.capacity(),
+                numFrames,
                 preferences.captureGain,
                 mode.get() == RelayMode.TALK || explicitlyMuted.get() || echoGuardActive,
             )
+            audioDiagnostics.capture(level, echoGuardActive)
             RelayRuntime.update { it.copy(captureRms = level.rms, capturePeak = level.peak) }
         }
     }
@@ -719,13 +742,14 @@ class WebRtcRelaySession(
     private val renderProcessor = object : ExternalAudioProcessingFactory.AudioProcessing {
         override fun initialize(sampleRateHz: Int, numChannels: Int) = Unit
         override fun reset(newRate: Int) = Unit
-        override fun process(sampleRateHz: Int, numChannels: Int, buffer: ByteBuffer) {
-            val level = gainProcessor.processPcm16(
+        override fun process(numBands: Int, numFrames: Int, buffer: ByteBuffer) {
+            val level = gainProcessor.process(
                 buffer,
-                buffer.capacity(),
+                numFrames,
                 preferences.playbackGain.toFloat(),
                 mode.get() == RelayMode.LISTEN,
             )
+            audioDiagnostics.render(level)
             if (mode.get() != RelayMode.LISTEN) {
                 echoGuard.observePeerRender(level.rms, level.peak, SystemClock.elapsedRealtime())
             }
