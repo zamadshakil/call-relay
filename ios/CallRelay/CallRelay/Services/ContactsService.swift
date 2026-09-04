@@ -35,7 +35,7 @@ final class ContactsService: ObservableObject {
                 _ = try await store.requestAccess(for: .contacts)
             }
             authorizationStatus = CNContactStore.authorizationStatus(for: .contacts)
-            guard authorizationStatus == .authorized else {
+            guard authorizationStatus == .authorized || authorizationStatus == .limited else {
                 contacts = []
                 return
             }

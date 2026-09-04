@@ -20,7 +20,7 @@ struct ContactsView: View {
         NavigationStack {
             Group {
                 switch contacts.authorizationStatus {
-                case .authorized:
+                case .authorized, .limited:
                     if contacts.filtered.isEmpty {
                         ContentUnavailableView.search(text: contacts.searchText)
                     } else {
