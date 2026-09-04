@@ -19,7 +19,7 @@ final class CallKitController: NSObject, ObservableObject {
     private var callIds: [UUID: String] = [:]
 
     override init() {
-        let configuration = CXProviderConfiguration(localizedName: "Call Relay")
+        let configuration = CXProviderConfiguration()
         configuration.supportsVideo = false
         configuration.maximumCallGroups = 1
         configuration.maximumCallsPerCallGroup = 1
@@ -48,7 +48,7 @@ final class CallKitController: NSObject, ObservableObject {
         }
         let uuid = uuid(for: call.id)
         do {
-            try await withCheckedThrowingContinuation { continuation in
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
                 provider.reportNewIncomingCall(with: uuid, update: update) { error in
                     if let error { continuation.resume(throwing: error) }
                     else { continuation.resume(returning: ()) }
@@ -138,7 +138,7 @@ final class CallKitController: NSObject, ObservableObject {
     }
 
     private func request(_ transaction: CXTransaction) async throws {
-        try await withCheckedThrowingContinuation { continuation in
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             controller.request(transaction) { error in
                 if let error { continuation.resume(throwing: error) }
                 else { continuation.resume(returning: ()) }
