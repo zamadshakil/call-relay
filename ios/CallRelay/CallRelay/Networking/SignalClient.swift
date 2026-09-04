@@ -140,7 +140,7 @@ final class SignalClient: ObservableObject {
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(20))
                 guard let self, self.wanted, let task else { break }
-                try? await task.sendPing()
+                task.sendPing { _ in }
             }
         }
         defer {

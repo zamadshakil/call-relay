@@ -54,17 +54,17 @@ final class CallCoordinator: ObservableObject {
     init(
         api: RelayAPI,
         signal: SignalClient,
-        media: MediaAdapter = WebRTCMediaAdapter(),
-        callKit: CallKitController = CallKitController(),
-        audio: AudioSessionController = AudioSessionController(),
+        media: MediaAdapter? = nil,
+        callKit: CallKitController? = nil,
+        audio: AudioSessionController? = nil,
         contacts: ContactsService,
         history: CallHistoryStore
     ) {
         self.api = api
         self.signal = signal
-        self.media = media
-        self.callKit = callKit
-        self.audio = audio
+        self.media = media ?? WebRTCMediaAdapter()
+        self.callKit = callKit ?? CallKitController()
+        self.audio = audio ?? AudioSessionController()
         self.contacts = contacts
         self.history = history
         wireCallbacks()
